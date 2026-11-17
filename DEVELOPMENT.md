@@ -2,13 +2,17 @@
 
 ## crate の責務
 
-依存は `pasori` から `rcs956` への一方向で、`rcs956` は `pasori` を知らない。どちらも `no_std` と `alloc` で動作し、`unsafe_code` を禁止する。
+依存は `pasori` から reader crate（`rcs956` と `rcs310`）へ、それぞれから `felica-packet` への一方向で、下位の crate は上位を知らない。reader crate 同士は依存しない。いずれも `no_std` と `alloc` で動作し、`unsafe_code` を禁止する。
+
+`felica-packet` は reader によらない FeliCa カードの packet の事実を所有する。IDm、Polling の要求と応答、packet の長さ byte の検証と、Polling で選択したカードとの packet 交換の contract（`Selection`）がここに属する。各 reader crate は自分の選択 handle でこの contract を実装し、RF 転送・待機・失敗時の状態遷移は reader crate が決める。
 
 `rcs956` は RC-S956 チップの制御を所有する。フレーム、取引状態、firmware の RF 設定と timer、target の検出と活性化（InListPassiveTarget と TgInitTarget）、その応答の検証、firmware が実行するカード操作（NFC-A の ISO-DEP、MIFARE Classic の認証と block access、NFC-DEP）がここに属する。host が実行するプロトコルには、選択した target ごとの交換手段を渡す。FeliCa の packet 交換と packet stream、NFC-B の block 転送、Type 1 と Type A の command 交換、passive Type A target の受信と応答がそれにあたる。crate が定義する `Transport` へ同期転送、pipe 回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移は crate で決める。OS のデバイス列挙、USB backend、ドライバとの通信は `Transport` の実装側が所有する。
 
-`pasori` は host が実行するカードのプロトコルを所有する。FeliCa の command と認証、FALP、NFC-B の ISO-DEP、NFC Forum Type 1〜4 の NDEF、Type 2 tag の emulation がここに属する。`pasori` は `rcs956` を再公開し、その選択 handle を受け取ってプロトコルの handle を作る。
+`rcs310` は RC-S310 と RC-S320 の制御を所有する。RC-S320 と同じ USB ID の RC-S600 もここで扱う。このリーダーは FeliCa だけを扱う。フレーム、取引状態、USB descriptor と register の観測による機種の判定、機種ごとの初期 register 値の書込み、RF field の切断、`5C` による FeliCa packet の運搬がここに属する。初期 register 値は Sony のドライバーパッケージが同じ観測に対して書く値で、値が分からない組合せは推測せずに拒否する。`Transport` の実装側は vendor control OUT 転送と interrupt IN 転送を受け持つ。
 
-`rcs956-script` は両 crate の wire-level test が共有する scripted transport で、公開しない dev dependency である。
+`pasori` は host が実行するカードのプロトコルを所有する。FeliCa の command と認証、FALP、NFC-B の ISO-DEP、NFC Forum Type 1〜4 の NDEF、Type 2 tag の emulation がここに属する。FeliCa の command、認証、Type 3 の NDEF は任意の `Selection` の上で動く。FALP は `rcs956` の packet stream を使い、それ以外の方式は `rcs956` の選択 handle を受け取る。`pasori` は `felica-packet`、`rcs956`、`rcs310` を再公開する。
+
+`reader-script` は各 crate の wire-level test が共有する RC-S956 と RC-S310 の scripted transport で、公開しない dev dependency である。
 
 ## ビルドと検証
 
@@ -20,7 +24,7 @@ cargo fmt --all --check
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features --config "build.rustdocflags=['-Dwarnings']"
-cargo check -p rcs956 -p pasori --lib --all-features --target x86_64-unknown-none
+cargo check -p felica-packet -p rcs956 -p rcs310 -p pasori --lib --all-features --target x86_64-unknown-none
 ```
 
 ## 状態と失敗の契約
@@ -31,7 +35,9 @@ cargo check -p rcs956 -p pasori --lib --all-features --target x86_64-unknown-non
 
 どの操作も自動で再送しない。例外は FALP の再送で、protocol 自体が順序番号で重複を排除する欠落 block の再要求と、応答のない送信切替 block の再送だけを行う。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みの progress を error に残す。transport 失敗後には RF readiness が失効する。reader への `initialize` は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 
-回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。中断前のカード操作の結果不明は caller に残る。
+`rcs956` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。`rcs310` には command を中断する手段がなく、回復は pipe と受信済み bytes の整理だけを行う。どちらでも、中断前のカード操作の結果不明は caller に残る。
+
+`rcs310` のリーダーは ACK の後に応答を返さないことがある。その取引は失敗として返すが stream は使える状態に残し、遅れて届く応答に備えて、次の取引は受信済み bytes を捨ててから送り、ACK より前の frame を拒否する。
 
 `rf_off` や `finish` の失敗は caller が観測する。Drop は OS resource の解放だけを担当する。
 
@@ -41,7 +47,7 @@ NDEF の書込みはメッセージを非公開にしてから本文を更新し
 
 固定 packet vector はデバイスに送るフレームと応答の解釈を検証する。実機 capture は USB と RF の観測範囲を別途記録する。
 
-NFC-A／B の固定 vector はカード実機の成功証拠ではない。全 firmware、全カード command／APDU の意味と副作用の成立は、固定 vector の検証対象に含めない。
+NFC-A／B の固定 vector はカード実機の成功証拠ではない。`rcs310` の固定 vector は Sony のドライバーの静的解析と第三者実装の挙動から組み立てたもので、RC-S310／RC-S320 の実機では確認していない。全 firmware、全カード command／APDU の意味と副作用の成立は、固定 vector の検証対象に含めない。
 
 ## 外部実装へ委譲する責務
 
