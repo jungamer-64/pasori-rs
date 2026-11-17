@@ -1,10 +1,7 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
 mod dep;
-mod falp;
 mod identity;
-mod type1;
-mod type2_target;
 
 pub use dep::{
     DepActivation, DepError, DepInitiator, DepLink, DepMessage, DepMode, DepPeer, DepRate,

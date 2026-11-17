@@ -1,5 +1,5 @@
 [workspace]
-members = ["rcs956"]
+members = ["rcs956", "pasori"]
 resolver = "3"
 
 [workspace.package]
