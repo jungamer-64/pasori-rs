@@ -319,7 +319,7 @@ fn farewell_reason(message: &[u8]) -> Option<Reason> {
 /// Propose and handshake, and receive its first burst. The reader is reset
 /// first; `timeout` bounds the wait for an initiator. A timeout of the
 /// activation command fails the reader transaction, so call
-/// [`Reader::initialize`] or [`FalpLink::finish`] before listening again.
+/// [`Reader::initialize`] before listening again.
 ///
 /// Each later wait for an initiator frame also fails the reader transaction
 /// when it times out, because the reader's command that receives the next
