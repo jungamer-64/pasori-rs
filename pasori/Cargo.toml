@@ -3,7 +3,7 @@ name = "pasori"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "NFC card protocols for PaSoRi readers, run over the RC-S956 chip layer"
+description = "NFC card protocols for PaSoRi readers, run over the RC-S956 and RC-S310 reader layers"
 
 [features]
 felica-lite-s = ["dep:des", "dep:subtle", "dep:zeroize"]
@@ -11,6 +11,7 @@ felica-standard-aes = ["dep:aes", "dep:cmac", "dep:subtle", "dep:zeroize"]
 
 [dependencies]
 felica-packet = { path = "../felica-packet", version = "0.1" }
+rcs310 = { path = "../rcs310", version = "0.1" }
 rcs956 = { path = "../rcs956", version = "0.1" }
 aes = { version = "0.9", features = ["zeroize"], optional = true }
 cmac = { version = "0.8", features = ["zeroize"], optional = true }
@@ -19,7 +20,7 @@ subtle = { version = "2.6", default-features = false, optional = true }
 zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
-rcs956-script = { path = "../script" }
+reader-script = { path = "../script" }
 
 [lints]
 workspace = true
