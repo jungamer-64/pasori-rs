@@ -5,10 +5,8 @@
 //! authentication. After sending a command the session can advance only
 //! from an authenticated response with a strictly newer transaction number.
 
-use crate::{
-    reader::{Error as ReaderError, FelicaCard, RawFelicaCard},
-    transport::Transport,
-};
+use super::{Card, Error as CommandError};
+use rcs956::{reader::FelicaCard, transport::Transport};
 use aes::{
     Aes128,
     cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit},
@@ -72,7 +70,7 @@ pub enum Error<E> {
         /// Card command code identifying the failed step.
         command: u8,
         /// Underlying failure with the reader transaction's progress.
-        cause: ReaderError<E>,
+        cause: CommandError<E>,
     },
     /// The first authentication response did not prove the shared key.
     CardProof,
@@ -146,13 +144,13 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
 /// selection before further operations, which clears the card's RF state.
 #[derive(Debug)]
 pub struct Session<'a, T: Transport> {
-    card: RawFelicaCard<'a, T>,
+    card: FelicaCard<'a, T>,
     secure: Option<Secure>,
     issue: Issue,
     nodes: usize,
 }
 
-impl<'a, T: Transport> FelicaCard<'a, T> {
+impl<'a, T: Transport> Card<'a, T> {
     /// Consume the ordinary card selection and authenticate using AES-128.
     /// Nodes appear in the same order in the key derivation and authentication
     /// command. Supply the system's individualization code, its operation
@@ -178,7 +176,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         let derivation = Aes128::new((&*group).into());
         let mut context = [0; 16];
         context[1] = 2;
-        context[6..14].copy_from_slice(self.observation().idm.as_bytes());
+        context[6..14].copy_from_slice(self.selection().observation().idm.as_bytes());
         context[14] = 1;
         let alpha = Zeroizing::new(derive(&derivation, context, 1));
         let mut beta = Zeroizing::new(derive(&derivation, context, 2));
@@ -222,7 +220,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         alpha.encrypt_block((&mut host_proof).into());
         let mut request = [0; 26];
         request[..2].copy_from_slice(&[26, 0x42]);
-        request[2..10].copy_from_slice(self.observation().idm.as_bytes());
+        request[2..10].copy_from_slice(self.selection().observation().idm.as_bytes());
         request[10..].copy_from_slice(&host_proof);
         let mut card = self.into_raw();
         let reply = exchange(&mut card, &request)?;
@@ -354,13 +352,13 @@ impl<T: Transport> Session<'_, T> {
 }
 
 fn exchange<T: Transport>(
-    card: &mut RawFelicaCard<'_, T>,
+    card: &mut FelicaCard<'_, T>,
     packet: &[u8],
 ) -> Result<Vec<u8>, Error<T::Error>> {
     card.exchange_packet(packet)
         .map_err(|cause| Error::Exchange {
             command: packet[1],
-            cause,
+            cause: CommandError::Reader(cause),
         })
 }
 

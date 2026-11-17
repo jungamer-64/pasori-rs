@@ -1,34 +1,19 @@
-//! FeliCa card packets, without RC-S956 command or USB frame envelopes.
+//! FeliCa card commands over a card selected by RC-S956 polling.
 //!
-//! Identity is session data, not a universally unique or authenticated credential.
-//! Service and block numbers are encoded little-endian; polling system codes are
-//! encoded big-endian.
+//! Service and block numbers are encoded little-endian.
 
 use alloc::vec::Vec;
 use core::fmt;
+use rcs956::{
+    felica::Idm,
+    reader::{self, FelicaCard},
+    transport::Transport,
+};
 
 #[cfg(feature = "felica-lite-s")]
 pub mod lite_s;
 #[cfg(feature = "felica-standard-aes")]
 pub mod standard_aes;
-
-/// RF rate selected for FeliCa polling and subsequent exchange.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BitRate {
-    /// 212 kbps.
-    Kbps212,
-    /// 424 kbps.
-    Kbps424,
-}
-
-impl BitRate {
-    pub(crate) fn selector(self) -> u8 {
-        match self {
-            Self::Kbps212 => 1,
-            Self::Kbps424 => 2,
-        }
-    }
-}
 
 /// Maximum blocks in one supported Read Without Encryption command.
 pub const MAX_READ_BLOCKS: usize = 12;
@@ -36,38 +21,9 @@ pub const MAX_READ_BLOCKS: usize = 12;
 /// Maximum write blocks that fit a single-service packet with short addresses.
 pub const MAX_WRITE_BLOCKS: usize = 13;
 
-/// Eight-byte card identity returned by the selected system's polling response.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Idm([u8; 8]);
-
-impl Idm {
-    /// Preserve the identity's wire byte order.
-    pub const fn new(bytes: [u8; 8]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the identity bytes in their wire order.
-    pub const fn as_bytes(&self) -> &[u8; 8] {
-        &self.0
-    }
-}
-
-impl fmt::Display for Idm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02X}")?;
-        }
-        Ok(())
-    }
-}
-
 /// Card packet validation or card-reported status failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CardError {
-    /// Polling request code is outside `00/01/02`.
-    RequestCode(u8),
-    /// Polling slot selector is outside `00/01/03/07/0F`.
-    TimeSlots(u8),
     /// Actual bytes do not match the packet's declared or required length.
     Length {
         /// Required packet length.
@@ -112,8 +68,6 @@ pub enum CardError {
 impl fmt::Display for CardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RequestCode(value) => write!(f, "unsupported polling request {value:02X}"),
-            Self::TimeSlots(value) => write!(f, "invalid polling slot selector {value:02X}"),
             Self::Length { expected, actual } => {
                 write!(f, "card packet length {actual}, expected {expected}")
             }
@@ -141,80 +95,6 @@ impl fmt::Display for CardError {
 }
 
 impl core::error::Error for CardError {}
-
-/// Validated six-byte polling command, including its FeliCa length byte.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PollRequest {
-    system: u16,
-    request: u8,
-    slots: u8,
-}
-
-impl PollRequest {
-    /// Construct polling parameters. `FF` is a wildcard in each system-code byte.
-    ///
-    /// # Errors
-    ///
-    /// Rejects request codes outside `0..=2` and invalid slot selectors.
-    pub fn new(system: u16, request: u8, slots: u8) -> Result<Self, CardError> {
-        if request > 2 {
-            return Err(CardError::RequestCode(request));
-        }
-        if !matches!(slots, 0 | 1 | 3 | 7 | 15) {
-            return Err(CardError::TimeSlots(slots));
-        }
-        Ok(Self {
-            system,
-            request,
-            slots,
-        })
-    }
-
-    /// Encode the six-byte card command, without CRC or reader timeout fields.
-    pub fn encode(self) -> [u8; 6] {
-        let [high, low] = self.system.to_be_bytes();
-        [6, 0, high, low, self.request, self.slots]
-    }
-}
-
-/// Validated polling response; optional bytes depend on the polling request code.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PollResponse {
-    /// Selected system's manufacturing identity, in wire order.
-    pub idm: Idm,
-    /// Manufacturing parameters, preserved without inferring a product model.
-    pub pmm: [u8; 8],
-    /// Optional two-byte request data, kept in wire order.
-    pub request_data: Option<[u8; 2]>,
-}
-
-impl PollResponse {
-    /// Decode an 18- or 20-byte polling response, including its card length byte.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed length, a response command other than `01`, or a packet
-    /// shape that cannot contain complete identity and manufacturing parameters.
-    pub fn parse(input: &[u8]) -> Result<Self, CardError> {
-        validate_packet(input, 0x01, 18)?;
-        if input.len() != 18 && input.len() != 20 {
-            return Err(CardError::Length {
-                expected: 18,
-                actual: input.len(),
-            });
-        }
-        let mut idm = [0; 8];
-        let mut pmm = [0; 8];
-        idm.copy_from_slice(&input[2..10]);
-        pmm.copy_from_slice(&input[10..18]);
-        let request_data = input.get(18..20).map(|bytes| [bytes[0], bytes[1]]);
-        Ok(Self {
-            idm: Idm::new(idm),
-            pmm,
-            request_data,
-        })
-    }
-}
 
 /// Build a one-service Read Without Encryption packet for at most 12 blocks.
 ///
@@ -471,7 +351,7 @@ impl ReadResponse {
     }
 }
 
-pub(crate) fn validate_length(input: &[u8], minimum: usize) -> Result<(), CardError> {
+fn validate_length(input: &[u8], minimum: usize) -> Result<(), CardError> {
     if input.len() < minimum {
         return Err(CardError::Length {
             expected: minimum,
@@ -499,34 +379,175 @@ fn validate_packet(input: &[u8], command: u8, minimum: usize) -> Result<(), Card
     Ok(())
 }
 
+/// A FeliCa command failure, split at the transfer of the command packet.
+#[derive(Debug)]
+pub enum Error<E> {
+    /// Request validation failed before the command was sent.
+    Request(CardError),
+    /// The reader command carrying the packet failed; its transaction
+    /// progress tells whether the packet was sent.
+    Reader(reader::Error<E>),
+    /// The command was sent but the card reply reported an error or failed
+    /// validation. The command may have taken effect.
+    Response(CardError),
+}
+
+impl<E: fmt::Debug> fmt::Display for Error<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Request(_) => "FeliCa request rejected before sending",
+            Self::Reader(_) => "FeliCa reader command failed",
+            Self::Response(_) => "FeliCa response failed; the command may have taken effect",
+        })
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Request(error) | Self::Response(error) => Some(error),
+            Self::Reader(error) => Some(error),
+        }
+    }
+}
+
+impl<E> From<reader::Error<E>> for Error<E> {
+    fn from(error: reader::Error<E>) -> Self {
+        Self::Reader(error)
+    }
+}
+
+/// Typed command access to a FeliCa card selected by polling. Every command
+/// addresses the polled IDm and leaves no state that a new Polling does not
+/// clear.
+#[derive(Debug)]
+pub struct Card<'a, T: Transport> {
+    selection: FelicaCard<'a, T>,
+}
+
+impl<'a, T: Transport> Card<'a, T> {
+    /// Take typed command authority over a polled card.
+    pub fn new(selection: FelicaCard<'a, T>) -> Self {
+        Self { selection }
+    }
+
+    /// The reader selection, including its polling response and rate.
+    pub fn selection(&self) -> &FelicaCard<'a, T> {
+        &self.selection
+    }
+
+    fn idm(&self) -> Idm {
+        self.selection.observation().idm
+    }
+
+    /// Read up to twelve blocks from one unencrypted service. The caller chooses
+    /// a service known to exist on this card; no card data is written.
+    pub fn read_without_encryption(
+        &mut self,
+        service: u16,
+        blocks: &[u16],
+    ) -> Result<ReadResponse, Error<T::Error>> {
+        let idm = self.idm();
+        let request = read_without_encryption(idm, service, blocks).map_err(Error::Request)?;
+        let response = self.selection.exchange_packet(&request)?;
+        ReadResponse::parse(&response, idm, blocks.len()).map_err(Error::Response)
+    }
+
+    /// Write blocks to one service with Write Without Encryption. Card-specific
+    /// limits still apply. [`Error::Request`] means validation stopped the
+    /// command before sending. [`Error::Response`] means it was sent and the
+    /// write outcome may be uncertain. Reader failures carry their own
+    /// transaction progress.
+    pub fn write_without_encryption(
+        &mut self,
+        service: u16,
+        blocks: &[BlockWrite],
+    ) -> Result<(), Error<T::Error>> {
+        let idm = self.idm();
+        let request = write_without_encryption(idm, service, blocks).map_err(Error::Request)?;
+        let response = self.selection.exchange_packet(&request)?;
+        write_response(&response, idm).map_err(Error::Response)
+    }
+
+    /// Confirm that the selected card still answers at its IDm, using Request
+    /// Response. Returns the card's current mode byte; the command changes no
+    /// card state. An absent card surfaces as a reader RF timeout, a different
+    /// card as [`Error::Response`].
+    pub fn request_response(&mut self) -> Result<u8, Error<T::Error>> {
+        match self.exchange_command(0x04, &[], 0x05)?.as_slice() {
+            [mode] => Ok(*mode),
+            payload => Err(Error::Response(CardError::Length {
+                expected: 11,
+                actual: payload.len() + 10,
+            })),
+        }
+    }
+
+    /// Request the system codes exposed by this card. Card products can omit this command.
+    pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<T::Error>> {
+        let idm = self.idm();
+        let response = self.exchange_addressed(0x0c, &[])?;
+        system_codes(&response, idm).map_err(Error::Response)
+    }
+
+    /// Look up one service or area index within the selected system.
+    /// The end-of-list marker returns `None`; an RF failure remains an error.
+    pub fn search_service_code(
+        &mut self,
+        index: u16,
+    ) -> Result<Option<ServiceEntry>, Error<T::Error>> {
+        let idm = self.idm();
+        let response = self.exchange_addressed(0x0a, &index.to_le_bytes())?;
+        service_entry(&response, idm).map_err(Error::Response)
+    }
+
+    /// Send a crate-owned FeliCa command with the selected IDm. `parameters`
+    /// starts after IDm. Returns the payload after checking the length, response
+    /// code and IDm. A command that changes card state outside the typed
+    /// operations must first require a field cycle, as authentication does.
+    pub(crate) fn exchange_command(
+        &mut self,
+        command: u8,
+        parameters: &[u8],
+        response_code: u8,
+    ) -> Result<Vec<u8>, Error<T::Error>> {
+        let idm = self.idm();
+        let response = self.exchange_addressed(command, parameters)?;
+        addressed_response(&response, idm, response_code)
+            .map(<[u8]>::to_vec)
+            .map_err(Error::Response)
+    }
+
+    fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
+        let request = addressed_command(self.idm(), command, data).map_err(Error::Request)?;
+        Ok(self.selection.exchange_packet(&request)?)
+    }
+
+    /// Authentication changes card state that a new Polling does not clear.
+    #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
+    pub(crate) fn begin_authentication(&mut self) {
+        self.selection.require_field_cycle();
+    }
+
+    /// Consume typed command authority to send opaque packets at the card's
+    /// polling rate. Packets can affect addressing or card state, so the
+    /// polled identity is no longer an authority, and the next selection
+    /// cycles the RF field first.
+    pub fn into_raw(mut self) -> FelicaCard<'a, T> {
+        self.selection.require_field_cycle();
+        self.selection
+    }
+
+    /// Consume typed command authority for a host-run packet stream.
+    pub(crate) fn into_selection(self) -> FelicaCard<'a, T> {
+        self.selection
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
-
-    #[test]
-    fn polling_known_answer() -> Result<(), CardError> {
-        assert_eq!(
-            PollRequest::new(0xffff, 0, 0)?.encode(),
-            [6, 0, 0xff, 0xff, 0, 0]
-        );
-        assert_eq!(
-            PollRequest::new(0x1234, 1, 15)?.encode(),
-            [6, 0, 0x12, 0x34, 1, 15]
-        );
-        let response = [
-            20, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x12,
-            0x34,
-        ];
-        let card = PollResponse::parse(&response)?;
-        assert_eq!(card.idm, Idm::new([1, 2, 3, 4, 5, 6, 7, 8]));
-        assert_eq!(card.request_data, Some([0x12, 0x34]));
-        assert!(matches!(
-            PollRequest::new(0xffff, 0, 2),
-            Err(CardError::TimeSlots(2))
-        ));
-        Ok(())
-    }
 
     #[test]
     fn service_and_large_block_byte_order() -> Result<(), CardError> {

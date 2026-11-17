@@ -200,3 +200,32 @@ pub(crate) fn validate_length(input: &[u8], minimum: usize) -> Result<(), Packet
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polling_known_answer() -> Result<(), alloc::boxed::Box<dyn core::error::Error>> {
+        assert_eq!(
+            PollRequest::new(0xffff, 0, 0)?.encode(),
+            [6, 0, 0xff, 0xff, 0, 0]
+        );
+        assert_eq!(
+            PollRequest::new(0x1234, 1, 15)?.encode(),
+            [6, 0, 0x12, 0x34, 1, 15]
+        );
+        let response = [
+            20, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x12,
+            0x34,
+        ];
+        let card = PollResponse::parse(&response)?;
+        assert_eq!(card.idm, Idm::new([1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(card.request_data, Some([0x12, 0x34]));
+        assert!(matches!(
+            PollRequest::new(0xffff, 0, 2),
+            Err(PollRequestError::TimeSlots(2))
+        ));
+        Ok(())
+    }
+}

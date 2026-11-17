@@ -6,11 +6,8 @@
 //! The TDES backend is intended for this legacy card protocol and may have
 //! key-dependent memory access.
 
-use super::BlockWrite;
-use crate::{
-    reader::{Error as ReaderError, FelicaCard},
-    transport::Transport,
-};
+use super::{BlockWrite, Card, Error as CommandError};
+use rcs956::transport::Transport;
 use core::fmt;
 use des::{
     TdesEde2,
@@ -70,7 +67,7 @@ pub enum Error<E> {
         /// Operation that was in progress.
         stage: Stage,
         /// Original exchange failure, including command progress.
-        cause: ReaderError<E>,
+        cause: CommandError<E>,
     },
     /// The returned block data and addresses did not authenticate.
     MacMismatch(Stage),
@@ -123,11 +120,11 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
 /// operation revokes these keys. The next reader selection clears RF state.
 #[derive(Debug)]
 pub struct AuthenticatedCard<'a, T: Transport> {
-    card: FelicaCard<'a, T>,
+    card: Card<'a, T>,
     keys: Option<SessionKeys>,
 }
 
-impl<'a, T: Transport> FelicaCard<'a, T> {
+impl<'a, T: Transport> Card<'a, T> {
     /// Authenticate a Lite-S card selected in system 88B4. Supply the card
     /// key in card byte order and a new 16-byte challenge from a CSPRNG.
     /// Authentication consumes the ordinary selection and never retries.
@@ -136,7 +133,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         card_key: &[u8; 16],
         challenge: [u8; 16],
     ) -> Result<AuthenticatedCard<'a, T>, Error<T::Error>> {
-        let identity = *self.observation();
+        let identity = *self.selection().observation();
         if identity.pmm[1] != 0xf1 {
             return Err(Error::UnsupportedCard(identity.pmm[1]));
         }
@@ -202,7 +199,7 @@ impl<T: Transport> AuthenticatedCard<'_, T> {
 
     fn with_keys<U>(
         &mut self,
-        operation: impl FnOnce(&SessionKeys, &mut FelicaCard<'_, T>) -> Result<U, Error<T::Error>>,
+        operation: impl FnOnce(&SessionKeys, &mut Card<'_, T>) -> Result<U, Error<T::Error>>,
     ) -> Result<U, Error<T::Error>> {
         let keys = self.keys.take().ok_or(Error::SessionUnavailable)?;
         let result = operation(&keys, &mut self.card)?;
@@ -220,7 +217,7 @@ fn counter_bytes<E>(data: [u8; 16]) -> Result<[u8; 3], Error<E>> {
 }
 
 fn write<T: Transport>(
-    card: &mut FelicaCard<'_, T>,
+    card: &mut Card<'_, T>,
     stage: Stage,
     blocks: &[BlockWrite],
 ) -> Result<(), Error<T::Error>> {
@@ -259,7 +256,7 @@ impl SessionKeys {
 
     fn read<T: Transport, const N: usize>(
         &self,
-        card: &mut FelicaCard<'_, T>,
+        card: &mut Card<'_, T>,
         stage: Stage,
         blocks: [u16; N],
     ) -> Result<[[u8; 16]; N], Error<T::Error>> {
@@ -290,7 +287,7 @@ impl SessionKeys {
 
     fn write<T: Transport>(
         &self,
-        card: &mut FelicaCard<'_, T>,
+        card: &mut Card<'_, T>,
         stage: Stage,
         block: u16,
         data: [u8; 16],
