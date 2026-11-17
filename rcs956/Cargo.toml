@@ -9,7 +9,7 @@ description = "RC-S956 host framing, transactions, firmware RF control, and chip
 felica-packet = { path = "../felica-packet", version = "0.1" }
 
 [dev-dependencies]
-rcs956-script = { path = "../script" }
+reader-script = { path = "../script" }
 serde_json = "1"
 
 [lints]

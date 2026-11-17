@@ -1,13 +1,14 @@
 [package]
-name = "rcs956-script"
+name = "reader-script"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Scripted RC-S956 transport for wire-level tests"
+description = "Scripted reader transports for wire-level tests"
 
 [dependencies]
 felica-packet = { path = "../felica-packet" }
+rcs310 = { path = "../rcs310" }
 rcs956 = { path = "../rcs956" }
 
 [lints]

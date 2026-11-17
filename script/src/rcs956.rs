@@ -1,7 +1,4 @@
-//! Scripted RC-S956 transport for wire-level tests of `rcs956` and `pasori`.
-//!
-//! Responses are built independently of the production frame encoder. The
-//! script models command and response contracts, not physical device timing.
+//! Scripted RC-S956 transport.
 
 use felica_packet::{PollRequest, PollRequestError};
 use rcs956::{

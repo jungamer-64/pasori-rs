@@ -13,7 +13,7 @@ use rcs956::{
     },
     transport::{Failure, Progress, TransactionError},
 };
-use rcs956_script::{
+use reader_script::rcs956::{
     Answer, Request, Script, Step, ab_config_image, ab_mode, bank_addresses, command, config_image,
     idle_receiver, initialization, mode_configuration, poll_request, timeout, type_a_response,
     type_b_response,
