@@ -10,6 +10,11 @@ const CONTROL_WAIT: Duration = Duration::from_secs(1);
 const MEMORY_BYTES: usize = 64;
 const DATA_START: usize = 16;
 const UID_PREFIX: u8 = 0x08;
+/// TgInitTarget SENS_RES for a single-size UID. The firmware rejects the
+/// command unless the second byte has exactly one of bits 4..0 set and bits
+/// 7..5 clear; an initiator's InListPassiveTarget reports the two bytes in
+/// reverse order.
+const SENS_RES: [u8; 2] = [0x00, 0x04];
 
 /// Largest message in the emulated Type 2 tag's read-only data area.
 pub const MAX_TYPE2_EMULATED_NDEF_BYTES: usize = MEMORY_BYTES - DATA_START - 2;
@@ -111,8 +116,9 @@ impl<T: Transport> Reader<T> {
         // Disable automatic mode detection before firmware anticollision.
         self.write_register(0x6301, 0x3f)?;
         let [a, b, c] = uid_suffix;
+        let [sens_first, sens_second] = SENS_RES;
         let mut args = [0; 35];
-        args[..7].copy_from_slice(&[0, 4, 0, a, b, c, 0]);
+        args[..7].copy_from_slice(&[0, sens_first, sens_second, a, b, c, 0]);
         let activation = self.command(0x8c, &args, timeout.host_wait())?;
         let [0, command @ ..] = activation.as_slice() else {
             return Err(Type2EmulationError::Activation);

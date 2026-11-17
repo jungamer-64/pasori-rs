@@ -2754,7 +2754,7 @@ fn type_two_target_serves_read_only_ndef_and_halts() -> Result<(), Box<dyn Error
     let configuration = ab_config_image();
     let mut steps = initialization(&configuration);
     let mut activation = [0; 35];
-    activation[..7].copy_from_slice(&[0, 4, 0, 1, 2, 3, 0]);
+    activation[..7].copy_from_slice(&[0, 0, 4, 1, 2, 3, 0]);
     steps.extend([
         command(8, &[0x03, 0x28, 0x59], &[0]),
         command(8, &[0x63, 1, 0x3f], &[0]),
