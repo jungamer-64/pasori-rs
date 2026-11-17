@@ -7,12 +7,12 @@
 リポジトリのルートで実行する。`no_std` 検証にはベアメタル向け Rust target が必要。
 
 ```powershell
-cargo build --locked
+cargo build
 cargo fmt --check
-cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo doc --locked --no-deps --all-features --config "build.rustdocflags=['-Dwarnings']"
-cargo check --locked --lib --all-features --target x86_64-unknown-none
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo doc --no-deps --all-features --config "build.rustdocflags=['-Dwarnings']"
+cargo check --lib --all-features --target x86_64-unknown-none
 ```
 
 ## 状態と失敗の契約
