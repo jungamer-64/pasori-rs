@@ -13,7 +13,7 @@ use aes::{
 use alloc::vec::Vec;
 use cmac::{Cmac, Mac};
 use core::fmt;
-use rcs956::{reader::FelicaCard, transport::Transport};
+use felica_packet::Selection;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -143,14 +143,14 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
 /// Exclusive FeliCa Standard AES session. Releasing it requires a new card
 /// selection before further operations, which clears the card's RF state.
 #[derive(Debug)]
-pub struct Session<'a, T: Transport> {
-    card: FelicaCard<'a, T>,
+pub struct Session<S: Selection> {
+    card: S,
     secure: Option<Secure>,
     issue: Issue,
     nodes: usize,
 }
 
-impl<'a, T: Transport> Card<'a, T> {
+impl<S: Selection> Card<S> {
     /// Consume the ordinary card selection and authenticate using AES-128.
     /// Nodes appear in the same order in the key derivation and authentication
     /// command. Supply the system's individualization code, its operation
@@ -161,7 +161,7 @@ impl<'a, T: Transport> Card<'a, T> {
         individualization: &[u8; 16],
         operation_parameter: u8,
         challenge: [u8; 16],
-    ) -> Result<Session<'a, T>, Error<T::Error>> {
+    ) -> Result<Session<S>, Error<S::Error>> {
         let node_count = u8::try_from(nodes.len())
             .ok()
             .filter(|count| (1..=16).contains(count))
@@ -176,7 +176,7 @@ impl<'a, T: Transport> Card<'a, T> {
         let derivation = Aes128::new((&*group).into());
         let mut context = [0; 16];
         context[1] = 2;
-        context[6..14].copy_from_slice(self.selection().observation().idm.as_bytes());
+        context[6..14].copy_from_slice(self.selection().poll_response().idm.as_bytes());
         context[14] = 1;
         let alpha = Zeroizing::new(derive(&derivation, context, 1));
         let mut beta = Zeroizing::new(derive(&derivation, context, 2));
@@ -220,7 +220,7 @@ impl<'a, T: Transport> Card<'a, T> {
         alpha.encrypt_block((&mut host_proof).into());
         let mut request = [0; 26];
         request[..2].copy_from_slice(&[26, 0x42]);
-        request[2..10].copy_from_slice(self.selection().observation().idm.as_bytes());
+        request[2..10].copy_from_slice(self.selection().poll_response().idm.as_bytes());
         request[10..].copy_from_slice(&host_proof);
         let mut card = self.into_raw();
         let reply = exchange(&mut card, &request)?;
@@ -256,14 +256,14 @@ impl<'a, T: Transport> Card<'a, T> {
     }
 }
 
-impl<T: Transport> Session<'_, T> {
+impl<S: Selection> Session<S> {
     /// Authenticated issue data returned when establishing this session.
     pub fn issue(&self) -> Issue {
         self.issue
     }
 
     /// Read blocks in request order and verify the response before releasing data.
-    pub fn read_blocks(&mut self, blocks: &[Block]) -> Result<Vec<[u8; 16]>, Error<T::Error>> {
+    pub fn read_blocks(&mut self, blocks: &[Block]) -> Result<Vec<[u8; 16]>, Error<S::Error>> {
         let request = self.block_list(blocks.len(), MAX_READ_BLOCKS, blocks.iter().copied())?;
         self.transact(0x44, request, |reply| {
             let [0, 0, count, data @ ..] = status(reply)? else {
@@ -278,7 +278,7 @@ impl<T: Transport> Session<'_, T> {
 
     /// Write blocks through the authenticated session. A failure after command
     /// submission may leave the write applied. Reauthenticate to reconcile it.
-    pub fn write_blocks(&mut self, blocks: &[(Block, [u8; 16])]) -> Result<(), Error<T::Error>> {
+    pub fn write_blocks(&mut self, blocks: &[(Block, [u8; 16])]) -> Result<(), Error<S::Error>> {
         let mut request = self.block_list(
             blocks.len(),
             MAX_WRITE_BLOCKS,
@@ -303,7 +303,7 @@ impl<T: Transport> Session<'_, T> {
         count: usize,
         maximum: usize,
         blocks: impl Iterator<Item = Block>,
-    ) -> Result<Zeroizing<Vec<u8>>, Error<T::Error>> {
+    ) -> Result<Zeroizing<Vec<u8>>, Error<S::Error>> {
         if !(1..=maximum).contains(&count) {
             return Err(Error::BlockCount(count));
         }
@@ -327,8 +327,8 @@ impl<T: Transport> Session<'_, T> {
         &mut self,
         command: u8,
         mut payload: Zeroizing<Vec<u8>>,
-        decode: impl FnOnce(&[u8]) -> Result<U, Error<T::Error>>,
-    ) -> Result<U, Error<T::Error>> {
+        decode: impl FnOnce(&[u8]) -> Result<U, Error<S::Error>>,
+    ) -> Result<U, Error<S::Error>> {
         let secure = self.secure.as_ref().ok_or(Error::SessionUnavailable)?;
         let sent = secure
             .counter
@@ -351,10 +351,7 @@ impl<T: Transport> Session<'_, T> {
     }
 }
 
-fn exchange<T: Transport>(
-    card: &mut FelicaCard<'_, T>,
-    packet: &[u8],
-) -> Result<Vec<u8>, Error<T::Error>> {
+fn exchange<S: Selection>(card: &mut S, packet: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
     card.exchange_packet(packet)
         .map_err(|cause| Error::Exchange {
             command: packet[1],

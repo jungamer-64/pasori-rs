@@ -1,14 +1,10 @@
-//! FeliCa card commands over a card selected by RC-S956 polling.
+//! FeliCa card commands over a card selected by a reader's polling.
 //!
 //! Service and block numbers are encoded little-endian.
 
 use alloc::vec::Vec;
 use core::fmt;
-use rcs956::{
-    felica::Idm,
-    reader::{self, FelicaCard},
-    transport::Transport,
-};
+use felica_packet::{Idm, Selection};
 
 #[cfg(feature = "felica-lite-s")]
 pub mod lite_s;
@@ -384,9 +380,9 @@ fn validate_packet(input: &[u8], command: u8, minimum: usize) -> Result<(), Card
 pub enum Error<E> {
     /// Request validation failed before the command was sent.
     Request(CardError),
-    /// The reader command carrying the packet failed; its transaction
-    /// progress tells whether the packet was sent.
-    Reader(reader::Error<E>),
+    /// The reader exchange carrying the packet failed; the reader's error
+    /// tells whether the packet was sent.
+    Reader(E),
     /// The command was sent but the card reply reported an error or failed
     /// validation. The command may have taken effect.
     Response(CardError),
@@ -396,7 +392,7 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Request(_) => "FeliCa request rejected before sending",
-            Self::Reader(_) => "FeliCa reader command failed",
+            Self::Reader(_) => "FeliCa reader exchange failed",
             Self::Response(_) => "FeliCa response failed; the command may have taken effect",
         })
     }
@@ -411,33 +407,27 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
     }
 }
 
-impl<E> From<reader::Error<E>> for Error<E> {
-    fn from(error: reader::Error<E>) -> Self {
-        Self::Reader(error)
-    }
-}
-
 /// Typed command access to a FeliCa card selected by polling. Every command
 /// addresses the polled IDm and leaves no state that a new Polling does not
 /// clear.
 #[derive(Debug)]
-pub struct Card<'a, T: Transport> {
-    selection: FelicaCard<'a, T>,
+pub struct Card<S: Selection> {
+    selection: S,
 }
 
-impl<'a, T: Transport> Card<'a, T> {
+impl<S: Selection> Card<S> {
     /// Take typed command authority over a polled card.
-    pub fn new(selection: FelicaCard<'a, T>) -> Self {
+    pub fn new(selection: S) -> Self {
         Self { selection }
     }
 
-    /// The reader selection, including its polling response and rate.
-    pub fn selection(&self) -> &FelicaCard<'a, T> {
+    /// The reader selection, including its polling response.
+    pub fn selection(&self) -> &S {
         &self.selection
     }
 
     fn idm(&self) -> Idm {
-        self.selection.observation().idm
+        self.selection.poll_response().idm
     }
 
     /// Read up to twelve blocks from one unencrypted service. The caller chooses
@@ -446,10 +436,10 @@ impl<'a, T: Transport> Card<'a, T> {
         &mut self,
         service: u16,
         blocks: &[u16],
-    ) -> Result<ReadResponse, Error<T::Error>> {
+    ) -> Result<ReadResponse, Error<S::Error>> {
         let idm = self.idm();
         let request = read_without_encryption(idm, service, blocks).map_err(Error::Request)?;
-        let response = self.selection.exchange_packet(&request)?;
+        let response = self.exchange_packet(&request)?;
         ReadResponse::parse(&response, idm, blocks.len()).map_err(Error::Response)
     }
 
@@ -462,18 +452,18 @@ impl<'a, T: Transport> Card<'a, T> {
         &mut self,
         service: u16,
         blocks: &[BlockWrite],
-    ) -> Result<(), Error<T::Error>> {
+    ) -> Result<(), Error<S::Error>> {
         let idm = self.idm();
         let request = write_without_encryption(idm, service, blocks).map_err(Error::Request)?;
-        let response = self.selection.exchange_packet(&request)?;
+        let response = self.exchange_packet(&request)?;
         write_response(&response, idm).map_err(Error::Response)
     }
 
     /// Confirm that the selected card still answers at its IDm, using Request
     /// Response. Returns the card's current mode byte; the command changes no
-    /// card state. An absent card surfaces as a reader RF timeout, a different
-    /// card as [`Error::Response`].
-    pub fn request_response(&mut self) -> Result<u8, Error<T::Error>> {
+    /// card state. An absent card surfaces as the reader's failure to receive
+    /// a reply, a different card as [`Error::Response`].
+    pub fn request_response(&mut self) -> Result<u8, Error<S::Error>> {
         match self.exchange_command(0x04, &[], 0x05)?.as_slice() {
             [mode] => Ok(*mode),
             payload => Err(Error::Response(CardError::Length {
@@ -484,7 +474,7 @@ impl<'a, T: Transport> Card<'a, T> {
     }
 
     /// Request the system codes exposed by this card. Card products can omit this command.
-    pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<T::Error>> {
+    pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<S::Error>> {
         let idm = self.idm();
         let response = self.exchange_addressed(0x0c, &[])?;
         system_codes(&response, idm).map_err(Error::Response)
@@ -495,7 +485,7 @@ impl<'a, T: Transport> Card<'a, T> {
     pub fn search_service_code(
         &mut self,
         index: u16,
-    ) -> Result<Option<ServiceEntry>, Error<T::Error>> {
+    ) -> Result<Option<ServiceEntry>, Error<S::Error>> {
         let idm = self.idm();
         let response = self.exchange_addressed(0x0a, &index.to_le_bytes())?;
         service_entry(&response, idm).map_err(Error::Response)
@@ -510,7 +500,7 @@ impl<'a, T: Transport> Card<'a, T> {
         command: u8,
         parameters: &[u8],
         response_code: u8,
-    ) -> Result<Vec<u8>, Error<T::Error>> {
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         let idm = self.idm();
         let response = self.exchange_addressed(command, parameters)?;
         addressed_response(&response, idm, response_code)
@@ -518,9 +508,15 @@ impl<'a, T: Transport> Card<'a, T> {
             .map_err(Error::Response)
     }
 
-    fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
+    fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
         let request = addressed_command(self.idm(), command, data).map_err(Error::Request)?;
-        Ok(self.selection.exchange_packet(&request)?)
+        self.exchange_packet(&request)
+    }
+
+    fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
+        self.selection
+            .exchange_packet(packet)
+            .map_err(Error::Reader)
     }
 
     /// Authentication changes card state that a new Polling does not clear.
@@ -529,17 +525,16 @@ impl<'a, T: Transport> Card<'a, T> {
         self.selection.require_field_cycle();
     }
 
-    /// Consume typed command authority to send opaque packets at the card's
-    /// polling rate. Packets can affect addressing or card state, so the
-    /// polled identity is no longer an authority, and the next selection
-    /// cycles the RF field first.
-    pub fn into_raw(mut self) -> FelicaCard<'a, T> {
+    /// Consume typed command authority to send opaque packets. Packets can
+    /// affect addressing or card state, so the polled identity is no longer
+    /// an authority, and the next selection cycles the RF field first.
+    pub fn into_raw(mut self) -> S {
         self.selection.require_field_cycle();
         self.selection
     }
 
     /// Consume typed command authority for a host-run packet stream.
-    pub(crate) fn into_selection(self) -> FelicaCard<'a, T> {
+    pub(crate) fn into_selection(self) -> S {
         self.selection
     }
 }

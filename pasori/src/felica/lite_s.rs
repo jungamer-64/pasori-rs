@@ -12,7 +12,7 @@ use des::{
     TdesEde2,
     cipher::{BlockCipherEncrypt, KeyInit},
 };
-use rcs956::transport::Transport;
+use felica_packet::Selection;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -119,12 +119,12 @@ impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
 /// One mutually authenticated card selection and its session keys. A failed
 /// operation revokes these keys. The next reader selection clears RF state.
 #[derive(Debug)]
-pub struct AuthenticatedCard<'a, T: Transport> {
-    card: Card<'a, T>,
+pub struct AuthenticatedCard<S: Selection> {
+    card: Card<S>,
     keys: Option<SessionKeys>,
 }
 
-impl<'a, T: Transport> Card<'a, T> {
+impl<S: Selection> Card<S> {
     /// Authenticate a Lite-S card selected in system 88B4. Supply the card
     /// key in card byte order and a new 16-byte challenge from a CSPRNG.
     /// Authentication consumes the ordinary selection and never retries.
@@ -132,8 +132,8 @@ impl<'a, T: Transport> Card<'a, T> {
         mut self,
         card_key: &[u8; 16],
         challenge: [u8; 16],
-    ) -> Result<AuthenticatedCard<'a, T>, Error<T::Error>> {
-        let identity = *self.selection().observation();
+    ) -> Result<AuthenticatedCard<S>, Error<S::Error>> {
+        let identity = *self.selection().poll_response();
         if identity.pmm[1] != 0xf1 {
             return Err(Error::UnsupportedCard(identity.pmm[1]));
         }
@@ -172,9 +172,9 @@ impl<'a, T: Transport> Card<'a, T> {
     }
 }
 
-impl<T: Transport> AuthenticatedCard<'_, T> {
+impl<S: Selection> AuthenticatedCard<S> {
     /// Read a user block and verify its MAC before returning the data.
-    pub fn read_block(&mut self, block: UserBlock) -> Result<[u8; 16], Error<T::Error>> {
+    pub fn read_block(&mut self, block: UserBlock) -> Result<[u8; 16], Error<S::Error>> {
         self.with_keys(|keys, card| {
             let [data] = keys.read(card, Stage::Read, [u16::from(block.0)])?;
             Ok(data)
@@ -184,7 +184,7 @@ impl<T: Transport> AuthenticatedCard<'_, T> {
     /// Submit a write using the current authenticated write counter. Success
     /// reports the card's write status. A failure at `Stage::Write` may leave
     /// the write applied. Reauthenticate and inspect the card to reconcile it.
-    pub fn write_block(&mut self, block: UserBlock, data: [u8; 16]) -> Result<(), Error<T::Error>> {
+    pub fn write_block(&mut self, block: UserBlock, data: [u8; 16]) -> Result<(), Error<S::Error>> {
         self.with_keys(|keys, card| {
             let [counter] = keys.read(card, Stage::ReadCounter, [WRITE_COUNTER])?;
             keys.write(
@@ -199,8 +199,8 @@ impl<T: Transport> AuthenticatedCard<'_, T> {
 
     fn with_keys<U>(
         &mut self,
-        operation: impl FnOnce(&SessionKeys, &mut Card<'_, T>) -> Result<U, Error<T::Error>>,
-    ) -> Result<U, Error<T::Error>> {
+        operation: impl FnOnce(&SessionKeys, &mut Card<S>) -> Result<U, Error<S::Error>>,
+    ) -> Result<U, Error<S::Error>> {
         let keys = self.keys.take().ok_or(Error::SessionUnavailable)?;
         let result = operation(&keys, &mut self.card)?;
         self.keys = Some(keys);
@@ -216,11 +216,11 @@ fn counter_bytes<E>(data: [u8; 16]) -> Result<[u8; 3], Error<E>> {
     Ok([a, b, c])
 }
 
-fn write<T: Transport>(
-    card: &mut Card<'_, T>,
+fn write<S: Selection>(
+    card: &mut Card<S>,
     stage: Stage,
     blocks: &[BlockWrite],
-) -> Result<(), Error<T::Error>> {
+) -> Result<(), Error<S::Error>> {
     card.write_without_encryption(WRITE_SERVICE, blocks)
         .map_err(|cause| Error::Exchange { stage, cause })
 }
@@ -254,12 +254,12 @@ impl SessionKeys {
         }
     }
 
-    fn read<T: Transport, const N: usize>(
+    fn read<S: Selection, const N: usize>(
         &self,
-        card: &mut Card<'_, T>,
+        card: &mut Card<S>,
         stage: Stage,
         blocks: [u16; N],
-    ) -> Result<[[u8; 16]; N], Error<T::Error>> {
+    ) -> Result<[[u8; 16]; N], Error<S::Error>> {
         // One MAC_A block follows at most three data blocks in a four-block read.
         const { assert!(N >= 1 && N <= 3) };
         let mut request = [MAC_A; 4];
@@ -285,14 +285,14 @@ impl SessionKeys {
         self.mac(&self.read, addresses, data)
     }
 
-    fn write<T: Transport>(
+    fn write<S: Selection>(
         &self,
-        card: &mut Card<'_, T>,
+        card: &mut Card<S>,
         stage: Stage,
         block: u16,
         data: [u8; 16],
         counter: [u8; 3],
-    ) -> Result<(), Error<T::Error>> {
+    ) -> Result<(), Error<S::Error>> {
         write(
             card,
             stage,

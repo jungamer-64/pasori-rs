@@ -2,6 +2,7 @@
 //!
 //! These model command/response contracts, not physical device operation.
 
+use felica_packet::{Idm, PacketError, Selection};
 use pasori::{
     falp::{
         self, FalpAccepted, FalpConnect, FalpError, FalpLink, FalpListen, FalpTurn, Profile,
@@ -14,9 +15,11 @@ use pasori::{
     type2::{Type2EmulationError, Type2Event, Type2Tag, Type2Target},
 };
 use rcs956::{
-    felica::{BitRate, Idm, PacketError},
+    felica::BitRate,
     nfcb::PollOptions,
-    reader::{Error as ReaderError, Reader, RfTimeout, TargetExchangeError, TypeBSelection},
+    reader::{
+        Error as ReaderError, FelicaCard, Reader, RfTimeout, TargetExchangeError, TypeBSelection,
+    },
     transport::{Progress, TransactionError},
 };
 use rcs956_script::{
@@ -29,8 +32,8 @@ use std::{error::Error, io, time::Duration};
 #[cfg(feature = "felica-lite-s")]
 mod lite_s {
     use super::*;
+    use felica_packet::PollRequest;
     use pasori::felica::lite_s::{Error as LiteSError, Stage, UserBlock};
-    use rcs956::felica::PollRequest;
 
     const CHALLENGE: [u8; 16] = [
         0xf1, 0x87, 0x5a, 0x01, 0xf9, 0xb2, 0x9e, 0x4c, 0x06, 0xa1, 0xce, 0xc4, 0x16, 0x55, 0x85,
@@ -349,12 +352,20 @@ fn type_three_ndef_uses_the_ndef_system_and_publishes_length_last() -> Result<()
     let (transport, journal) = Script::new(steps);
     let mut reader = Reader::new(transport);
     reader.initialize()?;
-    let mut tag =
-        Type3Tag::poll(&mut reader, BitRate::Kbps212, timeout()?)?.ok_or("Type 3 tag absent")?;
+    let mut tag = poll_type_three(&mut reader)?;
     assert_eq!(tag.read_ndef()?, [0x32; 3]);
     tag.write_ndef(&[0x5a; 17])?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
+}
+
+fn poll_type_three(
+    reader: &mut Reader<Script>,
+) -> Result<Type3Tag<FelicaCard<'_, Script>>, Box<dyn Error>> {
+    let card = reader
+        .poll_felica(BitRate::Kbps212, ndef::TYPE3_POLLING, timeout()?)?
+        .ok_or("Type 3 tag absent")?;
+    Type3Tag::new(Card::new(card)).map_err(|_| "Type 3 polling rejected".into())
 }
 
 #[test]
@@ -377,8 +388,7 @@ fn type_three_ndef_preserves_update_progress_and_detects_the_write_flag()
     let (transport, journal) = Script::new(steps);
     let mut reader = Reader::new(transport);
     reader.initialize()?;
-    let mut tag =
-        Type3Tag::poll(&mut reader, BitRate::Kbps212, timeout()?)?.ok_or("Type 3 tag absent")?;
+    let mut tag = poll_type_three(&mut reader)?;
     assert!(matches!(
         tag.write_ndef(&[0; 33]),
         Err(ndef::WriteError::Preparation(ndef::Error::Capacity {
@@ -664,9 +674,9 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
             .map(Card::new)
             .ok_or("expected selected FeliCa card")?;
         assert_eq!(card.selection().target(), 7);
-        assert_eq!(card.selection().observation().idm, Idm::new(IDENTITY));
-        assert_eq!(card.selection().observation().pmm, PARAMETERS);
-        assert_eq!(card.selection().observation().request_data, None);
+        assert_eq!(card.selection().poll_response().idm, Idm::new(IDENTITY));
+        assert_eq!(card.selection().poll_response().pmm, PARAMETERS);
+        assert_eq!(card.selection().poll_response().request_data, None);
         assert_eq!(
             card.read_without_encryption(0x1a8b, &[0])?.blocks(),
             &[[0x5a; 16]]
@@ -2265,7 +2275,9 @@ fn connected_initiator() -> Vec<Step> {
     steps
 }
 
-fn falp_connect(card: Card<'_, Script>) -> Result<FalpLink<'_, Script>, FalpError<io::Error>> {
+fn falp_connect(
+    card: Card<FelicaCard<'_, Script>>,
+) -> Result<FalpLink<'_, Script>, FalpError<io::Error>> {
     card.connect_falp(FalpConnect {
         profile: Profile::Speed1,
         application: b"A",

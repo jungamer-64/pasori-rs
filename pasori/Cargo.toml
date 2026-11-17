@@ -10,6 +10,7 @@ felica-lite-s = ["dep:des", "dep:subtle", "dep:zeroize"]
 felica-standard-aes = ["dep:aes", "dep:cmac", "dep:subtle", "dep:zeroize"]
 
 [dependencies]
+felica-packet = { path = "../felica-packet", version = "0.1" }
 rcs956 = { path = "../rcs956", version = "0.1" }
 aes = { version = "0.9", features = ["zeroize"], optional = true }
 cmac = { version = "0.8", features = ["zeroize"], optional = true }

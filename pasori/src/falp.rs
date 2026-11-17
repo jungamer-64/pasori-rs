@@ -7,7 +7,7 @@
 
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::{fmt, time::Duration};
-use rcs956::felica::Idm;
+use felica_packet::Idm;
 
 mod session;
 

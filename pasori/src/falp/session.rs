@@ -5,9 +5,13 @@ use super::{
 use crate::{falp, felica::Card};
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
+use felica_packet::{Idm, Selection};
 use rcs956::{
-    felica::{BitRate, Idm},
-    reader::{Error, FelicaLink, FelicaListen as ListenIdentity, FelicaRole, Reader, RfTimeout},
+    felica::BitRate,
+    reader::{
+        Error, FelicaCard, FelicaLink, FelicaListen as ListenIdentity, FelicaRole, Reader,
+        RfTimeout,
+    },
     transport::Transport,
 };
 
@@ -405,7 +409,7 @@ pub fn listen<'a, T: Transport>(
     Ok(FalpAccepted { link, turn })
 }
 
-impl<'a, T: Transport> Card<'a, T> {
+impl<'a, T: Transport> Card<FelicaCard<'a, T>> {
     /// Connect to a FALP target selected by polling, at its polling rate.
     /// Propose is sent once; the answer and the handshake response are then
     /// awaited until their timeouts elapse. The card's typed authority ends
@@ -421,7 +425,7 @@ impl<'a, T: Transport> Card<'a, T> {
         if !propose_range.contains(&config.propose_timeout) || config.handshake_timeout.is_zero() {
             return Err(FalpError::TimeoutRange);
         }
-        let idm = self.selection().observation().idm;
+        let idm = self.selection().poll_response().idm;
         let mut link = self.into_selection().into_link()?;
         let local = LocalParameters::new(
             config.profile,

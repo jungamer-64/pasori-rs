@@ -3,8 +3,8 @@
 //! Responses are built independently of the production frame encoder. The
 //! script models command and response contracts, not physical device timing.
 
+use felica_packet::{PollRequest, PollRequestError};
 use rcs956::{
-    felica::{PollRequest, PollRequestError},
     reader::{RfTimeout, TimeoutRange},
     transport::Transport,
     wire::{self, Direction, Frame},

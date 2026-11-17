@@ -16,12 +16,13 @@ pub use type_a_target::{TypeACommand, TypeATarget};
 pub use type1::Type1Target;
 
 use crate::{
-    felica::{self, BitRate, PacketError, PollRequest, PollResponse},
+    felica::BitRate,
     iso14443, nfca, nfcb,
     transport::{Failure, Link, Progress, TransactionError, Transport},
 };
 use alloc::{string::String, vec, vec::Vec};
 use core::{error, fmt, mem, time::Duration};
+use felica_packet::{PacketError, PollRequest, PollResponse, Selection};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
@@ -798,6 +799,7 @@ impl<T: Transport> Reader<T> {
                 };
                 Ok(Some(FelicaCard {
                     reader: self,
+                    request,
                     observation,
                     target: *target,
                     timeout,
@@ -1581,22 +1583,20 @@ fn admit_command<E>(data: &[u8], maximum: usize) -> Result<(), TargetExchangeErr
 
 /// Selected FeliCa card whose operation authority is tied to one reader borrow.
 ///
-/// A packet that leaves card state which a new Polling does not clear, such
-/// as authentication, must be declared with [`Self::require_field_cycle`]
-/// before it is sent.
+/// [`Selection::exchange_packet`] sends one packet using `A0` with the
+/// polling timeout. A packet that leaves card state which a new Polling does
+/// not clear, such as authentication, must be declared with
+/// [`Selection::require_field_cycle`] before it is sent.
 #[derive(Debug)]
 pub struct FelicaCard<'a, T: Transport> {
     reader: &'a mut Reader<T>,
+    request: PollRequest,
     observation: PollResponse,
     target: u8,
     timeout: RfTimeout,
     rate: BitRate,
 }
-impl<'a, T: Transport> FelicaCard<'a, T> {
-    /// Polling information. IDm is a session address, not a universal persistent ID.
-    pub fn observation(&self) -> &PollResponse {
-        &self.observation
-    }
+impl<T: Transport> FelicaCard<'_, T> {
     /// Reader-selected target number.
     pub fn target(&self) -> u8 {
         self.target
@@ -1605,21 +1605,27 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
     pub fn rate(&self) -> BitRate {
         self.rate
     }
-    /// Make the next selection cycle the RF field before its request, because
-    /// the card now holds state that a new Polling does not clear.
-    pub fn require_field_cycle(&mut self) {
-        self.reader.require_field_cycle();
+}
+impl<T: Transport> Selection for FelicaCard<'_, T> {
+    type Error = Error<T::Error>;
+
+    fn poll_request(&self) -> PollRequest {
+        self.request
     }
-    /// Send one FeliCa packet using `A0` with the polling timeout and return
-    /// the card's reply. Both packets include their FeliCa length byte and
-    /// exclude CRC. Packet effects are never replayed automatically.
-    pub fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
-        felica::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
+    /// IDm is a session address, not a universal persistent ID.
+    fn poll_response(&self) -> &PollResponse {
+        &self.observation
+    }
+    fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
+        felica_packet::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         let response = self
             .reader
             .exchange_rf(packet, self.timeout, RfProtocol::Felica)?;
-        felica::validate_length(&response, 2).map_err(Error::FelicaResponse)?;
+        felica_packet::validate_length(&response, 2).map_err(Error::FelicaResponse)?;
         Ok(response)
+    }
+    fn require_field_cycle(&mut self) {
+        self.reader.require_field_cycle();
     }
 }
 

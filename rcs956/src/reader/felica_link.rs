@@ -1,10 +1,8 @@
 use super::{Error, FelicaCard, Reader, RfTimeout, State};
-use crate::{
-    felica::{self, BitRate, Idm},
-    transport::Transport,
-};
+use crate::{felica::BitRate, transport::Transport};
 use alloc::vec::Vec;
 use core::time::Duration;
+use felica_packet::Idm;
 
 /// Host wait of one-way frames.
 const READER_WAIT: Duration = Duration::from_secs(1);
@@ -92,7 +90,7 @@ impl<T: Transport> Reader<T> {
             [mode, ..] => return Err(Error::TargetMode(*mode)),
             [] => return Err(Error::Response("target activation length")),
         };
-        felica::validate_length(packet, 2).map_err(Error::FelicaResponse)?;
+        felica_packet::validate_length(packet, 2).map_err(Error::FelicaResponse)?;
         let packet = packet.to_vec();
         Ok(FelicaActivation {
             link: FelicaLink {
@@ -151,7 +149,7 @@ impl<T: Transport> FelicaLink<'_, T> {
 
     /// Send one packet without receiving a reply.
     pub fn send(&mut self, packet: &[u8]) -> Result<(), Error<T::Error>> {
-        felica::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
+        felica_packet::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         match self.role {
             FelicaRole::Initiator => {
                 // A zero wait sends without receiving and reports RF timeout.
@@ -194,7 +192,7 @@ impl<T: Transport> FelicaLink<'_, T> {
         packet: &[u8],
         wait: RfTimeout,
     ) -> Result<Option<Vec<u8>>, Error<T::Error>> {
-        felica::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
+        felica_packet::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         let mut args = Vec::with_capacity(packet.len() + 2);
         args.extend_from_slice(&wait.ticks().to_le_bytes());
         args.extend_from_slice(packet);
@@ -213,7 +211,7 @@ impl<T: Transport> FelicaLink<'_, T> {
             return Ok(None);
         }
         let packet = self.reader.rf_response(response)?;
-        felica::validate_length(&packet, 2).map_err(Error::FelicaResponse)?;
+        felica_packet::validate_length(&packet, 2).map_err(Error::FelicaResponse)?;
         Ok(Some(packet))
     }
 }
