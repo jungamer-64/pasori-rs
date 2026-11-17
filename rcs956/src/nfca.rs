@@ -2,7 +2,7 @@
 //!
 //! Parsing begins after the reader's target number. UID bytes remain in wire
 //! order, and ATS retains its own inclusive length byte without RF CRC bytes.
-use crate::isodep::FrameSize;
+use crate::iso14443::{self, FrameSize};
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
@@ -130,9 +130,9 @@ impl Ats {
     pub fn fwi(&self) -> u8 {
         self.fwi
     }
-    /// Card frame waiting time rounded upward by the shared ISO-DEP time conversion.
+    /// Card frame waiting time, rounded upward to whole nanoseconds.
     pub fn frame_wait(&self) -> Duration {
-        crate::isodep::frame_wait(self.fwi)
+        iso14443::frame_wait(self.fwi)
     }
     /// Startup frame guard integer; 0 means no additional startup guard time.
     pub fn sfgi(&self) -> u8 {

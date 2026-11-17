@@ -1,35 +1,37 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
 mod dep;
+mod felica_link;
 mod identity;
+mod type1;
+mod type_a_target;
 
 pub use dep::{
     DepActivation, DepError, DepInitiator, DepLink, DepMessage, DepMode, DepPeer, DepRate,
     DepRequest, DepTransferCause, MAX_DEP_MESSAGE_BYTES, PassiveDepTarget,
 };
-pub use falp::{
-    FalpAccepted, FalpConnect, FalpError, FalpLink, FalpListen, FalpTurn, TransferCause,
-};
+pub use felica_link::{FelicaActivation, FelicaLink, FelicaListen, FelicaRole};
 pub use identity::{DeviceNameError, Model, Product};
-pub use type1::Type1Tag;
-pub use type2_target::{
-    MAX_TYPE2_EMULATED_NDEF_BYTES, Type2EmulationError, Type2Event, Type2Target,
-};
+pub use type_a_target::{TypeACommand, TypeATarget};
+pub use type1::Type1Target;
 
 use crate::{
-    felica::{
-        self, BitRate, BlockWrite, CardError, PollRequest, PollResponse, ReadResponse, ServiceEntry,
-    },
-    isodep, nfca, nfcb,
+    felica::{self, BitRate, PacketError, PollRequest, PollResponse},
+    iso14443, nfca, nfcb,
     transport::{Failure, Link, Progress, TransactionError, Transport},
 };
 use alloc::{string::String, vec, vec::Vec};
-use core::{error, fmt, mem, num::NonZeroU8, time::Duration};
+use core::{error, fmt, mem, time::Duration};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
 /// Maximum card-command bytes accepted by the reader's NFC-B `40` exchange.
 pub const MAX_TYPE_B_FRAME_COMMAND_BYTES: usize = 63;
+/// Reader block buffer of an NFC-B `A0` block transfer in each direction,
+/// including the two CRC bytes that the reader appends and removes.
+pub const MAX_TYPE_B_BLOCK_BYTES: usize = 64;
+/// Status of an `A0` or `40` reply whose low six bits report an RF timeout.
+const RF_TIMEOUT: u8 = 0x01;
 const MAX_TYPE_A_RESPONSE_FRAGMENTS: usize = 256;
 /// `40` reader status bit announcing a further response fragment.
 const TARGET_MORE_INFORMATION: u8 = 0x40;
@@ -55,19 +57,19 @@ pub enum Error<E> {
     /// requires reader initialization; a masked `0B` is returned only after a
     /// 10 ms settle wait.
     RfStatus(u8),
-    /// FeliCa request validation failed before the command was sent.
-    FelicaRequest(CardError),
-    /// The FeliCa command was sent but the card reply reported an error or
-    /// failed validation. The command may have taken effect.
-    FelicaResponse(CardError),
+    /// A FeliCa packet was malformed before it was sent.
+    FelicaRequest(PacketError),
+    /// A FeliCa reply was malformed. The packet that caused it was sent and
+    /// may have taken effect.
+    FelicaResponse(PacketError),
     /// The requested RF wait cannot be encoded as nonzero half-ms ticks.
     Timeout(TimeoutRange),
     /// NFC-A activation data failed validation.
     TypeA(nfca::Error),
     /// NFC-B activation data failed validation.
     TypeB(nfcb::Error),
-    /// Activated NFC-B parameters cannot construct a supported ISO-DEP session.
-    IsoDepParameters(isodep::ParameterError),
+    /// Target activation reported a mode other than the one the command set up.
+    TargetMode(u8),
     /// Payload exceeds the selected reader command's supported limit.
     InputLength {
         /// Maximum accepted bytes.
@@ -93,7 +95,7 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
             Self::Timeout(_) => f.write_str("invalid RF wait"),
             Self::TypeA(_) => f.write_str("invalid NFC-A activation"),
             Self::TypeB(_) => f.write_str("invalid NFC-B activation"),
-            Self::IsoDepParameters(_) => f.write_str("unsupported ISO-DEP parameters"),
+            Self::TargetMode(mode) => write!(f, "unexpected target mode {mode:02X}"),
             Self::InputLength { maximum, actual } => {
                 write!(f, "input of {actual} bytes exceeds {maximum}")
             }
@@ -109,9 +111,15 @@ impl<E: error::Error + 'static> error::Error for Error<E> {
             Self::Timeout(error) => Some(error),
             Self::TypeA(error) => Some(error),
             Self::TypeB(error) => Some(error),
-            Self::IsoDepParameters(error) => Some(error),
             _ => None,
         }
+    }
+}
+impl<E> Error<E> {
+    /// Whether this is the RF status of a transfer that received no answer
+    /// within its RF wait. Other RF statuses report a received but invalid frame.
+    pub fn is_rf_timeout(&self) -> bool {
+        matches!(self, Self::RfStatus(status) if status & 0x3f == RF_TIMEOUT)
     }
 }
 impl<E> From<TimeoutRange> for Error<E> {
@@ -137,6 +145,9 @@ pub struct RfTimeout {
     ticks: u16,
 }
 impl RfTimeout {
+    /// The longest wait the reader encodes, 65535 half-ms ticks.
+    pub const MAX: Self = Self { ticks: u16::MAX };
+
     /// Round a positive duration up to half-ms ticks.
     ///
     /// # Errors
@@ -359,7 +370,7 @@ impl TargetWait {
     /// about 4.4 FWT, so four FWT cover retransmission and two maximal FWT
     /// (FWI 14) leave room for WTX.
     fn iso_dep(fwt: Duration) -> Self {
-        Self::IsoDep(fwt * 4 + isodep::frame_wait(14) * 2)
+        Self::IsoDep(fwt * 4 + iso14443::frame_wait(14) * 2)
     }
 
     /// Host deadline: the card bound plus the margin of every reader command.
@@ -444,12 +455,11 @@ enum RawTypeAResponse {
 #[derive(Debug, Clone, Copy)]
 enum RfSelection {
     Ordinary,
-    Type2Sector(NonZeroU8),
     /// The card can hold state that the next selection request does not
     /// clear, so that selection cycles the RF field first. Firmware may have
     /// activated a target that this crate rejected without granting a handle,
-    /// which can then ignore the next request; or raw packets or
-    /// authentication changed the card outside the typed operations.
+    /// which can then ignore the next request; or the holder of a selection
+    /// declared such a state change.
     FieldCycleRequired,
 }
 
@@ -836,7 +846,7 @@ impl<T: Transport> Reader<T> {
 
     /// Activate one NFC-B target at 106 kbps. ATQB determines which exchange
     /// authority the result grants. The caller chooses the RF table and AFI.
-    /// `timeout` is the detection wait; ISO-DEP block waits come from ATQB.
+    /// `timeout` is the detection wait and the wait of frame exchanges.
     pub fn poll_type_b(
         &mut self,
         options: nfcb::PollOptions,
@@ -848,23 +858,25 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
-                let (observation, session) = match type_b_activation(data, options) {
-                    Ok(activation) => activation,
+                let observation = match nfcb::Observation::parse(data) {
+                    Ok(observation) => observation,
                     Err(error) => {
                         self.require_field_cycle();
-                        return Err(error);
+                        return Err(Error::TypeB(error));
                     }
                 };
                 self.apply_type_b_receiver()?;
+                let iso_dep = observation.supports_iso_dep();
                 let target = TypeBTarget {
                     reader: self,
                     number: *target,
                     observation,
                     profile: options.profile,
                 };
-                Ok(Some(match session {
-                    Some(session) => TypeBSelection::IsoDep(TypeBCard { target, session }),
-                    None => TypeBSelection::Frame(TypeBFrameCard { target, timeout }),
+                Ok(Some(if iso_dep {
+                    TypeBSelection::IsoDep(TypeBBlockCard { target })
+                } else {
+                    TypeBSelection::Frame(TypeBFrameCard { target, timeout })
                 }))
             }
             _ => {
@@ -1110,6 +1122,11 @@ impl<E: error::Error + 'static> error::Error for TargetExchangeError<E> {
 }
 
 /// NFC-A selection tied to one exclusive reader borrow.
+///
+/// The selection's activation assumptions hold while the card keeps the
+/// state that activation established. A command that leaves state which the
+/// next selection request does not clear must be declared with
+/// [`Self::require_field_cycle`] before it is sent.
 #[derive(Debug)]
 pub struct TypeACard<'a, T: Transport> {
     reader: &'a mut Reader<T>,
@@ -1118,35 +1135,6 @@ pub struct TypeACard<'a, T: Transport> {
     timeout: RfTimeout,
 }
 impl<'a, T: Transport> TypeACard<'a, T> {
-    pub(crate) fn type2_sector(&self) -> u8 {
-        match self.reader.state {
-            State::Ready {
-                rf:
-                    RfMode::Configured {
-                        selection: RfSelection::Type2Sector(sector),
-                        ..
-                    },
-                ..
-            } => sector.get(),
-            _ => 0,
-        }
-    }
-
-    pub(crate) fn record_type2_sector(&mut self, selected: u8) {
-        if let State::Ready {
-            rf: RfMode::Configured { selection, .. },
-            ..
-        } = &mut self.reader.state
-        {
-            *selection =
-                NonZeroU8::new(selected).map_or(RfSelection::Ordinary, RfSelection::Type2Sector);
-        }
-    }
-
-    pub(crate) fn invalidate(&mut self) {
-        self.reader.state = State::NeedsInitialization;
-    }
-
     /// Validated activation data for this selection.
     pub fn observation(&self) -> &nfca::Observation {
         &self.observation
@@ -1170,8 +1158,13 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     pub fn set_exchange_timeout(&mut self, timeout: RfTimeout) {
         self.timeout = timeout;
     }
-    /// Consume the typed selection and allow caller-defined card commands.
-    /// Such commands can change card state that typed operations depend on.
+    /// Make the next selection cycle the RF field before its request, because
+    /// the card now holds state that a selection request does not clear.
+    pub fn require_field_cycle(&mut self) {
+        self.reader.require_field_cycle();
+    }
+    /// Consume the typed selection and allow caller-defined card commands
+    /// whose responses can span several reader fragments.
     pub fn into_raw(self) -> RawTypeACard<'a, T> {
         RawTypeACard {
             reader: self.reader,
@@ -1180,9 +1173,15 @@ impl<'a, T: Transport> TypeACard<'a, T> {
         }
     }
 
-    // Only for crate-owned commands whose response is a single frame and
-    // whose effects preserve the typed selection's activation assumptions.
-    pub(crate) fn exchange(
+    /// Send one card command through `40` and return its single response
+    /// fragment, including the unmodified reader status.
+    ///
+    /// Input must contain 1 to [`MAX_TYPE_A_COMMAND_BYTES`] bytes; rejection
+    /// preserves the selection. A response announcing a further fragment, or
+    /// lacking its reader status, cannot be collected through this handle and
+    /// requires reader initialization. Use [`Self::into_raw`] for commands
+    /// whose responses can continue.
+    pub fn exchange(
         &mut self,
         data: &[u8],
     ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
@@ -1192,26 +1191,23 @@ impl<'a, T: Transport> TypeACard<'a, T> {
             .exchange_single_response(RfProtocol::TypeA, self.target, data, timeout)
     }
 
-    /// Exchange one ISO-DEP APDU and collect reader-reported continuation
-    /// fragments. Requires completed activation with ATS. The APDU is sent
-    /// once. Failure after submission returns any accumulated response and
-    /// invalidates the selection before another command can be sent. Each
-    /// fragment may take four ATS frame waiting times plus about 9.9 s for
-    /// WTX before the host abandons it as a deadline.
-    pub fn exchange_apdu(
-        &mut self,
-        apdu: &[u8],
-    ) -> Result<Vec<u8>, isodep::Error<Error<T::Error>>> {
+    /// Exchange one APDU through the reader's ISO-DEP and collect
+    /// reader-reported continuation fragments. Requires completed activation
+    /// with ATS. The APDU is sent once. Failure after submission returns any
+    /// accumulated response and requires reader initialization before another
+    /// command can be sent. Each fragment may take four ATS frame waiting
+    /// times plus about 9.9 s for WTX before the host abandons it as a deadline.
+    pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, ApduError<T::Error>> {
         const MAX_RESPONSE_BYTES: usize = 65_536;
-        let mut progress = isodep::Progress::default();
+        let mut progress = ApduProgress::default();
         let mut output = Vec::new();
         let result = (|| {
             let ats = match self.observation.ats() {
                 Some(ats) if self.observation.supports_iso_dep() => ats,
-                _ => return Err(isodep::Cause::ActivationRequired),
+                _ => return Err(ApduCause::ActivationRequired),
             };
             if apdu.is_empty() || apdu.len() > MAX_TYPE_A_COMMAND_BYTES {
-                return Err(isodep::Cause::InputLength {
+                return Err(ApduCause::InputLength {
                     actual: apdu.len(),
                     maximum: MAX_TYPE_A_COMMAND_BYTES,
                 });
@@ -1220,52 +1216,137 @@ impl<'a, T: Transport> TypeACard<'a, T> {
             match self.reader.prepare_target_exchange(RfProtocol::TypeA, wait) {
                 Ok(()) => {}
                 Err(TargetExchangeError::Preparation(error)) => {
-                    return Err(isodep::Cause::Preparation(error));
+                    return Err(ApduCause::Preparation(error));
                 }
-                Err(_) => return Err(isodep::Cause::SessionInvalid),
+                Err(_) => return Err(ApduCause::SessionInvalid),
             }
-            progress.attempted_application_bytes = apdu.len();
-            progress.frames = 1;
-            let mut response = match self.reader.exchange_target(self.target, apdu, wait) {
-                Ok(response) => {
-                    progress.acknowledged_application_bytes = apdu.len();
-                    response
-                }
-                Err(error) => return Err(isodep::Cause::Transport(error)),
-            };
+            progress.fragments = 1;
+            let mut response = self
+                .reader
+                .exchange_target(self.target, apdu, wait)
+                .map_err(ApduCause::Exchange)?;
+            progress.delivered = true;
             loop {
                 if response.status & 0x80 != 0 {
-                    return Err(isodep::Cause::InvalidBlock("unexpected NFC-A NAD"));
+                    return Err(ApduCause::NodeAddress);
                 }
                 if output.len() + response.data.len() > MAX_RESPONSE_BYTES {
-                    return Err(isodep::Cause::Budget(isodep::Budget::ResponseBytes));
+                    return Err(ApduCause::ResponseBytes);
                 }
                 output.extend_from_slice(&response.data);
-                progress.received_application_bytes = output.len();
+                progress.received_bytes = output.len();
                 if response.status & TARGET_MORE_INFORMATION == 0 {
                     return Ok(());
                 }
-                if progress.frames == MAX_TYPE_A_RESPONSE_FRAGMENTS {
-                    return Err(isodep::Cause::Budget(isodep::Budget::Frames));
+                if progress.fragments == MAX_TYPE_A_RESPONSE_FRAGMENTS {
+                    return Err(ApduCause::Fragments);
                 }
-                progress.frames += 1;
+                progress.fragments += 1;
                 response = self
                     .reader
                     .exchange_target(self.target, &[], wait)
-                    .map_err(isodep::Cause::Transport)?;
+                    .map_err(ApduCause::Exchange)?;
             }
         })();
         if let Err(cause) = result {
-            if progress.frames != 0 {
+            if progress.fragments != 0 {
                 self.reader.state = State::NeedsInitialization;
             }
-            return Err(isodep::Error {
+            return Err(ApduError {
                 cause,
                 progress,
                 partial_response: output,
             });
         }
         Ok(output)
+    }
+}
+
+/// Why an APDU exchanged through the reader's NFC-A ISO-DEP did not complete.
+#[derive(Debug)]
+pub enum ApduCause<E> {
+    /// The selection has no ISO-DEP activation with ATS. Nothing was sent.
+    ActivationRequired,
+    /// The APDU length is outside `1..=maximum`. Nothing was sent and the
+    /// selection remains usable.
+    InputLength {
+        /// Supplied bytes.
+        actual: usize,
+        /// Largest APDU the reader command admits.
+        maximum: usize,
+    },
+    /// The selection has already lost its operation authority.
+    SessionInvalid,
+    /// Reader timing setup failed before the APDU was sent.
+    Preparation(Error<E>),
+    /// The transaction carrying the APDU or a continuation failed; the APDU
+    /// may have taken effect.
+    Exchange(Error<E>),
+    /// A response fragment announced a node address, which this selection
+    /// never requests.
+    NodeAddress,
+    /// The accumulated response exceeded 65536 bytes.
+    ResponseBytes,
+    /// The response needed more than 256 reader fragments.
+    Fragments,
+}
+
+/// Progress of one APDU through the reader's NFC-A ISO-DEP.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApduProgress {
+    /// `40` transactions attempted, including unsuccessful ones. A nonzero
+    /// count means the APDU was handed to the reader.
+    pub fragments: usize,
+    /// The first response fragment arrived, so the card received the APDU.
+    pub delivered: bool,
+    /// Response bytes accumulated before completion or failure.
+    pub received_bytes: usize,
+}
+
+/// A failed reader-run ISO-DEP exchange with its partial response.
+#[derive(Debug)]
+pub struct ApduError<E> {
+    /// Machine-readable failure classification.
+    pub cause: ApduCause<E>,
+    /// Observed progress; an error never implies the APDU had no effect.
+    pub progress: ApduProgress,
+    /// Response bytes accumulated before failure.
+    pub partial_response: Vec<u8>,
+}
+
+impl<E: fmt::Debug> fmt::Display for ApduError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.cause {
+            ApduCause::ActivationRequired => {
+                return f.write_str("target has no ISO-DEP activation");
+            }
+            ApduCause::InputLength { actual, maximum } => {
+                return write!(f, "APDU of {actual} bytes is outside 1..={maximum}");
+            }
+            ApduCause::SessionInvalid => return f.write_str("card selection is no longer valid"),
+            ApduCause::Preparation(_) => {
+                return f.write_str("reader setup failed before the APDU was sent");
+            }
+            ApduCause::Exchange(_) => f.write_str("reader ISO-DEP exchange failed")?,
+            ApduCause::NodeAddress => f.write_str("response fragment announced a node address")?,
+            ApduCause::ResponseBytes => f.write_str("APDU response exceeds its limit")?,
+            ApduCause::Fragments => f.write_str("APDU response fragment limit exceeded")?,
+        }
+        let p = &self.progress;
+        write!(
+            f,
+            " after {} fragments; delivered {}; response bytes {}",
+            p.fragments, p.delivered, p.received_bytes,
+        )
+    }
+}
+
+impl<E: error::Error + 'static> error::Error for ApduError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match &self.cause {
+            ApduCause::Preparation(error) | ApduCause::Exchange(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
@@ -1365,20 +1446,13 @@ impl<T: Transport> RawTypeACard<'_, T> {
     }
 }
 
-/// NFC-B ISO-DEP selection, with a block-number state that cannot outlive the
-/// reader selection. Protocol failure poisons the session; it never replays APDUs.
+/// NFC-B selection whose ATQB advertises ISO-DEP. The host runs the block
+/// protocol; the reader transfers each block and owns its CRC.
 #[derive(Debug)]
-pub struct TypeBCard<'a, T: Transport> {
+pub struct TypeBBlockCard<'a, T: Transport> {
     target: TypeBTarget<'a, T>,
-    session: isodep::Session,
 }
-impl<T: Transport> TypeBCard<'_, T> {
-    /// Largest APDU this session admits: the local limit, the card buffer
-    /// advertised by MBLI, and the frame budget, whichever is smallest.
-    pub fn maximum_apdu_bytes(&self) -> usize {
-        self.session.maximum_apdu_bytes()
-    }
-
+impl<T: Transport> TypeBBlockCard<'_, T> {
     /// Validated activation data, including ATQB and negotiated CID.
     pub fn observation(&self) -> &nfcb::Observation {
         &self.target.observation
@@ -1387,51 +1461,47 @@ impl<T: Transport> TypeBCard<'_, T> {
     pub fn target(&self) -> u8 {
         self.target.number
     }
-    /// Exchange one APDU, handling ISO-DEP chaining, R-blocks and bounded WTX.
-    /// Errors distinguish reader setup (zero application progress) from RF
-    /// transfer attempts. Setup applies 32/02 selector 0x10 and a 3280 ms reader
-    /// response step; each A0 block independently uses its FWI/WTX wait.
-    /// Application APDUs are never retried.
-    pub fn exchange_apdu(
-        &mut self,
-        apdu: &[u8],
-    ) -> Result<Vec<u8>, isodep::Error<Error<T::Error>>> {
-        let reader = &mut self.target.reader;
-        let protocol = RfProtocol::TypeB(self.target.profile);
-        let exchange = self.session.prepare(apdu)?;
-        // One fixed 3280 ms selector and its 1C timer cover every block of the
-        // APDU. A0 keeps its independent FWI/WTX wait; individual blocks do
-        // not reprogram 1C.
-        let setup =
-            reader.prepare_exchange_timing(protocol, TargetWait::Step(ResponseTimeout::Ms3280));
-        exchange.exchange(
-            setup,
-            |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
-            |block, wait| {
-                let timeout = RfTimeout::new(wait)?;
-                reader.exchange_rf(block, timeout, protocol)
-            },
-        )
+    /// Make the next selection cycle the RF field before its request, because
+    /// the card now holds state that a selection request does not clear.
+    pub fn require_field_cycle(&mut self) {
+        self.target.reader.require_field_cycle();
     }
-
-    /// Confirm that the card still answers between APDUs, using the same
-    /// reader setup as [`Self::exchange_apdu`]. The probe carries no
-    /// application data and leaves block numbering unchanged. Any failure,
-    /// including an absent card, invalidates the session.
-    pub fn check_presence(&mut self) -> Result<(), isodep::PresenceError<Error<T::Error>>> {
-        let reader = &mut self.target.reader;
+    /// Apply the reader timing that every block transfer runs under: `32/02`
+    /// selector 0x10 (a 3280 ms response step) and its `1C` timer. Each block
+    /// keeps its own `A0` wait. Failure sends no block and leaves the reader
+    /// requiring initialization.
+    pub fn blocks(&mut self) -> Result<TypeBBlocks<'_, T>, Error<T::Error>> {
         let protocol = RfProtocol::TypeB(self.target.profile);
-        let check = self.session.admit_presence_check()?;
-        let setup =
-            reader.prepare_exchange_timing(protocol, TargetWait::Step(ResponseTimeout::Ms3280));
-        check.run(
-            setup,
-            |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
-            |block, wait| {
-                let timeout = RfTimeout::new(wait)?;
-                reader.exchange_rf(block, timeout, protocol)
-            },
-        )
+        self.target
+            .reader
+            .prepare_exchange_timing(protocol, TargetWait::Step(ResponseTimeout::Ms3280))?;
+        Ok(TypeBBlocks {
+            reader: self.target.reader,
+            protocol,
+        })
+    }
+}
+
+/// Block transfer authority of an NFC-B ISO-DEP selection after its timing setup.
+#[derive(Debug)]
+pub struct TypeBBlocks<'s, T: Transport> {
+    reader: &'s mut Reader<T>,
+    protocol: RfProtocol,
+}
+impl<T: Transport> TypeBBlocks<'_, T> {
+    /// Send one block of at most [`MAX_TYPE_B_BLOCK_BYTES`] including CRC,
+    /// without its CRC, and return the card's reply block without CRC. A
+    /// block that receives no answer within `wait` fails with an RF status
+    /// for which [`Error::is_rf_timeout`] holds.
+    pub fn transfer(&mut self, block: &[u8], wait: RfTimeout) -> Result<Vec<u8>, Error<T::Error>> {
+        let maximum = MAX_TYPE_B_BLOCK_BYTES - 2;
+        if block.len() > maximum {
+            return Err(Error::InputLength {
+                maximum,
+                actual: block.len(),
+            });
+        }
+        self.reader.exchange_rf(block, wait, self.protocol)
     }
 }
 
@@ -1439,7 +1509,7 @@ impl<T: Transport> TypeBCard<'_, T> {
 #[derive(Debug)]
 pub enum TypeBSelection<'a, T: Transport> {
     /// The card advertises ISO-DEP block exchange.
-    IsoDep(TypeBCard<'a, T>),
+    IsoDep(TypeBBlockCard<'a, T>),
     /// The card advertises another protocol. The caller supplies its frames.
     Frame(TypeBFrameCard<'a, T>),
 }
@@ -1498,37 +1568,6 @@ impl<T: Transport> TypeBFrameCard<'_, T> {
     }
 }
 
-/// Validate NFC-B activation data and the ISO-DEP session it grants.
-fn type_b_activation<E>(
-    data: &[u8],
-    options: nfcb::PollOptions,
-) -> Result<(nfcb::Observation, Option<isodep::Session>), Error<E>> {
-    let observation = nfcb::Observation::parse(data).map_err(Error::TypeB)?;
-    if options.node_address.is_some()
-        && !(observation.supports_iso_dep() && observation.nad_supported())
-    {
-        return Err(Error::IsoDepParameters(
-            isodep::ParameterError::NadUnsupported,
-        ));
-    }
-    if !observation.supports_iso_dep() {
-        return Ok((observation, None));
-    }
-    let cid = match observation.cid() {
-        0 => None,
-        cid => Some(cid),
-    };
-    let session = isodep::Session::new(
-        observation.card_frame_size(),
-        cid,
-        isodep::block_frame_wait(observation.fwi()),
-        observation.maximum_command_bytes(),
-        options.node_address,
-    )
-    .map_err(Error::IsoDepParameters)?;
-    Ok((observation, Some(session)))
-}
-
 /// Reject an empty or oversized card command before any reader setup.
 fn admit_command<E>(data: &[u8], maximum: usize) -> Result<(), TargetExchangeError<E>> {
     if data.is_empty() || data.len() > maximum {
@@ -1540,7 +1579,11 @@ fn admit_command<E>(data: &[u8], maximum: usize) -> Result<(), TargetExchangeErr
     Ok(())
 }
 
-/// Selected card identity whose operation authority is tied to one reader borrow.
+/// Selected FeliCa card whose operation authority is tied to one reader borrow.
+///
+/// A packet that leaves card state which a new Polling does not clear, such
+/// as authentication, must be declared with [`Self::require_field_cycle`]
+/// before it is sent.
 #[derive(Debug)]
 pub struct FelicaCard<'a, T: Transport> {
     reader: &'a mut Reader<T>,
@@ -1550,12 +1593,6 @@ pub struct FelicaCard<'a, T: Transport> {
     rate: BitRate,
 }
 impl<'a, T: Transport> FelicaCard<'a, T> {
-    /// Authentication changes card state that a new Polling does not clear.
-    #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
-    pub(crate) fn begin_authentication(&mut self) {
-        self.reader.require_field_cycle();
-    }
-
     /// Polling information. IDm is a session address, not a universal persistent ID.
     pub fn observation(&self) -> &PollResponse {
         &self.observation
@@ -1564,121 +1601,18 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
     pub fn target(&self) -> u8 {
         self.target
     }
-    /// Read up to twelve blocks from one unencrypted service. The caller chooses
-    /// a service known to exist on this card; no card data is written.
-    pub fn read_without_encryption(
-        &mut self,
-        service: u16,
-        blocks: &[u16],
-    ) -> Result<ReadResponse, Error<T::Error>> {
-        let request = felica::read_without_encryption(self.observation.idm, service, blocks)
-            .map_err(Error::FelicaRequest)?;
-        let response = self
-            .reader
-            .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
-        ReadResponse::parse(&response, self.observation.idm, blocks.len())
-            .map_err(Error::FelicaResponse)
+    /// RF rate of the polling that selected this card.
+    pub fn rate(&self) -> BitRate {
+        self.rate
     }
-
-    /// Write blocks to one service with Write Without Encryption. Card-specific
-    /// limits still apply. [`Error::FelicaRequest`] means validation stopped
-    /// the command before sending. [`Error::FelicaResponse`] means it was sent
-    /// and the write outcome may be uncertain. Transport failures carry their
-    /// own transaction progress.
-    pub fn write_without_encryption(
-        &mut self,
-        service: u16,
-        blocks: &[BlockWrite],
-    ) -> Result<(), Error<T::Error>> {
-        let idm = self.observation.idm;
-        let request =
-            felica::write_without_encryption(idm, service, blocks).map_err(Error::FelicaRequest)?;
-        let response = self
-            .reader
-            .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
-        felica::write_response(&response, idm).map_err(Error::FelicaResponse)
-    }
-
-    /// Confirm that the selected card still answers at its IDm, using Request
-    /// Response. Returns the card's current mode byte; the command changes no
-    /// card state. An absent card surfaces as the RF timeout
-    /// [`Error::RfStatus`], a different card as [`Error::FelicaResponse`].
-    pub fn request_response(&mut self) -> Result<u8, Error<T::Error>> {
-        match self.exchange_command(0x04, &[], 0x05)?.as_slice() {
-            [mode] => Ok(*mode),
-            payload => Err(Error::FelicaResponse(CardError::Length {
-                expected: 11,
-                actual: payload.len() + 10,
-            })),
-        }
-    }
-
-    /// Request the system codes exposed by this card. Card products can omit this command.
-    pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<T::Error>> {
-        let idm = self.observation.idm;
-        let response = self.exchange_addressed(0x0c, &[])?;
-        felica::system_codes(&response, idm).map_err(Error::FelicaResponse)
-    }
-
-    /// Look up one service or area index within the selected system.
-    /// The end-of-list marker returns `None`; an RF failure remains an error.
-    pub fn search_service_code(
-        &mut self,
-        index: u16,
-    ) -> Result<Option<ServiceEntry>, Error<T::Error>> {
-        let idm = self.observation.idm;
-        let response = self.exchange_addressed(0x0a, &index.to_le_bytes())?;
-        felica::service_entry(&response, idm).map_err(Error::FelicaResponse)
-    }
-
-    /// Send a crate-owned FeliCa command with the selected IDm. `parameters`
-    /// starts after IDm. Returns the payload after checking the length, response
-    /// code and IDm. A command that changes card state outside the typed
-    /// operations must first require a field cycle, as authentication does.
-    pub(crate) fn exchange_command(
-        &mut self,
-        command: u8,
-        parameters: &[u8],
-        response_code: u8,
-    ) -> Result<Vec<u8>, Error<T::Error>> {
-        let idm = self.observation.idm;
-        let response = self.exchange_addressed(command, parameters)?;
-        felica::addressed_response(&response, idm, response_code)
-            .map(<[u8]>::to_vec)
-            .map_err(Error::FelicaResponse)
-    }
-
-    fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
-        let request = felica::addressed_command(self.observation.idm, command, data)
-            .map_err(Error::FelicaRequest)?;
-        self.reader
-            .exchange_rf(&request, self.timeout, RfProtocol::Felica)
-    }
-
-    /// Consume the selected card's typed command authority to send opaque
-    /// packets at its negotiated FeliCa rate. Packets can affect addressing
-    /// or card state, so the original identity is no longer an authority,
-    /// and the next selection cycles the RF field first.
-    pub fn into_raw(self) -> RawFelicaCard<'a, T> {
+    /// Make the next selection cycle the RF field before its request, because
+    /// the card now holds state that a new Polling does not clear.
+    pub fn require_field_cycle(&mut self) {
         self.reader.require_field_cycle();
-        RawFelicaCard {
-            reader: self.reader,
-            timeout: self.timeout,
-        }
     }
-}
-
-/// Raw packet authority for an activated FeliCa RF field.
-#[derive(Debug)]
-pub struct RawFelicaCard<'a, T: Transport> {
-    reader: &'a mut Reader<T>,
-    timeout: RfTimeout,
-}
-
-impl<T: Transport> RawFelicaCard<'_, T> {
-    /// Send a caller-built FeliCa packet using `A0`. Both packets include
-    /// their FeliCa length byte. Address, command, status, and any ciphertext
-    /// belong to the caller; packet effects are never replayed automatically.
+    /// Send one FeliCa packet using `A0` with the polling timeout and return
+    /// the card's reply. Both packets include their FeliCa length byte and
+    /// exclude CRC. Packet effects are never replayed automatically.
     pub fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
         felica::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         let response = self

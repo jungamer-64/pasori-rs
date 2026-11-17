@@ -2,7 +2,7 @@
 //!
 //! Parsing begins after the target number and requires the 12-byte ATQB without
 //! CRC, followed by the ATTRIB response length and complete ATTRIB response.
-use crate::isodep::FrameSize;
+use crate::iso14443::{self, FrameSize};
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
@@ -23,8 +23,6 @@ pub struct PollOptions {
     pub profile: RfProfile,
     /// Application Family Identifier. Zero requests all families.
     pub afi: u8,
-    /// Optional node address for ISO-DEP, valid only with card-advertised NAD support.
-    pub node_address: Option<crate::isodep::NodeAddress>,
 }
 
 /// Invalid NFC-B activation data or unsupported standard-frame parameters.
@@ -158,10 +156,7 @@ impl Observation {
     }
     /// Maximum card frame size including protocol overhead and CRC.
     pub fn frame_size(&self) -> u16 {
-        self.card_frame_size().bytes()
-    }
-    pub(crate) fn card_frame_size(&self) -> FrameSize {
-        FrameSize::from_index(self.fsci())
+        FrameSize::from_index(self.fsci()).bytes()
     }
     /// Standard maximum-card-frame-size code from ATQB.
     pub fn fsci(&self) -> u8 {
@@ -171,9 +166,9 @@ impl Observation {
     pub fn fwi(&self) -> u8 {
         self.atqb[11] >> 4
     }
-    /// Card frame waiting time rounded upward by the shared ISO-DEP conversion.
+    /// Card frame waiting time, rounded upward to whole nanoseconds.
     pub fn frame_wait(&self) -> Duration {
-        crate::isodep::frame_wait(self.fwi())
+        iso14443::frame_wait(self.fwi())
     }
     /// Whether ATQB advertises optional card-identifier fields.
     pub fn cid_supported(&self) -> bool {
