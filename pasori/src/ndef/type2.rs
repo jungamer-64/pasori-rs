@@ -1,10 +1,11 @@
 use super::{Error, UpdateStage, WriteError, control_range};
-use crate::{
-    reader::{self, TargetExchangeError, TypeACard},
-    transport::Transport,
-};
+use crate::type2::Type2Tag;
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
+use rcs956::{
+    reader::{self, TargetExchangeError},
+    transport::Transport,
+};
 
 /// Failure while replacing a Type 2 message over NFC-A.
 pub type Type2WriteError<E> = WriteError<TargetExchangeError<E>>;
@@ -12,11 +13,11 @@ pub type Type2WriteError<E> = WriteError<TargetExchangeError<E>>;
 /// Failure while retrieving a Type 2 message over NFC-A.
 pub type Type2Error<E> = Error<TargetExchangeError<E>>;
 
-impl<T: Transport> TypeACard<'_, T> {
+impl<T: Transport> Type2Tag<'_, T> {
     /// Read the NDEF message across the tag's Type 2 memory sectors.
     /// Reserved bytes and dynamic lock bytes are skipped. An empty mapped
     /// message is returned as an empty vector. No write is performed.
-    pub fn read_type2_ndef(&mut self) -> Result<Option<Vec<u8>>, Type2Error<T::Error>> {
+    pub fn read_ndef(&mut self) -> Result<Option<Vec<u8>>, Type2Error<T::Error>> {
         let mut tag = Type2Data::open(self)?;
         if !tag.find_message()? {
             return Ok(None);
@@ -32,7 +33,7 @@ impl<T: Transport> TypeACard<'_, T> {
     /// mapping. The Terminator
     /// after the new message supersedes any TLVs that followed the old message.
     /// An empty slice clears the message.
-    pub fn write_type2_ndef(&mut self, message: &[u8]) -> Result<(), Type2WriteError<T::Error>> {
+    pub fn write_ndef(&mut self, message: &[u8]) -> Result<(), Type2WriteError<T::Error>> {
         let mut tag = Type2Data::open(self).map_err(WriteError::Preparation)?;
         let write = tag
             .prepare_write(message)
@@ -51,7 +52,7 @@ impl<T: Transport> TypeACard<'_, T> {
 }
 
 struct Type2Data<'card, 'reader, T: Transport> {
-    card: &'card mut TypeACard<'reader, T>,
+    card: &'card mut Type2Tag<'reader, T>,
     cached_start: usize,
     cache: [u8; 16],
     /// Next address to map; excluded ranges are skipped when it is consumed.
@@ -96,8 +97,8 @@ struct Type2Write {
 }
 
 impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
-    fn open(card: &'card mut TypeACard<'reader, T>) -> Result<Self, Type2Error<T::Error>> {
-        if card.observation().sel_res() != 0 {
+    fn open(card: &'card mut Type2Tag<'reader, T>) -> Result<Self, Type2Error<T::Error>> {
+        if card.card.observation().sel_res() != 0 {
             return Err(Error::UnsupportedMapping);
         }
         let header = type2_read_window(card, Type2Page(0))?;
@@ -334,7 +335,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
 }
 
 fn type2_read_window<T: Transport>(
-    card: &mut TypeACard<'_, T>,
+    card: &mut Type2Tag<'_, T>,
     page: Type2Page,
 ) -> Result<[u8; 16], Type2Error<T::Error>> {
     let (sector, address) = page.wire_address();
@@ -345,11 +346,17 @@ fn type2_read_window<T: Transport>(
 }
 
 fn select_sector<T: Transport>(
-    card: &mut TypeACard<'_, T>,
+    card: &mut Type2Tag<'_, T>,
     sector: u8,
 ) -> Result<(), Type2Error<T::Error>> {
-    if card.type2_sector() == sector {
+    if card.sector == Some(sector) {
         return Ok(());
+    }
+    // Until both packets complete, the addressed sector is unknown. Any
+    // sector but 0 survives a new selection request.
+    card.sector = None;
+    if sector != 0 {
+        card.card.require_field_cycle();
     }
     let selected = (|| {
         match type2_exchange(card, &[0xc2, 0xff])?.as_slice() {
@@ -359,7 +366,7 @@ fn select_sector<T: Transport>(
         }
         // The second packet succeeds with a passive ACK. Only a reader RF
         // timeout demonstrates silence; a lost USB response leaves it unknown.
-        match card.exchange(&[sector, 0, 0, 0]) {
+        match card.card.exchange(&[sector, 0, 0, 0]) {
             Err(TargetExchangeError::Exchange(reader::Error::RfStatus(1))) => Ok(()),
             Ok(reply) if reply.status == 0 => match reply.data.as_slice() {
                 [nak @ (0 | 1 | 4 | 5)] => Err(Error::Type2Nak(*nak)),
@@ -370,18 +377,16 @@ fn select_sector<T: Transport>(
         }
     })();
     if selected.is_ok() {
-        card.record_type2_sector(sector);
-    } else {
-        card.invalidate();
+        card.sector = Some(sector);
     }
     selected
 }
 
 fn type2_exchange<T: Transport>(
-    card: &mut TypeACard<'_, T>,
+    card: &mut Type2Tag<'_, T>,
     command: &[u8],
 ) -> Result<Vec<u8>, Type2Error<T::Error>> {
-    let response = card.exchange(command).map_err(Error::Exchange)?;
+    let response = card.card.exchange(command).map_err(Error::Exchange)?;
     if response.status != 0 {
         return Err(Error::Type2ReaderStatus(response.status));
     }

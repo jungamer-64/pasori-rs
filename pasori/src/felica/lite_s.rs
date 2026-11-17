@@ -7,12 +7,12 @@
 //! key-dependent memory access.
 
 use super::{BlockWrite, Card, Error as CommandError};
-use rcs956::transport::Transport;
 use core::fmt;
 use des::{
     TdesEde2,
     cipher::{BlockCipherEncrypt, KeyInit},
 };
+use rcs956::transport::Transport;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 

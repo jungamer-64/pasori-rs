@@ -1,9 +1,7 @@
 use super::{Error, UpdateStage, WriteError, control_range};
-use crate::{
-    reader::{TargetExchangeError, Type1Tag},
-    transport::Transport,
-};
+use crate::type1::Type1Tag;
 use alloc::vec::Vec;
+use rcs956::{reader::TargetExchangeError, transport::Transport};
 
 /// Failure while retrieving an NDEF message from a Type 1 tag.
 pub type Type1Error<E> = Error<TargetExchangeError<E>>;

@@ -116,7 +116,7 @@ impl PollRequest {
     /// # Errors
     ///
     /// Rejects request codes outside `0..=2` and invalid slot selectors.
-    pub fn new(system: u16, request: u8, slots: u8) -> Result<Self, PollRequestError> {
+    pub const fn new(system: u16, request: u8, slots: u8) -> Result<Self, PollRequestError> {
         if request > 2 {
             return Err(PollRequestError::RequestCode(request));
         }

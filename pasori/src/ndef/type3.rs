@@ -1,38 +1,41 @@
 use super::{Error, UpdateStage, WriteError};
-use crate::{
-    felica::{BitRate, BlockWrite, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS, PollRequest},
-    reader::{self, FelicaCard, Reader, RfTimeout},
+use crate::felica::{self, BlockWrite, Card, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS};
+use alloc::vec::Vec;
+use rcs956::{
+    felica::{BitRate, PollRequest},
+    reader::{self, Reader, RfTimeout},
     transport::Transport,
 };
-use alloc::vec::Vec;
 
-const SYSTEM: u16 = 0x12fc;
+/// Polling for the NDEF system 12FC without request data.
+const POLL: PollRequest = match PollRequest::new(0x12fc, 0, 0) {
+    Ok(request) => request,
+    Err(_) => panic!("the NDEF polling request is valid"),
+};
 const READ_SERVICE: u16 = 0x000b;
 const WRITE_SERVICE: u16 = 0x0009;
 const BLOCK_BYTES: usize = 16;
 
 /// A selected NFC Forum Type 3 system. Its IDm comes from polling system 12FC.
 #[derive(Debug)]
-pub struct Type3Tag<'a, T: Transport>(FelicaCard<'a, T>);
+pub struct Type3Tag<'a, T: Transport>(Card<'a, T>);
 
-impl<T: Transport> Reader<T> {
+impl<'a, T: Transport> Type3Tag<'a, T> {
     /// Poll for one NFC Forum Type 3 system at the selected FeliCa rate.
     /// The NDEF mapping is checked when a message is accessed.
-    pub fn poll_type3(
-        &mut self,
+    pub fn poll(
+        reader: &'a mut Reader<T>,
         rate: BitRate,
         timeout: RfTimeout,
-    ) -> Result<Option<Type3Tag<'_, T>>, reader::Error<T::Error>> {
-        let request = PollRequest::new(SYSTEM, 0, 0).map_err(reader::Error::FelicaRequest)?;
-        self.poll_felica(rate, request, timeout)
-            .map(|card| card.map(Type3Tag))
+    ) -> Result<Option<Self>, reader::Error<T::Error>> {
+        reader
+            .poll_felica(rate, POLL, timeout)
+            .map(|card| card.map(|card| Self(Card::new(card))))
     }
-}
 
-impl<T: Transport> Type3Tag<'_, T> {
     /// Read the message from an initialized Type 3 mapping. An empty mapping
     /// returns an empty vector. An interrupted update is reported separately.
-    pub fn read_ndef(&mut self) -> Result<Vec<u8>, Error<reader::Error<T::Error>>> {
+    pub fn read_ndef(&mut self) -> Result<Vec<u8>, Error<felica::Error<T::Error>>> {
         let attribute = self.attribute()?;
         let length = attribute.length();
         let mut data = Vec::with_capacity(length);
@@ -56,7 +59,7 @@ impl<T: Transport> Type3Tag<'_, T> {
     pub fn write_ndef(
         &mut self,
         message: &[u8],
-    ) -> Result<(), WriteError<reader::Error<T::Error>>> {
+    ) -> Result<(), WriteError<felica::Error<T::Error>>> {
         let attribute = self.attribute().map_err(WriteError::Preparation)?;
         let capacity = attribute.capacity();
         let limit = usize::from(attribute.0[2]).min(MAX_WRITE_BLOCKS);
@@ -110,7 +113,7 @@ impl<T: Transport> Type3Tag<'_, T> {
             .map_err(|cause| WriteError::update(UpdateStage::Publish, written, cause))
     }
 
-    fn attribute(&mut self) -> Result<Attribute, Error<reader::Error<T::Error>>> {
+    fn attribute(&mut self) -> Result<Attribute, Error<felica::Error<T::Error>>> {
         let response = self
             .0
             .read_without_encryption(READ_SERVICE, &[0])
@@ -121,7 +124,7 @@ impl<T: Transport> Type3Tag<'_, T> {
         Attribute::parse(*block)
     }
 
-    fn write_attribute(&mut self, data: [u8; 16]) -> Result<(), Error<reader::Error<T::Error>>> {
+    fn write_attribute(&mut self, data: [u8; 16]) -> Result<(), Error<felica::Error<T::Error>>> {
         self.0
             .write_without_encryption(WRITE_SERVICE, &[BlockWrite { block: 0, data }])
             .map_err(Error::Exchange)

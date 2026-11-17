@@ -1,9 +1,5 @@
 use super::{Error, UpdateStage, WriteError};
-use crate::{
-    isodep,
-    reader::{self, TypeACard, TypeBCard},
-    transport::Transport,
-};
+use crate::isodep::ApduExchange;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -12,54 +8,28 @@ const CAPABILITY_CONTAINER_ID: u16 = 0xe103;
 const SHORT_FILE_END: usize = 0x8000;
 const MAX_EXTENDED_FILE_BYTES: usize = 1 << 20;
 
-/// Failure while retrieving a Type 4 message over NFC-A or NFC-B.
-pub type Type4Error<E> = Error<isodep::Error<reader::Error<E>>>;
-
-/// Failure while replacing a Type 4 message over NFC-A or NFC-B.
-pub type Type4WriteError<E> = WriteError<isodep::Error<reader::Error<E>>>;
-
-impl<T: Transport> TypeACard<'_, T> {
-    /// Read the first publicly readable NDEF file on a Type 4A tag.
-    /// This selects the NDEF application and files on the card.
-    pub fn read_type4_ndef(&mut self) -> Result<Vec<u8>, Type4Error<T::Error>> {
-        read_type4(|command| self.exchange_apdu(command))
-    }
-
-    /// Replace the NDEF message in the first publicly readable Type 4A file
-    /// if it is also publicly writable. An empty slice clears the file.
-    pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
-        let max_apdu_bytes = self.maximum_apdu_bytes();
-        write_type4(
-            |command| self.exchange_apdu(command),
-            max_apdu_bytes,
-            message,
-        )
-    }
+/// Read the first publicly readable NDEF file on a Type 4 tag. This selects
+/// the NDEF application and files on the card.
+pub fn read_type4<C: ApduExchange>(card: &mut C) -> Result<Vec<u8>, Error<C::Error>> {
+    read(|command| card.exchange_apdu(command))
 }
 
-impl<T: Transport> TypeBCard<'_, T> {
-    /// Read the first publicly readable NDEF file on a Type 4B tag.
-    /// This selects the NDEF application and files on the card.
-    pub fn read_type4_ndef(&mut self) -> Result<Vec<u8>, Type4Error<T::Error>> {
-        read_type4(|command| self.exchange_apdu(command))
-    }
-
-    /// Replace the NDEF message in the first publicly readable Type 4B file
-    /// if it is also publicly writable. An empty slice clears the file.
-    /// The write size per APDU respects both MLc and the ISO-DEP session limit.
-    pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
-        let max_apdu_bytes = self.maximum_apdu_bytes();
-        write_type4(
-            |command| self.exchange_apdu(command),
-            max_apdu_bytes,
-            message,
-        )
-    }
+/// Replace the NDEF message in the first publicly readable Type 4 file if it
+/// is also publicly writable. An empty slice clears the file. The write size
+/// per APDU respects both MLc and the card's APDU limit.
+pub fn write_type4<C: ApduExchange>(
+    card: &mut C,
+    message: &[u8],
+) -> Result<(), WriteError<C::Error>> {
+    let max_apdu_bytes = card.maximum_apdu_bytes();
+    write(
+        |command| card.exchange_apdu(command),
+        max_apdu_bytes,
+        message,
+    )
 }
 
-fn read_type4<E>(
-    mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
-) -> Result<Vec<u8>, Error<E>> {
+fn read<E>(mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>) -> Result<Vec<u8>, Error<E>> {
     let file = select_ndef_file(&mut exchange)?;
     let encoded = read_binary(
         &mut exchange,
@@ -82,7 +52,7 @@ fn read_type4<E>(
     read_file(&mut exchange, length_bytes..end, file.max_read, addressing)
 }
 
-fn write_type4<E>(
+fn write<E>(
     mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
     max_apdu_bytes: usize,
     message: &[u8],

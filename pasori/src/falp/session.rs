@@ -1,17 +1,16 @@
-use super::{Error, FelicaCard, Reader, RfTimeout, State};
-use crate::{
-    falp::{
-        self, Gaps, Kind, LocalParameters, MAX_APPLICATION_ID_BYTES, Message, Parameters, Pdu,
-        Profile, RF_212, RF_424, Reason, ReceiveWindow, SendWindow,
-    },
-    felica::{self, BitRate, Idm},
-    transport::Transport,
+use super::{
+    Gaps, Kind, LocalParameters, MAX_APPLICATION_ID_BYTES, Message, Parameters, Pdu, Profile,
+    RF_212, RF_424, Reason, ReceiveWindow, SendWindow,
 };
+use crate::{falp, felica::Card};
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
+use rcs956::{
+    felica::{BitRate, Idm},
+    reader::{Error, FelicaLink, FelicaListen as ListenIdentity, FelicaRole, Reader, RfTimeout},
+    transport::Transport,
+};
 
-/// Host wait of one-way frames, matching the Sony driver's reader wait.
-const READER_WAIT: Duration = Duration::from_secs(1);
 /// Wait for the next block while the peer holds the turn.
 const DATA_WAIT: Duration = Duration::from_millis(3000);
 /// Largest single RF wait of the Propose and handshake steps.
@@ -22,13 +21,12 @@ const STEP_MINIMUM: Duration = Duration::from_millis(100);
 const ATTEMPTS: u8 = 3;
 /// Unexpected replies tolerated while one missing block is requested.
 const STRIKES: u8 = 3;
-/// Registers whose four bytes the Sony driver adds, little-endian, to its
-/// frame processing time in microseconds.
-const PROCESSING_REGISTERS: [u8; 8] = [0, 0x10, 0, 5, 0, 6, 0, 7];
 /// System code the listening target advertises.
-const SYSTEM_CODE: [u8; 2] = [0xfe, 0xe2];
+const SYSTEM_CODE: u16 = 0xfee2;
+/// Manufacturing parameters the listening target advertises.
+const PMM: [u8; 8] = [0, 0x22, 3, 3, 3, 3, 3, 3];
 
-/// Parameters of [`FelicaCard::connect_falp`].
+/// Parameters of [`Card::connect_falp`].
 #[derive(Clone, Copy, Debug)]
 pub struct FalpConnect<'a> {
     /// Local parameter set.
@@ -44,7 +42,7 @@ pub struct FalpConnect<'a> {
     pub handshake_timeout: Duration,
 }
 
-/// Parameters of [`Reader::listen_falp`].
+/// Parameters of [`listen`].
 #[derive(Clone, Copy, Debug)]
 pub struct FalpListen<'a> {
     /// Local parameter set.
@@ -61,7 +59,7 @@ pub struct FalpListen<'a> {
 #[derive(Debug)]
 pub enum FalpError<E> {
     /// A reader command failed outside a data turn. The session is revoked;
-    /// call [`Reader::initialize`] before using the reader.
+    /// call [`Reader::initialize`] or [`FalpLink::finish`] before using the reader.
     Reader(Error<E>),
     /// The application identifier is longer than [`MAX_APPLICATION_ID_BYTES`].
     /// Nothing was sent.
@@ -106,7 +104,7 @@ pub enum FalpError<E> {
 /// Failure of a data turn.
 #[derive(Debug)]
 pub enum TransferCause<E> {
-    /// A reader command failed; call [`Reader::initialize`].
+    /// A reader command failed; call [`Reader::initialize`] or [`FalpLink::finish`].
     Reader(Error<E>),
     /// The peer stopped answering.
     Timeout,
@@ -205,19 +203,12 @@ pub struct FalpAccepted<'a, T: Transport> {
     pub turn: FalpTurn,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Role {
-    Initiator,
-    Target,
-}
-
 /// Exclusive FALP session. Between [`Self::exchange`] calls this side holds
 /// the sending turn, and the peer waits about three seconds for its next
 /// burst; call again with empty data to keep the session alive.
 #[derive(Debug)]
 pub struct FalpLink<'a, T: Transport> {
-    reader: &'a mut Reader<T>,
-    role: Role,
+    link: FelicaLink<'a, T>,
     /// This side's IDm on a target, the peer's on an initiator.
     idm: Idm,
     port: u16,
@@ -263,7 +254,55 @@ fn rf_rate(rate: BitRate) -> u32 {
 /// Clamp a protocol wait to the reader's half-ms range.
 fn rf_wait(wait: Duration) -> RfTimeout {
     let bounded = wait.clamp(Duration::from_millis(1), Duration::from_millis(32_767));
-    RfTimeout::new(bounded).unwrap_or(RfTimeout { ticks: u16::MAX })
+    RfTimeout::new(bounded).unwrap_or(RfTimeout::MAX)
+}
+
+/// Frame processing allowance in the handshake's microsecond unit.
+fn allowance_micros<T: Transport>(link: &FelicaLink<'_, T>) -> u32 {
+    u32::try_from(link.processing_allowance().as_micros()).unwrap_or(u32::MAX)
+}
+
+/// Remaining part of `total` after `start`, or `None` once it elapsed.
+fn remaining<T: Transport>(
+    link: &FelicaLink<'_, T>,
+    start: Duration,
+    total: Duration,
+) -> Option<Duration> {
+    let elapsed = link.now().saturating_sub(start);
+    total.checked_sub(elapsed).filter(|wait| !wait.is_zero())
+}
+
+/// Wait for a data packet of the handshake until `total` elapses after
+/// `start`, beginning with `reply` if a combined command returned one.
+fn handshake_step<T: Transport>(
+    link: &mut FelicaLink<'_, T>,
+    mut reply: Option<Vec<u8>>,
+    start: Duration,
+    total: Duration,
+) -> Result<Vec<u8>, FalpError<T::Error>> {
+    loop {
+        if let Some(packet) = reply.take() {
+            match Pdu::parse(&packet) {
+                Pdu::Data { message, .. } => return Ok(message.to_vec()),
+                Pdu::Farewell { message } => {
+                    return Err(FalpError::Closed(farewell_reason(message)));
+                }
+                _ => {}
+            }
+        }
+        let remaining = remaining(link, start, total).ok_or(FalpError::HandshakeTimeout)?;
+        reply = link.receive(rf_wait(remaining.clamp(STEP_MINIMUM, STEP_WAIT)))?;
+    }
+}
+
+/// Send a farewell and report the violation that caused it.
+fn violation<T: Transport, X>(
+    link: &mut FelicaLink<'_, T>,
+    port: u16,
+    reason: Reason,
+) -> Result<X, FalpError<T::Error>> {
+    link.send(&falp::farewell_packet(port, &falp::farewell(reason)))?;
+    Err(FalpError::Violation(reason))
 }
 
 fn farewell_reason(message: &[u8]) -> Option<Reason> {
@@ -276,213 +315,97 @@ fn farewell_reason(message: &[u8]) -> Option<Reason> {
     }
 }
 
-impl<T: Transport> Reader<T> {
-    /// Frame processing allowance the Sony driver reads from the reader.
-    fn processing_allowance(&mut self) -> Result<u32, Error<T::Error>> {
-        let bytes: [u8; 4] = self
-            .command(6, &PROCESSING_REGISTERS, READER_WAIT)?
-            .try_into()
-            .map_err(|_| Error::Response("processing register length"))?;
-        Ok(u32::from_le_bytes(bytes))
+/// Listen as a passive FeliCa target for one FALP initiator, accept its
+/// Propose and handshake, and receive its first burst. The reader is reset
+/// first; `timeout` bounds the wait for an initiator. A timeout of the
+/// activation command fails the reader transaction, so call
+/// [`Reader::initialize`] or [`FalpLink::finish`] before listening again.
+///
+/// Each later wait for an initiator frame also fails the reader transaction
+/// when it times out, because the reader's command that receives the next
+/// frame cannot be ended without a reset.
+pub fn listen<'a, T: Transport>(
+    reader: &'a mut Reader<T>,
+    config: FalpListen<'_>,
+    timeout: RfTimeout,
+) -> Result<FalpAccepted<'a, T>, FalpError<T::Error>> {
+    if config.handshake_timeout.is_zero() {
+        return Err(FalpError::TimeoutRange);
     }
-
-    /// Interpret a reader reply carrying an RF status and optional packet.
-    fn falp_packet(&mut self, response: Vec<u8>) -> Result<Option<Vec<u8>>, Error<T::Error>> {
-        if matches!(response.first(), Some(status) if status & 0x3f == 1) {
-            return Ok(None);
-        }
-        let packet = self.rf_response(response)?;
-        felica::validate_length(&packet, 2).map_err(Error::FelicaResponse)?;
-        Ok(Some(packet))
-    }
-
-    /// Send one packet without receiving a reply.
-    fn falp_send(&mut self, role: Role, packet: &[u8]) -> Result<(), Error<T::Error>> {
-        match role {
-            Role::Initiator => {
-                // A zero wait sends without receiving and reports RF timeout.
-                let mut args = Vec::with_capacity(packet.len() + 2);
-                args.extend_from_slice(&[0, 0]);
-                args.extend_from_slice(packet);
-                let response = self.command(0xa0, &args, READER_WAIT)?;
-                match response.first() {
-                    Some(status) if status & 0x3f == 1 => Ok(()),
-                    Some(0) => Err(Error::Response("FALP send received a frame")),
-                    _ => self.rf_response(response).map(|_| ()),
-                }
-            }
-            Role::Target => match self.command(0x90, packet, READER_WAIT)?.as_slice() {
-                [0] => Ok(()),
-                [status] => Err(Error::RfStatus(*status)),
-                _ => Err(Error::Response("FALP response status length")),
-            },
-        }
-    }
-
-    /// Receive one packet; `None` means the wait ended without a frame.
-    fn falp_receive(
-        &mut self,
-        role: Role,
-        wait: Duration,
-    ) -> Result<Option<Vec<u8>>, Error<T::Error>> {
-        let timeout = rf_wait(wait);
-        let response = match role {
-            Role::Initiator => {
-                self.command(0xa0, &timeout.ticks.to_le_bytes(), timeout.host_wait())?
-            }
-            Role::Target => self.command(0x88, &[], timeout.host_wait())?,
-        };
-        self.falp_packet(response)
-    }
-
-    /// Send one packet and receive the next one in the same command.
-    fn falp_send_receive(
-        &mut self,
-        packet: &[u8],
-        wait: Duration,
-    ) -> Result<Option<Vec<u8>>, Error<T::Error>> {
-        let timeout = rf_wait(wait);
-        let mut args = Vec::with_capacity(packet.len() + 2);
-        args.extend_from_slice(&timeout.ticks.to_le_bytes());
-        args.extend_from_slice(packet);
-        let response = self.command(0xa0, &args, timeout.host_wait())?;
-        self.falp_packet(response)
-    }
-
-    /// Remaining part of `total` after `start`, or `None` once it elapsed.
-    fn falp_remaining(&self, start: Duration, total: Duration) -> Option<Duration> {
-        let elapsed = self.link.now().saturating_sub(start);
-        total.checked_sub(elapsed).filter(|wait| !wait.is_zero())
-    }
-
-    /// Wait for a data packet of the handshake until `total` elapses after
-    /// `start`, beginning with `first` if a combined command returned one.
-    fn falp_step(
-        &mut self,
-        role: Role,
-        mut reply: Option<Vec<u8>>,
-        start: Duration,
-        total: Duration,
-    ) -> Result<Vec<u8>, FalpError<T::Error>> {
-        loop {
-            if let Some(packet) = reply.take() {
-                match Pdu::parse(&packet) {
-                    Pdu::Data { message, .. } => return Ok(message.to_vec()),
-                    Pdu::Farewell { message } => {
-                        return Err(FalpError::Closed(farewell_reason(message)));
-                    }
-                    _ => {}
-                }
-            }
-            let remaining = self
-                .falp_remaining(start, total)
-                .ok_or(FalpError::HandshakeTimeout)?;
-            reply = self.falp_receive(role, remaining.clamp(STEP_MINIMUM, STEP_WAIT))?;
-        }
-    }
-
-    /// Send a farewell and report the violation that caused it.
-    fn falp_violation<X>(
-        &mut self,
-        role: Role,
-        port: u16,
-        reason: Reason,
-    ) -> Result<X, FalpError<T::Error>> {
-        self.falp_send(role, &falp::farewell_packet(port, &falp::farewell(reason)))?;
-        Err(FalpError::Violation(reason))
-    }
-
-    /// Listen as a passive FeliCa target for one FALP initiator, accept its
-    /// Propose and handshake, and receive its first burst. The reader is
-    /// reset first; `timeout` bounds the wait for an initiator. A timeout of
-    /// the activation command fails the reader transaction, so call
-    /// [`Self::initialize`] before listening again.
-    ///
-    /// Each later wait for an initiator frame also fails the reader
-    /// transaction when it times out, because the reader's command that
-    /// receives the next frame cannot be ended without a reset.
-    pub fn listen_falp(
-        &mut self,
-        config: FalpListen<'_>,
-        timeout: RfTimeout,
-    ) -> Result<FalpAccepted<'_, T>, FalpError<T::Error>> {
-        if config.handshake_timeout.is_zero() {
-            return Err(FalpError::TimeoutRange);
-        }
-        self.initialize()?;
-        self.state = State::NeedsInitialization;
-        let allowance = self.processing_allowance()?;
-        let [a, b, c, d, e, f] = config.identity;
-        let idm = Idm::new([2, 0xfe, a, b, c, d, e, f]);
-        let mut args = Vec::with_capacity(36);
-        args.extend_from_slice(&[0, 0, 1, 1, 2, 3, 0]);
-        args.extend_from_slice(idm.as_bytes());
-        args.extend_from_slice(&[0, 0x22, 3, 3, 3, 3, 3, 3]);
-        args.extend_from_slice(&SYSTEM_CODE);
-        args.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x55]);
-        let activation = self.command(0x8c, &args, timeout.host_wait())?;
-        let (rate, packet) = match activation.as_slice() {
-            [0x12, packet @ ..] => (RF_212, packet),
-            [0x22, packet @ ..] => (RF_424, packet),
-            _ => return Err(FalpError::Activation),
-        };
-        felica::validate_length(packet, 2).map_err(|_| FalpError::Activation)?;
-        let Pdu::Propose { port, .. } = Pdu::parse(packet) else {
+    let [a, b, c, d, e, f] = config.identity;
+    let idm = Idm::new([2, 0xfe, a, b, c, d, e, f]);
+    let identity = ListenIdentity {
+        idm,
+        pmm: PMM,
+        system_code: SYSTEM_CODE,
+    };
+    let activation = match reader.listen_felica(identity, timeout) {
+        Ok(activation) => activation,
+        Err(Error::TargetMode(_) | Error::FelicaResponse(_)) => {
             return Err(FalpError::Activation);
-        };
-        let mut local = LocalParameters::new(config.profile, rate, allowance);
-
-        let start = self.link.now();
-        let reply = self.falp_send_receive(
-            &falp::accept_packet(idm, port),
-            config.handshake_timeout.min(STEP_WAIT),
-        )?;
-        let message = self.falp_step(Role::Target, reply, start, config.handshake_timeout)?;
-        let handshake = match Message::parse(&message, u16::MAX) {
-            Ok(m) if m.kind == Kind::Handshake => match falp::parse_handshake(&m, local.wire) {
-                Ok(handshake) => handshake,
-                Err(reason) => return self.falp_violation(Role::Target, port, reason),
-            },
-            Ok(m) if m.kind == Kind::Farewell => {
-                return self.falp_violation(Role::Target, port, Reason::FORMAT);
-            }
-            Ok(_) => return self.falp_violation(Role::Target, port, Reason::UNEXPECTED),
-            Err(reason) => return self.falp_violation(Role::Target, port, reason),
-        };
-        if !config.applications.contains(&handshake.application) {
-            return self.falp_violation(Role::Target, port, Reason::APPLICATION);
         }
-        // The target transmits at the initiator's rate.
-        local.wire.rf_bit_rate = handshake.parameters.rf_bit_rate;
-        let peer = handshake.parameters;
-        let response = falp::handshake_response(&local.wire);
-        self.falp_send(Role::Target, &falp::data_packet(port, &response))?;
-        let mut link = FalpLink::new(self, Role::Target, idm, port, local, peer);
-        let turn = match link.receive_burst(None) {
-            Ok(received) => FalpTurn::Exchanged { sent: 0, received },
-            Err(TurnEnd::Closed(reason)) => {
-                link.open = false;
-                FalpTurn::Closed {
-                    sent: 0,
-                    delivered: true,
-                    received: link.receive.prefix(),
-                    reason,
-                }
-            }
-            Err(TurnEnd::Failed(cause)) => {
-                return Err(FalpError::Transfer {
-                    sent: 0,
-                    delivered: true,
-                    received: link.receive.prefix(),
-                    cause,
-                });
-            }
-        };
-        Ok(FalpAccepted { link, turn })
+        Err(error) => return Err(FalpError::Reader(error)),
+    };
+    let mut link = activation.link;
+    let Pdu::Propose { port, .. } = Pdu::parse(&activation.packet) else {
+        return Err(FalpError::Activation);
+    };
+    let mut local = LocalParameters::new(
+        config.profile,
+        rf_rate(link.rate()),
+        allowance_micros(&link),
+    );
+
+    let start = link.now();
+    let reply = link.send_receive(
+        &falp::accept_packet(idm, port),
+        rf_wait(config.handshake_timeout.min(STEP_WAIT)),
+    )?;
+    let message = handshake_step(&mut link, reply, start, config.handshake_timeout)?;
+    let handshake = match Message::parse(&message, u16::MAX) {
+        Ok(m) if m.kind == Kind::Handshake => match falp::parse_handshake(&m, local.wire) {
+            Ok(handshake) => handshake,
+            Err(reason) => return violation(&mut link, port, reason),
+        },
+        Ok(m) if m.kind == Kind::Farewell => {
+            return violation(&mut link, port, Reason::FORMAT);
+        }
+        Ok(_) => return violation(&mut link, port, Reason::UNEXPECTED),
+        Err(reason) => return violation(&mut link, port, reason),
+    };
+    if !config.applications.contains(&handshake.application) {
+        return violation(&mut link, port, Reason::APPLICATION);
     }
+    // The target transmits at the initiator's rate.
+    local.wire.rf_bit_rate = handshake.parameters.rf_bit_rate;
+    let peer = handshake.parameters;
+    let response = falp::handshake_response(&local.wire);
+    link.send(&falp::data_packet(port, &response))?;
+    let mut link = FalpLink::new(link, idm, port, local, peer);
+    let turn = match link.receive_burst(None) {
+        Ok(received) => FalpTurn::Exchanged { sent: 0, received },
+        Err(TurnEnd::Closed(reason)) => {
+            link.open = false;
+            FalpTurn::Closed {
+                sent: 0,
+                delivered: true,
+                received: link.receive.prefix(),
+                reason,
+            }
+        }
+        Err(TurnEnd::Failed(cause)) => {
+            return Err(FalpError::Transfer {
+                sent: 0,
+                delivered: true,
+                received: link.receive.prefix(),
+                cause,
+            });
+        }
+    };
+    Ok(FalpAccepted { link, turn })
 }
 
-impl<'a, T: Transport> FelicaCard<'a, T> {
+impl<'a, T: Transport> Card<'a, T> {
     /// Connect to a FALP target selected by polling, at its polling rate.
     /// Propose is sent once; the answer and the handshake response are then
     /// awaited until their timeouts elapse. The card's typed authority ends
@@ -498,21 +421,18 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         if !propose_range.contains(&config.propose_timeout) || config.handshake_timeout.is_zero() {
             return Err(FalpError::TimeoutRange);
         }
-        let Self {
-            reader,
-            observation,
-            rate,
-            ..
-        } = self;
-        reader.state = State::NeedsInitialization;
-        let allowance = reader.processing_allowance()?;
-        let local = LocalParameters::new(config.profile, rf_rate(rate), allowance);
-        let idm = observation.idm;
+        let idm = self.selection().observation().idm;
+        let mut link = self.into_selection().into_link()?;
+        let local = LocalParameters::new(
+            config.profile,
+            rf_rate(link.rate()),
+            allowance_micros(&link),
+        );
 
-        let start = reader.link.now();
-        let mut answer = reader.falp_send_receive(
+        let start = link.now();
+        let mut answer = link.send_receive(
             &falp::propose_packet(idm, config.port, config.propose_timeout),
-            config.propose_timeout.min(STEP_WAIT),
+            rf_wait(config.propose_timeout.min(STEP_WAIT)),
         )?;
         let port = loop {
             if let Some(packet) = answer.take() {
@@ -524,53 +444,42 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
                     _ => return Err(FalpError::Answer),
                 }
             }
-            let remaining = reader
-                .falp_remaining(start, config.propose_timeout)
-                .ok_or(FalpError::NoAnswer)?;
-            answer =
-                reader.falp_receive(Role::Initiator, remaining.clamp(STEP_MINIMUM, STEP_WAIT))?;
+            let remaining =
+                remaining(&link, start, config.propose_timeout).ok_or(FalpError::NoAnswer)?;
+            answer = link.receive(rf_wait(remaining.clamp(STEP_MINIMUM, STEP_WAIT)))?;
         };
 
-        let start = reader.link.now();
+        let start = link.now();
         let hello = falp::data_packet(port, &falp::handshake(config.application, &local.wire));
-        let reply = reader.falp_send_receive(&hello, config.handshake_timeout.min(STEP_WAIT))?;
-        let message = reader.falp_step(Role::Initiator, reply, start, config.handshake_timeout)?;
+        let reply = link.send_receive(&hello, rf_wait(config.handshake_timeout.min(STEP_WAIT)))?;
+        let message = handshake_step(&mut link, reply, start, config.handshake_timeout)?;
         let peer = match Message::parse(&message, u16::MAX) {
             Ok(m) if m.kind == Kind::HandshakeResponse => {
                 match falp::parse_handshake_response(&m, local.wire) {
                     Ok(peer) => peer,
-                    Err(reason) => return reader.falp_violation(Role::Initiator, port, reason),
+                    Err(reason) => return violation(&mut link, port, reason),
                 }
             }
             Ok(m) if m.kind == Kind::Farewell => {
-                return reader.falp_violation(Role::Initiator, port, Reason::FORMAT);
+                return violation(&mut link, port, Reason::FORMAT);
             }
-            Ok(_) => return reader.falp_violation(Role::Initiator, port, Reason::UNEXPECTED),
-            Err(reason) => return reader.falp_violation(Role::Initiator, port, reason),
+            Ok(_) => return violation(&mut link, port, Reason::UNEXPECTED),
+            Err(reason) => return violation(&mut link, port, reason),
         };
-        Ok(FalpLink::new(
-            reader,
-            Role::Initiator,
-            idm,
-            port,
-            local,
-            peer,
-        ))
+        Ok(FalpLink::new(link, idm, port, local, peer))
     }
 }
 
 impl<'a, T: Transport> FalpLink<'a, T> {
     fn new(
-        reader: &'a mut Reader<T>,
-        role: Role,
+        link: FelicaLink<'a, T>,
         idm: Idm,
         port: u16,
         local: LocalParameters,
         peer: Parameters,
     ) -> Self {
         Self {
-            reader,
-            role,
+            link,
             idm,
             port,
             local,
@@ -624,7 +533,7 @@ impl<'a, T: Transport> FalpLink<'a, T> {
     }
 
     /// End the session with an orderly farewell, then reinitialize the reader.
-    pub fn close(self) -> Result<(), FalpError<T::Error>> {
+    pub fn close(mut self) -> Result<(), FalpError<T::Error>> {
         if self.open {
             let wait = falp::send_wait(
                 self.last_received,
@@ -633,23 +542,22 @@ impl<'a, T: Transport> FalpLink<'a, T> {
                 &self.peer,
                 false,
             );
-            self.reader.link.wait(wait);
+            self.link.wait(wait);
             let message = falp::farewell(Reason::NORMAL);
-            self.reader
-                .falp_send(self.role, &falp::farewell_packet(self.port, &message))?;
+            self.link
+                .send(&falp::farewell_packet(self.port, &message))?;
         }
-        self.reader.initialize()?;
+        self.link.finish()?;
         Ok(())
     }
 
     /// Leave the session without a farewell and reinitialize the reader.
     pub fn finish(self) -> Result<(), Error<T::Error>> {
-        self.reader.initialize().map(|_| ())
+        self.link.finish()
     }
 
     fn send_packet(&mut self, message: &[u8]) -> Result<(), Error<T::Error>> {
-        self.reader
-            .falp_send(self.role, &falp::data_packet(self.port, message))
+        self.link.send(&falp::data_packet(self.port, message))
     }
 
     fn send_burst(&mut self, empty: bool) -> Result<(), TurnEnd<T::Error>> {
@@ -663,14 +571,14 @@ impl<'a, T: Transport> FalpLink<'a, T> {
             &self.peer,
             switching,
         );
-        self.reader.link.wait(wait);
+        self.link.wait(wait);
         let mut previous: Option<u32> = None;
         for message in &messages {
             let frame = falp::frame_bytes(message.len());
             if let Some(sent) = previous {
                 let wait = falp::block_interval(sent, frame, &self.local, &self.peer)
                     + self.local.inter_block_delay;
-                self.reader.link.wait(wait);
+                self.link.wait(wait);
             }
             self.send_packet(message)?;
             previous = Some(frame);
@@ -681,12 +589,12 @@ impl<'a, T: Transport> FalpLink<'a, T> {
     /// Receive one data or farewell packet, answering envelope-level
     /// requests on the way.
     fn next_message(&mut self, wait: Duration) -> Result<Incoming, Error<T::Error>> {
-        let start = self.reader.link.now();
+        let start = self.link.now();
         loop {
-            let Some(remaining) = self.reader.falp_remaining(start, wait) else {
+            let Some(remaining) = remaining(&self.link, start, wait) else {
                 return Ok(Incoming::Timeout);
             };
-            let Some(packet) = self.reader.falp_receive(self.role, remaining)? else {
+            let Some(packet) = self.link.receive(rf_wait(remaining))? else {
                 return Ok(Incoming::Timeout);
             };
             match Pdu::parse(&packet) {
@@ -696,20 +604,21 @@ impl<'a, T: Transport> FalpLink<'a, T> {
                 } => {
                     self.last_received = falp::frame_bytes(message.len());
                     if acknowledge {
-                        self.reader.falp_send(self.role, &falp::data_ack_packet())?;
+                        self.link.send(&falp::data_ack_packet())?;
                     }
                     return Ok(Incoming::Message(message.to_vec()));
                 }
                 Pdu::Farewell { message } => {
                     return Ok(Incoming::Farewell(farewell_reason(message)));
                 }
-                Pdu::StatusQuery { idm } if self.role == Role::Target && idm == self.idm => {
+                Pdu::StatusQuery { idm }
+                    if self.link.role() == FelicaRole::Target && idm == self.idm =>
+                {
                     let reply = falp::status_reply_packet(idm, true, self.port);
-                    self.reader.falp_send(self.role, &reply)?;
+                    self.link.send(&reply)?;
                 }
-                Pdu::Propose { idm, .. } if self.role == Role::Target => {
-                    self.reader
-                        .falp_send(self.role, &falp::reject_packet(idm))?;
+                Pdu::Propose { idm, .. } if self.link.role() == FelicaRole::Target => {
+                    self.link.send(&falp::reject_packet(idm))?;
                 }
                 _ => {}
             }
@@ -718,8 +627,8 @@ impl<'a, T: Transport> FalpLink<'a, T> {
 
     fn violation<X>(&mut self, reason: Reason) -> Result<X, TurnEnd<T::Error>> {
         let message = falp::farewell(reason);
-        self.reader
-            .falp_send(self.role, &falp::farewell_packet(self.port, &message))?;
+        self.link
+            .send(&falp::farewell_packet(self.port, &message))?;
         Err(TurnEnd::Failed(TransferCause::Violation(reason)))
     }
 
@@ -778,7 +687,7 @@ impl<'a, T: Transport> FalpLink<'a, T> {
                         &self.peer,
                         false,
                     );
-                    self.reader.link.wait(wait);
+                    self.link.wait(wait);
                     self.send_packet(&block)?;
                     repeated = Some(block);
                     attempts = ATTEMPTS;
@@ -846,7 +755,7 @@ impl<'a, T: Transport> FalpLink<'a, T> {
                     &self.peer,
                     false,
                 );
-                self.reader.link.wait(wait);
+                self.link.wait(wait);
             }
             self.send_packet(&request)?;
             wait_first = true;

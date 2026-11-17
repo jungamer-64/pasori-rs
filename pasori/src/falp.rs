@@ -1,13 +1,19 @@
-//! FALP packet, parameter and window rules, without reader commands.
+//! FALP sessions over a FeliCa packet stream.
 //!
 //! FALP carries a byte stream between two devices in FeliCa packets. Each
 //! side sends bursts of numbered blocks; the last block of a burst passes the
 //! sending turn to the peer, and the peer's next burst acknowledges the whole
 //! burst. Missing blocks are requested one at a time before the turn passes.
 
-use crate::felica::Idm;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::{fmt, time::Duration};
+use rcs956::felica::Idm;
+
+mod session;
+
+pub use session::{
+    FalpAccepted, FalpConnect, FalpError, FalpLink, FalpListen, FalpTurn, TransferCause, listen,
+};
 
 /// Bytes of a block message before its data: type and big-endian number.
 const MESSAGE_HEADER: usize = 3;

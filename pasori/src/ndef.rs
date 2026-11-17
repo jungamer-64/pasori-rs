@@ -12,7 +12,7 @@ pub use message::{Message, MessageError, MessageErrorKind, Record, RecordType};
 pub use type1::{Type1Error, Type1WriteError};
 pub use type2::{Type2Error, Type2WriteError};
 pub use type3::Type3Tag;
-pub use type4::{Type4Error, Type4WriteError};
+pub use type4::{read_type4, write_type4};
 
 use core::fmt;
 

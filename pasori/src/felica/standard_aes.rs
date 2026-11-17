@@ -6,7 +6,6 @@
 //! from an authenticated response with a strictly newer transaction number.
 
 use super::{Card, Error as CommandError};
-use rcs956::{reader::FelicaCard, transport::Transport};
 use aes::{
     Aes128,
     cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit},
@@ -14,6 +13,7 @@ use aes::{
 use alloc::vec::Vec;
 use cmac::{Cmac, Mac};
 use core::fmt;
+use rcs956::{reader::FelicaCard, transport::Transport};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 

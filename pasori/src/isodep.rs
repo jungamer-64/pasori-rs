@@ -502,7 +502,9 @@ impl PreparedExchange<'_, '_> {
                 }
                 let transfer = match outbound {
                     Outbound::Information => transmit(&mut channel, &last_i, wait),
-                    Outbound::Acknowledge => transmit(&mut channel, &session.frame(0xa2 | number, &[]), wait),
+                    Outbound::Acknowledge => {
+                        transmit(&mut channel, &session.frame(0xa2 | number, &[]), wait)
+                    }
                     Outbound::RequestRetransmission => {
                         transmit(&mut channel, &session.frame(0xb2 | number, &[]), wait)
                     }
@@ -789,19 +791,11 @@ mod tests {
     use std::io;
 
     fn session(fsc: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
-        Session::new(
-            fsc,
-            64,
-            cid,
-            block_frame_wait(4),
-            None,
-            None,
-        )
+        Session::new(fsc, 64, cid, block_frame_wait(4), None, None)
     }
 
     #[test]
-    fn large_card_frames_keep_the_channel_block_limit()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn large_card_frames_keep_the_channel_block_limit() -> Result<(), Box<dyn std::error::Error>> {
         let mut link = session(4096, None)?;
         let mut first = vec![0x12];
         first.extend_from_slice(&[0x55; 61]);
@@ -1055,7 +1049,11 @@ mod tests {
         let mut link = session(64, None)?;
         let error = link
             .prepare::<io::Error>(&[1])?
-            .exchange(Ok(()), |_| false, |_, _, _| Ok::<_, io::Error>(vec![0xf2, 1]))
+            .exchange(
+                Ok(()),
+                |_| false,
+                |_, _, _| Ok::<_, io::Error>(vec![0xf2, 1]),
+            )
             .err()
             .ok_or("expected exhaustion")?;
         assert!(matches!(error.cause, Cause::Budget(Budget::WaitExtensions)));
@@ -1120,14 +1118,7 @@ mod tests {
     #[test]
     fn reader_receive_and_card_buffer_limits_are_distinct() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut link = Session::new(
-            16,
-            64,
-            None,
-            block_frame_wait(4),
-            Some(128),
-            None,
-        )?;
+        let mut link = Session::new(16, 64, None, block_frame_wait(4), Some(128), None)?;
         let error = link
             .prepare::<io::Error>(&[0; 129])
             .err()
@@ -1198,7 +1189,11 @@ mod tests {
             let mut link = session(64, None)?;
             let error = link
                 .admit_presence_check::<io::Error>()?
-                .run(Ok(()), |_| false, |_, _, _| Ok::<_, io::Error>(reply.clone()))
+                .run(
+                    Ok(()),
+                    |_| false,
+                    |_, _, _| Ok::<_, io::Error>(reply.clone()),
+                )
                 .err()
                 .ok_or("expected an unconfirmed probe")?;
             assert!(matches!(error, PresenceError::InvalidBlock(_)));
@@ -1228,7 +1223,7 @@ mod tests {
         let error = link
             .admit_presence_check::<io::Error>()?
             .run(
-                Err(io::Error::other("setup")),
+                Err::<(), _>(io::Error::other("setup")),
                 |_| false,
                 |_, _, _| Err::<Vec<u8>, _>(io::Error::other("unexpected transfer")),
             )
