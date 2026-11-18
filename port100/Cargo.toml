@@ -1,0 +1,15 @@
+[package]
+name = "port100"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Port-100 host framing, reader initialization, and FeliCa packet exchange"
+
+[dependencies]
+felica-packet = { path = "../felica-packet", version = "0.1" }
+
+[dev-dependencies]
+reader-script = { path = "../script" }
+
+[lints]
+workspace = true
