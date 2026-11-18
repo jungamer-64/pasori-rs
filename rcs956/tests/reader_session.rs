@@ -2,21 +2,22 @@
 //!
 //! These model command/response contracts, not physical device operation.
 
+use felica_packet::Idm;
 use rcs956::{
     felica::BitRate,
     mifare,
     nfcb::{PollOptions, RfProfile},
     reader::{
         ApduCause, ApduError, ConfigurationError, DepActivation, DepError, DepMode, DepRate,
-        DepTransferCause, Error as ReaderError, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout,
-        TargetExchangeError, TypeBSelection,
+        DepTransferCause, Error as ReaderError, FelicaListen, FelicaRole, MAX_DEP_MESSAGE_BYTES,
+        Reader, RfTimeout, TargetExchangeError, TypeBSelection,
     },
     transport::{Failure, Progress, TransactionError},
 };
 use reader_script::rcs956::{
     Answer, Request, Script, Step, ab_config_image, ab_mode, bank_addresses, command, config_image,
-    idle_receiver, initialization, mode_configuration, poll_request, timeout, type_a_response,
-    type_b_response,
+    idle_receiver, initialization, mode_configuration, poll_request, poll_response, timeout,
+    type_a_response, type_b_response,
 };
 use std::{error::Error, time::Duration};
 
@@ -1163,5 +1164,66 @@ fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), B
         assert_eq!(journal.borrow().requests.len(), count);
         assert_eq!(journal.borrow().remaining, 0);
     }
+    Ok(())
+}
+
+#[test]
+fn felica_target_listens_right_after_reset_and_streams_packets() -> Result<(), Box<dyn Error>> {
+    let configuration = config_image();
+    let mut steps = initialization(&configuration);
+    let mut args = vec![0, 0, 1, 1, 2, 3, 0];
+    args.extend([2, 0xfe, 1, 2, 3, 4, 5, 6]);
+    args.extend([0, 0x22, 3, 3, 3, 3, 3, 3, 0x12, 0xfc]);
+    args.extend([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x55]);
+    steps.extend([
+        command(0x8c, &args, &[0x22, 3, 0xaa, 1]),
+        command(0x90, &[3, 0xab, 2], &[0]),
+        command(0x88, &[], &[0, 2, 0xbc]),
+    ]);
+    steps.extend(initialization(&configuration));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    let listen = FelicaListen {
+        idm: Idm::new([2, 0xfe, 1, 2, 3, 4, 5, 6]),
+        pmm: [0, 0x22, 3, 3, 3, 3, 3, 3],
+        system_code: 0x12fc,
+    };
+    let mut activation = reader.listen_felica(listen, timeout()?)?;
+    assert_eq!(activation.packet, [3, 0xaa, 1]);
+    assert_eq!(activation.link.role(), FelicaRole::Target);
+    assert_eq!(activation.link.rate(), BitRate::Kbps424);
+    activation.link.send(&[3, 0xab, 2])?;
+    assert_eq!(activation.link.receive(timeout()?)?, Some(vec![2, 0xbc]));
+    activation.link.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn polled_felica_card_becomes_a_link_without_a_reader_command() -> Result<(), Box<dyn Error>> {
+    let configuration = config_image();
+    let mut steps = initialization(&configuration);
+    steps.extend(mode_configuration());
+    steps.extend([
+        idle_receiver(),
+        command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &poll_response()),
+        command(0xa0, &[0xc8, 0, 2, 0xaa], &[0, 2, 0xab]),
+    ]);
+    steps.extend(initialization(&configuration));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let card = reader
+        .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+        .ok_or("FeliCa card absent")?;
+    let mut link = card.into_link();
+    assert_eq!(link.role(), FelicaRole::Initiator);
+    assert_eq!(link.rate(), BitRate::Kbps212);
+    assert_eq!(
+        link.send_receive(&[2, 0xaa], timeout()?)?,
+        Some(vec![2, 0xab])
+    );
+    link.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

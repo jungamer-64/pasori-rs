@@ -2168,7 +2168,6 @@ fn type_four_b_ndef_write_fits_each_apdu_within_the_card_buffer() -> Result<(), 
 }
 
 // FALP fixtures, built from the packet layout independently of the crate.
-const FALP_PROCESSING: [u8; 8] = [0, 0x10, 0, 5, 0, 6, 0, 7];
 const INITIATOR_PORT: [u8; 2] = [0x34, 0x12];
 const TARGET_PORT: [u8; 2] = [0x78, 0x56];
 /// One-second waits encoded as half-millisecond ticks.
@@ -2260,7 +2259,6 @@ fn connected_initiator() -> Vec<Step> {
     steps.extend([
         idle_receiver(),
         command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
-        command(6, &FALP_PROCESSING, &[0, 0, 0, 0]),
         command(
             0xa0,
             &with_ticks(SECOND, &propose(IDENTITY, INITIATOR_PORT)),
@@ -2429,7 +2427,6 @@ const TARGET_IDM: [u8; 8] = [2, 0xfe, 1, 2, 3, 4, 5, 6];
 
 fn falp_listen_steps(application: &[u8]) -> Vec<Step> {
     let mut steps = initialization(&config_image());
-    steps.push(command(6, &FALP_PROCESSING, &[0, 0, 0, 0]));
     let mut args = vec![0, 0, 1, 1, 2, 3, 0];
     args.extend(TARGET_IDM);
     args.extend([0, 0x22, 3, 3, 3, 3, 3, 3, 0xfe, 0xe2]);

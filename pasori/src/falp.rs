@@ -37,16 +37,22 @@ const STATUS_REPLY: u8 = 0xbf;
 /// Parameter set chosen for a session, matching the Sony driver's
 /// `FalpSpeed` registry value. Larger values receive more blocks per burst
 /// and wait less between frames.
+///
+/// The frame processing time advertised in the handshake and used in this
+/// side's waits is the profile's value alone. The Sony driver adds a value it
+/// reads from RC-S956 registers `0010` and `0005`–`0007`, but RC-S330/S
+/// firmware rejects that read and the registers' meaning is unknown, so no
+/// reader value is added.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Profile {
     /// `FalpSpeed` 0: 16 blocks per burst, 40 ms turnaround and frame
-    /// interval, 10 ms between blocks.
+    /// interval, 10 ms between blocks, 3.5 ms frame processing.
     Speed0,
     /// `FalpSpeed` 1, the driver default: 256 blocks per burst, 20 ms
-    /// turnaround and frame interval.
+    /// turnaround and frame interval, 3.5 ms frame processing.
     Speed1,
     /// `FalpSpeed` 2: 512 blocks per burst, 3 ms turnaround, 5 ms frame
-    /// interval and no frame processing allowance.
+    /// interval and no frame processing time.
     Speed2,
 }
 
@@ -117,8 +123,8 @@ pub(crate) struct LocalParameters {
 }
 
 impl LocalParameters {
-    /// Profile values with the reader's RF rate and processing allowance.
-    pub(crate) fn new(profile: Profile, rf_bit_rate: u32, processing_allowance: u32) -> Self {
+    /// Profile values with the reader's RF rate.
+    pub(crate) fn new(profile: Profile, rf_bit_rate: u32) -> Self {
         let (blocks, processing, turnaround, interval, delay) = match profile {
             Profile::Speed0 => (16, 3500, 40_000, 40_000, 10),
             Profile::Speed1 => (256, 3500, 20_000, 20_000, 0),
@@ -128,7 +134,7 @@ impl LocalParameters {
             wire: Parameters {
                 blocks,
                 block_bytes: 0xf9,
-                frame_processing: u32::saturating_add(processing, processing_allowance),
+                frame_processing: processing,
                 rf_overhead: 11,
                 rf_bit_rate,
                 host_send_overhead: 14,
@@ -828,7 +834,7 @@ mod tests {
     use super::*;
 
     fn local(profile: Profile) -> LocalParameters {
-        LocalParameters::new(profile, RF_424, 0)
+        LocalParameters::new(profile, RF_424)
     }
 
     #[test]

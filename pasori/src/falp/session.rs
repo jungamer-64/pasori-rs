@@ -261,11 +261,6 @@ fn rf_wait(wait: Duration) -> RfTimeout {
     RfTimeout::new(bounded).unwrap_or(RfTimeout::MAX)
 }
 
-/// Frame processing allowance in the handshake's microsecond unit.
-fn allowance_micros<T: Transport>(link: &FelicaLink<'_, T>) -> u32 {
-    u32::try_from(link.processing_allowance().as_micros()).unwrap_or(u32::MAX)
-}
-
 /// Remaining part of `total` after `start`, or `None` once it elapsed.
 fn remaining<T: Transport>(
     link: &FelicaLink<'_, T>,
@@ -354,11 +349,7 @@ pub fn listen<'a, T: Transport>(
     let Pdu::Propose { port, .. } = Pdu::parse(&activation.packet) else {
         return Err(FalpError::Activation);
     };
-    let mut local = LocalParameters::new(
-        config.profile,
-        rf_rate(link.rate()),
-        allowance_micros(&link),
-    );
+    let mut local = LocalParameters::new(config.profile, rf_rate(link.rate()));
 
     let start = link.now();
     let reply = link.send_receive(
@@ -426,12 +417,8 @@ impl<'a, T: Transport> Card<FelicaCard<'a, T>> {
             return Err(FalpError::TimeoutRange);
         }
         let idm = self.selection().poll_response().idm;
-        let mut link = self.into_selection().into_link()?;
-        let local = LocalParameters::new(
-            config.profile,
-            rf_rate(link.rate()),
-            allowance_micros(&link),
-        );
+        let mut link = self.into_selection().into_link();
+        let local = LocalParameters::new(config.profile, rf_rate(link.rate()));
 
         let start = link.now();
         let mut answer = link.send_receive(

@@ -6,9 +6,6 @@ use felica_packet::Idm;
 
 /// Host wait of one-way frames.
 const READER_WAIT: Duration = Duration::from_secs(1);
-/// Registers whose four bytes, little-endian, the Sony driver adds to its
-/// frame processing time in microseconds.
-const PROCESSING_REGISTERS: [u8; 8] = [0, 0x10, 0, 5, 0, 6, 0, 7];
 /// TgInitTarget fields before the FeliCa parameters: passive-only mode and
 /// NFC-A parameters, which a FeliCa activation does not use.
 const LISTEN_PREFIX: [u8; 7] = [0, 0, 1, 1, 2, 3, 0];
@@ -53,19 +50,9 @@ pub struct FelicaLink<'a, T: Transport> {
     reader: &'a mut Reader<T>,
     role: FelicaRole,
     rate: BitRate,
-    processing_allowance: Duration,
 }
 
 impl<T: Transport> Reader<T> {
-    /// Frame processing allowance read from the reader's registers.
-    fn processing_allowance(&mut self) -> Result<Duration, Error<T::Error>> {
-        let bytes: [u8; 4] = self
-            .command(6, &PROCESSING_REGISTERS, READER_WAIT)?
-            .try_into()
-            .map_err(|_| Error::Response("processing register length"))?;
-        Ok(Duration::from_micros(u64::from(u32::from_le_bytes(bytes))))
-    }
-
     /// Reset the reader and listen as a passive FeliCa target answering
     /// Polling with `listen`. `timeout` bounds the wait for an initiator; a
     /// timeout of the activation command fails the reader transaction.
@@ -76,7 +63,6 @@ impl<T: Transport> Reader<T> {
     ) -> Result<FelicaActivation<'_, T>, Error<T::Error>> {
         self.initialize()?;
         self.state = State::NeedsInitialization;
-        let processing_allowance = self.processing_allowance()?;
         let mut args = Vec::with_capacity(36);
         args.extend_from_slice(&LISTEN_PREFIX);
         args.extend_from_slice(listen.idm.as_bytes());
@@ -97,7 +83,6 @@ impl<T: Transport> Reader<T> {
                 reader: self,
                 role: FelicaRole::Target,
                 rate,
-                processing_allowance,
             },
             packet,
         })
@@ -108,16 +93,14 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
     /// Consume the selected card's typed authority for a packet stream at its
     /// polling rate. The reader requires initialization from here on, which
     /// [`FelicaLink::finish`] performs.
-    pub fn into_link(self) -> Result<FelicaLink<'a, T>, Error<T::Error>> {
+    pub fn into_link(self) -> FelicaLink<'a, T> {
         let Self { reader, rate, .. } = self;
         reader.state = State::NeedsInitialization;
-        let processing_allowance = reader.processing_allowance()?;
-        Ok(FelicaLink {
+        FelicaLink {
             reader,
             role: FelicaRole::Initiator,
             rate,
-            processing_allowance,
-        })
+        }
     }
 }
 
@@ -130,11 +113,6 @@ impl<T: Transport> FelicaLink<'_, T> {
     /// RF rate of the activation.
     pub fn rate(&self) -> BitRate {
         self.rate
-    }
-
-    /// Frame processing time the reader's registers add to each frame.
-    pub fn processing_allowance(&self) -> Duration {
-        self.processing_allowance
     }
 
     /// Host monotonic time.
