@@ -96,29 +96,19 @@ fn identifies_an_rcs600_on_the_rcs320_product_id() -> TestResult {
 }
 
 #[test]
-fn initializes_an_rcs310_by_release() -> TestResult {
-    let mut values = vec![0x29];
-    values.extend_from_slice(&[
-        0x89, 0x13, 0x25, 0xf0, 0xa0, 0x02, 0xa1, 0x00, 0xa2, 0x89, 0xa3, 0x10, 0xa4, 0x03, 0xa5,
-        0x89, 0xa6, 0x10,
-    ]);
+fn initializes_an_rcs310_by_release_without_5a() -> TestResult {
     let steps = vec![
-        command(0x58, &[], &FIRMWARE),
-        command(0x62, &[1, 0x82], &[0, 0x20]),
-        command(0x62, &values, &[0]),
-        command(0x5a, &[0x80], &[0]),
+        command(0x58, &[], &[0x21, 0x01]),
+        command(0x62, &[1, 0x82], &[0, 0x28]),
+        command(0x62, &[&[0x29][..], &RCS310_0121].concat(), &[0]),
         command(0x54, &[], &[0]),
     ];
-    let (transport, journal) = Script::new(rcs310(0x0118, 0), steps);
+    let (transport, journal) = Script::new(rcs310(0x0121, 0), steps);
     let mut reader = Reader::new(transport);
     assert_eq!(reader.initialize()?.product, Product::Rcs310);
     assert_eq!(journal.borrow().remaining, 0);
 
-    let steps = vec![
-        command(0x58, &[], &FIRMWARE),
-        command(0x5a, &[0x80], &[0]),
-        command(0x54, &[], &[0]),
-    ];
+    let steps = vec![command(0x58, &[], &FIRMWARE), command(0x54, &[], &[0])];
     let (transport, journal) = Script::new(rcs310(0x0100, 1), steps);
     let mut reader = Reader::new(transport);
     assert_eq!(reader.initialize()?.product, Product::Rcs310Ed2);

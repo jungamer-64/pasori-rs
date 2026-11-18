@@ -173,9 +173,11 @@ impl<T: Transport> Reader<T> {
     /// reader uninitialized; no command replay.
     ///
     /// The register values are those that Sony's driver package writes for
-    /// the same observations. `5A 80` is the form of command `5A` that the
-    /// driver sends before a short card exchange. The device-side meaning of
-    /// both is not established here.
+    /// the same observations. The RC-S320 family then receives `5A 80`, the
+    /// form of command `5A` that the driver sends before a short card
+    /// exchange; an RC-S310 answers `5A` with the error frame, so it receives
+    /// none. The device-side meaning of the values and of `5A` is not
+    /// established here.
     ///
     /// # Errors
     ///
@@ -221,12 +223,12 @@ impl<T: Transport> Reader<T> {
                         }),
                     )?;
                 self.write_registers(values)?;
+                if self.command(0x5a, &[0x80], READER_WAIT)? != [0] {
+                    return Err(Error::Response("5A status"));
+                }
                 product
             }
         };
-        if self.command(0x5a, &[0x80], READER_WAIT)? != [0] {
-            return Err(Error::Response("5A status"));
-        }
         self.switch_field_off()?;
         let info = ReaderInfo {
             descriptor,
