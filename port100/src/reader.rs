@@ -1,14 +1,28 @@
-//! Reader initialization and lifetime-bound FeliCa card access.
+//! Reader initialization and lifetime-bound card access.
 //!
-//! Initialization and the FeliCa RF and protocol settings follow what Sony's
-//! NFC Port 5.6.9.0 driver package sends to Port-100 readers, including the
-//! settings it withholds from older firmware.
+//! Initialization and the RF and protocol settings follow what Sony's NFC
+//! Port 5.6.9.0 driver package sends to Port-100 readers. The host runs NFC-A
+//! anticollision, RATS and the NFC-B ATTRIB itself; the reader carries each
+//! frame and, except where a card handle says otherwise, its CRC.
+
+mod iso_dep;
+mod settings;
+mod type_a;
+mod type_b;
+
+pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard, MAX_BLOCK_BYTES};
+pub use type_a::{TypeACard, TypeASelection};
 
 use crate::transport::{Failure, Link, Progress, TransactionError, Transport};
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
 use felica_packet::{PacketError, PollRequest, PollResponse, Selection};
+use iso14443::{nfca, nfcb};
+use settings::{Firmware, Settings};
 
+/// Largest RF frame, without the CRC that the reader appends, that one
+/// InCommRF carries.
+pub const MAX_FRAME_BYTES: usize = 0x122;
 /// Host wait of commands that do not reach a card.
 const COMMAND_WAIT: Duration = Duration::from_secs(1);
 /// Host wait for an InCommRF response beyond the RF wait the reader runs.
@@ -19,10 +33,6 @@ const FIELD_OFF_SETTLE: Duration = Duration::from_millis(5);
 const RECEIVE_TIMEOUT: u32 = 0x80;
 /// Highest command type that initialization selects.
 const MAX_COMMAND_TYPE: u8 = 2;
-/// InSetRF technology code of FeliCa.
-const FELICA: u8 = 0x01;
-/// InSetRF receive technology code meaning "same as the send technology".
-const SAME_AS_SEND: u8 = 0x0f;
 
 /// Failures of reader initialization, RF control, or card exchange.
 #[derive(Debug)]
@@ -43,7 +53,7 @@ pub enum Error<E> {
         status: u8,
     },
     /// The reader reported an RF failure other than a missing card reply.
-    /// The packet was sent and may have taken effect; the next selection
+    /// The frame was sent and may have taken effect; the next selection
     /// cycles the RF field.
     RfStatus(u32),
     /// A FeliCa packet was malformed before it was sent.
@@ -52,8 +62,31 @@ pub enum Error<E> {
     /// may have taken effect.
     FelicaResponse(PacketError),
     /// No card reply arrived within the wait. The card may have received the
-    /// packet and taken effect; the reader remains usable.
+    /// frame and taken effect; the reader remains usable.
     NoResponse,
+    /// NFC-A activation data failed validation.
+    TypeA(nfca::Error),
+    /// NFC-B activation data failed validation.
+    TypeB(nfcb::Error),
+    /// A card reply did not have the layout its command requires.
+    CardReply(&'static str),
+    /// A card reply that the host checks failed its CRC.
+    CardCrc,
+    /// The NFC-B card's ATQB does not advertise ISO-DEP, the only protocol
+    /// this reader layer runs for NFC-B.
+    NotIsoDep,
+    /// The RF settings this selection exchanges under are no longer known to
+    /// be in effect; the card must be selected again.
+    FieldReset,
+    /// A frame exceeds what one InCommRF carries.
+    InputLength {
+        /// Maximum accepted bytes.
+        maximum: usize,
+        /// Supplied bytes.
+        actual: usize,
+    },
+    /// A requested wait is zero or longer than [`ResponseWait::MAX`].
+    WaitRange(Duration),
 }
 
 impl<E: fmt::Debug> fmt::Display for Error<E> {
@@ -74,6 +107,16 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
                 f.write_str("FeliCa response failed; the command may have taken effect")
             }
             Self::NoResponse => f.write_str("no card reply; the command may have taken effect"),
+            Self::TypeA(_) => f.write_str("invalid NFC-A activation"),
+            Self::TypeB(_) => f.write_str("invalid NFC-B activation"),
+            Self::CardReply(reason) => write!(f, "malformed card reply: {reason}"),
+            Self::CardCrc => f.write_str("card reply failed its CRC"),
+            Self::NotIsoDep => f.write_str("NFC-B card does not advertise ISO-DEP"),
+            Self::FieldReset => f.write_str("RF settings of the selection were lost"),
+            Self::InputLength { maximum, actual } => {
+                write!(f, "input of {actual} bytes exceeds {maximum}")
+            }
+            Self::WaitRange(wait) => write!(f, "wait of {wait:?} cannot be encoded"),
         }
     }
 }
@@ -83,6 +126,8 @@ impl<E: error::Error + 'static> error::Error for Error<E> {
         match self {
             Self::Transaction(error) => Some(error),
             Self::FelicaRequest(error) | Self::FelicaResponse(error) => Some(error),
+            Self::TypeA(error) => Some(error),
+            Self::TypeB(error) => Some(error),
             _ => None,
         }
     }
@@ -125,16 +170,6 @@ pub enum BitRate {
     Kbps424,
 }
 
-impl BitRate {
-    /// InSetRF bit-rate code, shared by every firmware.
-    fn code(self) -> u8 {
-        match self {
-            Self::Kbps212 => 0x01,
-            Self::Kbps424 => 0x02,
-        }
-    }
-}
-
 /// Hardware observations obtained by a completed initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderInfo {
@@ -151,78 +186,32 @@ pub struct ReaderInfo {
     pub pd_data: u16,
 }
 
-/// Firmware observations that select the FeliCa protocol settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Firmware {
-    version: u16,
-    option_60: u16,
-}
-
-impl Firmware {
-    /// Whether the firmware belongs to the older range that ends at `last`.
-    /// Only option-60 values up to 5 have older ranges, and for them
-    /// versions `0101`..`0199` compare as if shifted left by four bits, which
-    /// places them above every range.
-    fn at_most(self, last: u16) -> bool {
-        if self.option_60 > 5 {
-            return false;
-        }
-        let version = u32::from(self.version);
-        let version = if (0x101..0x19a).contains(&version) {
-            version << 4
-        } else {
-            version
-        };
-        (1..=u32::from(last)).contains(&version)
-    }
-
-    /// InSetProtocol pairs for FeliCa polling and exchange: CRC appended and
-    /// checked, no parity or SOF/EOF, initial guard time 18 and guard time
-    /// 6. Firmware up to 0599 receives tag 0D instead of tag 12, firmware up
-    /// to 0609 receives the general receive settings for tags 0E to 10, and
-    /// firmware up to 0619 does not receive tag 13.
-    fn felica_protocol(self) -> Vec<u8> {
-        let mut pairs = Vec::with_capacity(38);
-        pairs.extend_from_slice(&[
-            0x00, 0x18, 0x01, 0x01, 0x02, 0x01, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00,
-            0x07, 0x08, 0x08, 0x00, 0x09, 0x00, 0x0a, 0x00, 0x0b, 0x00, 0x0c, 0x00,
-        ]);
-        let older_tags = self.at_most(0x599);
-        if older_tags {
-            pairs.extend_from_slice(&[0x0d, 0x00]);
-        }
-        if self.at_most(0x609) {
-            pairs.extend_from_slice(&[0x0e, 0x04, 0x0f, 0x00, 0x10, 0x00]);
-        } else {
-            pairs.extend_from_slice(&[0x0e, 0x00, 0x0f, 0x05, 0x10, 0xff]);
-        }
-        pairs.extend_from_slice(&[0x11, 0x00]);
-        if !older_tags {
-            pairs.extend_from_slice(&[0x12, 0x00]);
-        }
-        if !self.at_most(0x619) {
-            pairs.extend_from_slice(&[0x13, 0x06]);
-        }
-        pairs
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
-    /// The field is off and no FeliCa settings are known to be in effect.
+    /// The field is off and no settings are known to be in effect.
     Off,
-    /// FeliCa settings for this rate were accepted.
-    Felica(BitRate),
-    /// The card can hold state that the next Polling does not clear, or an
-    /// RF failure left the field state unknown, so the next selection
+    /// These settings were accepted. `cycle` makes the next selection switch
+    /// the field off first, because a card can hold state that selection
+    /// does not clear or an RF failure left the card state unknown.
+    On { settings: Settings, cycle: bool },
+    /// A rejected setting left the settings unknown; the next selection
     /// switches the field off first.
-    CycleRequired,
+    Unknown,
 }
 
 #[derive(Debug)]
 enum State {
     NeedsInitialization,
     Ready { firmware: Firmware, field: Field },
+}
+
+/// One card reply carried by InCommRF.
+#[derive(Debug)]
+struct Received {
+    data: Vec<u8>,
+    /// Response byte 5, which the driver package compares with 8 to accept
+    /// a reply whose last byte is complete.
+    last_bits: u8,
 }
 
 /// Exclusive reader owner. Uncertain transport failures revoke readiness.
@@ -318,9 +307,9 @@ impl<T: Transport> Reader<T> {
         Ok(())
     }
 
-    fn ready(&mut self) -> Result<(Firmware, &mut Field), Error<T::Error>> {
-        match &mut self.state {
-            State::Ready { firmware, field } => Ok((*firmware, field)),
+    fn ready(&self) -> Result<(Firmware, Field), Error<T::Error>> {
+        match self.state {
+            State::Ready { firmware, field } => Ok((firmware, field)),
             State::NeedsInitialization => Err(Error::NotInitialized),
         }
     }
@@ -340,27 +329,130 @@ impl<T: Transport> Reader<T> {
     /// it again, and a nonzero status leaves the field state unknown.
     pub fn rf_off(&mut self) -> Result<(), Error<T::Error>> {
         self.ready()?;
-        self.set_field(Field::CycleRequired);
+        self.set_field(Field::Unknown);
         self.switch_field_off()?;
         self.set_field(Field::Off);
         Ok(())
     }
 
-    /// Send the FeliCa RF and protocol settings for `rate` unless they are
-    /// in effect. A rejected setting leaves the field state unknown.
-    fn configure_felica(&mut self, rate: BitRate) -> Result<(), Error<T::Error>> {
-        let (firmware, field) = self.ready()?;
-        let current = *field;
-        match current {
-            Field::Felica(configured) if configured == rate => return Ok(()),
-            Field::CycleRequired => self.rf_off()?,
-            Field::Off | Field::Felica(_) => {}
+    /// Make the next selection switch the field off before its request.
+    fn require_field_cycle(&mut self) {
+        if let State::Ready {
+            field: Field::On { cycle, .. },
+            ..
+        } = &mut self.state
+        {
+            *cycle = true;
         }
-        self.set_field(Field::CycleRequired);
-        self.status_command(0x00, &[FELICA, rate.code(), SAME_AS_SEND, rate.code()])?;
-        self.status_command(0x02, &firmware.felica_protocol())?;
-        self.set_field(Field::Felica(rate));
+    }
+
+    /// Send `settings` unless they are in effect, switching the field off
+    /// first when a field cycle is required. A rejected setting leaves the
+    /// settings unknown.
+    fn configure(&mut self, settings: Settings) -> Result<(), Error<T::Error>> {
+        let (firmware, field) = self.ready()?;
+        match field {
+            Field::On {
+                settings: current,
+                cycle: false,
+            } if current == settings => return Ok(()),
+            Field::On { cycle: true, .. } | Field::Unknown => self.rf_off()?,
+            Field::Off | Field::On { .. } => {}
+        }
+        self.set_field(Field::Unknown);
+        self.status_command(0x00, &settings.rf(firmware))?;
+        self.status_command(0x02, &settings.protocol(firmware))?;
+        self.set_field(Field::On {
+            settings,
+            cycle: false,
+        });
         Ok(())
+    }
+
+    /// Start an NFC-A or NFC-B activation from a field that was off, so that
+    /// every card in it starts from its idle state, under `settings`.
+    fn begin_activation(&mut self, settings: Settings) -> Result<(), Error<T::Error>> {
+        if self.ready()?.1 != Field::Off {
+            self.rf_off()?;
+        }
+        self.configure(settings)
+    }
+
+    /// Apply protocol pairs within an activation, keeping the settings
+    /// unknown until the activation publishes them.
+    fn set_protocol(&mut self, pairs: &[u8]) -> Result<(), Error<T::Error>> {
+        self.set_field(Field::Unknown);
+        self.status_command(0x02, pairs)
+    }
+
+    /// Carry one frame of a selected card under `settings`. NFC-A switches
+    /// between reader and host CRC checks as the frame requires; any other
+    /// difference from the settings in effect means that the card's
+    /// selection no longer holds.
+    fn transceive(
+        &mut self,
+        settings: Settings,
+        frame: &[u8],
+        wait: ResponseWait,
+    ) -> Result<Option<Received>, Error<T::Error>> {
+        let (_, field) = self.ready()?;
+        let Field::On {
+            settings: current,
+            cycle,
+        } = field
+        else {
+            return Err(Error::FieldReset);
+        };
+        if current != settings {
+            let (Settings::TypeA(_), Settings::TypeA(check)) = (current, settings) else {
+                return Err(Error::FieldReset);
+            };
+            self.set_field(Field::Unknown);
+            self.status_command(0x02, &settings::crc_check(check))?;
+            self.set_field(Field::On { settings, cycle });
+        }
+        self.in_comm_rf(frame, wait)
+    }
+
+    /// Send one RF frame within an activation and require a card reply.
+    fn card_reply(&mut self, frame: &[u8], wait: ResponseWait) -> Result<Vec<u8>, Error<T::Error>> {
+        self.in_comm_rf(frame, wait)?
+            .map(|received| received.data)
+            .ok_or(Error::NoResponse)
+    }
+
+    /// Send one RF frame with InCommRF and return the card's reply, or
+    /// `None` when no reply arrived within `wait`.
+    fn in_comm_rf(
+        &mut self,
+        frame: &[u8],
+        wait: ResponseWait,
+    ) -> Result<Option<Received>, Error<T::Error>> {
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(Error::InputLength {
+                maximum: MAX_FRAME_BYTES,
+                actual: frame.len(),
+            });
+        }
+        let mut args = Vec::with_capacity(frame.len() + 2);
+        args.extend_from_slice(&wait.0.to_le_bytes());
+        args.extend_from_slice(frame);
+        let response = self.command(0x04, &args, wait.host_wait())?;
+        let Some((&[s0, s1, s2, s3, last_bits], data)) = response.split_first_chunk::<5>() else {
+            return Err(Error::Response("InCommRF length"));
+        };
+        match u32::from_le_bytes([s0, s1, s2, s3]) {
+            0 if data.is_empty() => Ok(None),
+            0 => Ok(Some(Received {
+                data: data.to_vec(),
+                last_bits,
+            })),
+            RECEIVE_TIMEOUT => Ok(None),
+            status => {
+                self.require_field_cycle();
+                Err(Error::RfStatus(status))
+            }
+        }
     }
 
     /// Select one FeliCa card at `rate`. The returned card exclusively
@@ -380,55 +472,39 @@ impl<T: Transport> Reader<T> {
         request: PollRequest,
         wait: ResponseWait,
     ) -> Result<Option<FelicaCard<'_, T>>, Error<T::Error>> {
-        self.configure_felica(rate)?;
-        let Some(packet) = self.exchange(&request.encode(), wait)? else {
+        let settings = Settings::Felica(rate);
+        self.configure(settings)?;
+        let Some(packet) = self.felica_exchange(settings, &request.encode(), wait)? else {
             return Ok(None);
         };
         match PollResponse::parse(&packet) {
             Ok(observation) => Ok(Some(FelicaCard {
                 reader: self,
+                rate,
                 request,
                 observation,
                 wait,
             })),
             Err(error) => {
-                self.set_field(Field::CycleRequired);
+                self.require_field_cycle();
                 Err(Error::FelicaResponse(error))
             }
         }
     }
 
-    /// Carry one packet with InCommRF and return the card's reply, or `None`
-    /// when no reply arrived within `wait`.
-    fn exchange(
+    /// Carry one FeliCa packet and return the card's packet, whose length
+    /// byte has been checked.
+    fn felica_exchange(
         &mut self,
+        settings: Settings,
         packet: &[u8],
         wait: ResponseWait,
     ) -> Result<Option<Vec<u8>>, Error<T::Error>> {
-        self.ready()?;
-        let mut args = Vec::with_capacity(packet.len() + 2);
-        args.extend_from_slice(&wait.0.to_le_bytes());
-        args.extend_from_slice(packet);
-        let response = self.command(0x04, &args, wait.host_wait())?;
-        let Some((&[s0, s1, s2, s3, _], received)) = response.split_first_chunk::<5>() else {
-            return Err(Error::Response("InCommRF length"));
+        let Some(received) = self.transceive(settings, packet, wait)? else {
+            return Ok(None);
         };
-        match u32::from_le_bytes([s0, s1, s2, s3]) {
-            0 if received.is_empty() => Ok(None),
-            0 => {
-                felica_packet::validate_length(received, 2).map_err(Error::FelicaResponse)?;
-                Ok(Some(received.to_vec()))
-            }
-            RECEIVE_TIMEOUT => Ok(None),
-            status => {
-                self.set_field(Field::CycleRequired);
-                Err(Error::RfStatus(status))
-            }
-        }
-    }
-
-    fn require_field_cycle(&mut self) {
-        self.set_field(Field::CycleRequired);
+        felica_packet::validate_length(&received.data, 2).map_err(Error::FelicaResponse)?;
+        Ok(Some(received.data))
     }
 }
 
@@ -440,6 +516,7 @@ impl<T: Transport> Reader<T> {
 #[derive(Debug)]
 pub struct FelicaCard<'a, T: Transport> {
     reader: &'a mut Reader<T>,
+    rate: BitRate,
     request: PollRequest,
     observation: PollResponse,
     wait: ResponseWait,
@@ -460,7 +537,7 @@ impl<T: Transport> Selection for FelicaCard<'_, T> {
     fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
         felica_packet::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         self.reader
-            .exchange(packet, self.wait)?
+            .felica_exchange(Settings::Felica(self.rate), packet, self.wait)?
             .ok_or(Error::NoResponse)
     }
 
@@ -472,20 +549,6 @@ impl<T: Transport> Selection for FelicaCard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn older_firmware_ranges_follow_option_60_and_the_shifted_versions() {
-        let firmware = |option_60, version| Firmware { option_60, version };
-        assert!(firmware(0, 0x0599).at_most(0x599));
-        assert!(!firmware(0, 0x0600).at_most(0x599));
-        assert!(!firmware(6, 0x0100).at_most(0x599));
-        assert!(!firmware(0, 0x0000).at_most(0x599));
-        assert!(firmware(5, 0x0100).at_most(0x199));
-        assert!(!firmware(5, 0x0101).at_most(0x711));
-        assert!(!firmware(5, 0x0199).at_most(0x711));
-        assert!(!firmware(5, 0x019a).at_most(0x199));
-        assert!(firmware(5, 0x019a).at_most(0x299));
-    }
 
     #[test]
     fn response_waits_round_up_to_the_reader_unit() {

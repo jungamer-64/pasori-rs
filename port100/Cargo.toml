@@ -3,10 +3,11 @@ name = "port100"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Port-100 host framing, reader initialization, and FeliCa packet exchange"
+description = "Port-100 host framing, reader initialization, NFC-A/B activation, and card frame exchange"
 
 [dependencies]
 felica-packet = { path = "../felica-packet", version = "0.1" }
+iso14443 = { path = "../iso14443", version = "0.1" }
 
 [dev-dependencies]
 reader-script = { path = "../script" }
