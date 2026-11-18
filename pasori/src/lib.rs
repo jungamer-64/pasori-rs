@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 pub use felica_packet;
+pub use iso14443;
 pub use port100;
 pub use rcs310;
 pub use rcs956;

@@ -3,6 +3,7 @@
 //! These model command/response contracts, not physical device operation.
 
 use felica_packet::Idm;
+use iso14443::nfca::Selection as _;
 use rcs956::{
     felica::BitRate,
     mifare,

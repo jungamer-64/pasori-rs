@@ -10,7 +10,6 @@ mod type4;
 
 pub use message::{Message, MessageError, MessageErrorKind, Record, RecordType};
 pub use type1::{Type1Error, Type1WriteError};
-pub use type2::{Type2Error, Type2WriteError};
 pub use type3::{TYPE3_POLLING, Type3Tag};
 pub use type4::{read_type4, write_type4};
 
@@ -44,8 +43,9 @@ pub enum Error<E> {
     Status(u16),
     /// A Type 2 tag returned a negative acknowledgement nibble.
     Type2Nak(u8),
-    /// A Type 2 command returned an unexpected successful reader status.
-    Type2ReaderStatus(u8),
+    /// The tag sent no reply to a command that requires one. The command
+    /// may have taken effect.
+    NoResponse,
     /// The first NDEF TLV must exist before it can be replaced.
     MissingMessageTlv,
 }
@@ -66,9 +66,7 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
             Self::Address(address) => write!(f, "address {address} is outside the tag"),
             Self::Status(status) => write!(f, "card returned status word {status:04X}"),
             Self::Type2Nak(nak) => write!(f, "Type 2 tag returned NAK {nak:X}"),
-            Self::Type2ReaderStatus(status) => {
-                write!(f, "unexpected Type 2 reader status {status:02X}")
-            }
+            Self::NoResponse => f.write_str("tag sent no reply; the command may have taken effect"),
             Self::MissingMessageTlv => f.write_str("tag has no NDEF message TLV"),
         }
     }

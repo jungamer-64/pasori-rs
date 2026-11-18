@@ -12,9 +12,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod felica;
-mod iso14443;
 pub mod mifare;
-pub mod nfca;
 pub mod nfcb;
 pub mod reader;
 pub mod transport;

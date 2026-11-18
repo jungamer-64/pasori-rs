@@ -5,6 +5,7 @@ use crate::{
     transport::Transport,
 };
 use core::{fmt, ops::RangeInclusive};
+use iso14443::nfca::Selection as _;
 
 /// Key slot to use for Classic sector authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,6 +7,7 @@ description = "RC-S956 host framing, transactions, firmware RF control, and chip
 
 [dependencies]
 felica-packet = { path = "../felica-packet", version = "0.1" }
+iso14443 = { path = "../iso14443", version = "0.1" }
 
 [dev-dependencies]
 reader-script = { path = "../script" }

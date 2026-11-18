@@ -2,22 +2,13 @@ use super::{Error, UpdateStage, WriteError, control_range};
 use crate::type2::Type2Tag;
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
-use rcs956::{
-    reader::{self, TargetExchangeError},
-    transport::Transport,
-};
+use iso14443::nfca;
 
-/// Failure while replacing a Type 2 message over NFC-A.
-pub type Type2WriteError<E> = WriteError<TargetExchangeError<E>>;
-
-/// Failure while retrieving a Type 2 message over NFC-A.
-pub type Type2Error<E> = Error<TargetExchangeError<E>>;
-
-impl<T: Transport> Type2Tag<'_, T> {
+impl<C: nfca::Selection> Type2Tag<C> {
     /// Read the NDEF message across the tag's Type 2 memory sectors.
     /// Reserved bytes and dynamic lock bytes are skipped. An empty mapped
     /// message is returned as an empty vector. No write is performed.
-    pub fn read_ndef(&mut self) -> Result<Option<Vec<u8>>, Type2Error<T::Error>> {
+    pub fn read_ndef(&mut self) -> Result<Option<Vec<u8>>, Error<C::Error>> {
         let mut tag = Type2Data::open(self)?;
         if !tag.find_message()? {
             return Ok(None);
@@ -33,7 +24,7 @@ impl<T: Transport> Type2Tag<'_, T> {
     /// mapping. The Terminator
     /// after the new message supersedes any TLVs that followed the old message.
     /// An empty slice clears the message.
-    pub fn write_ndef(&mut self, message: &[u8]) -> Result<(), Type2WriteError<T::Error>> {
+    pub fn write_ndef(&mut self, message: &[u8]) -> Result<(), WriteError<C::Error>> {
         let mut tag = Type2Data::open(self).map_err(WriteError::Preparation)?;
         let write = tag
             .prepare_write(message)
@@ -51,8 +42,8 @@ impl<T: Transport> Type2Tag<'_, T> {
     }
 }
 
-struct Type2Data<'card, 'reader, T: Transport> {
-    card: &'card mut Type2Tag<'reader, T>,
+struct Type2Data<'card, C: nfca::Selection> {
+    card: &'card mut Type2Tag<C>,
     cached_start: usize,
     cache: [u8; 16],
     /// Next address to map; excluded ranges are skipped when it is consumed.
@@ -96,8 +87,8 @@ struct Type2Write {
     published: [u8; 4],
 }
 
-impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
-    fn open(card: &'card mut Type2Tag<'reader, T>) -> Result<Self, Type2Error<T::Error>> {
+impl<'card, C: nfca::Selection> Type2Data<'card, C> {
+    fn open(card: &'card mut Type2Tag<C>) -> Result<Self, Error<C::Error>> {
         if card.card.observation().sel_res() != 0 {
             return Err(Error::UnsupportedMapping);
         }
@@ -120,7 +111,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         })
     }
 
-    fn find_message(&mut self) -> Result<bool, Type2Error<T::Error>> {
+    fn find_message(&mut self) -> Result<bool, Error<C::Error>> {
         while self.remaining() != 0 {
             let tag = self.byte()?;
             match tag {
@@ -144,7 +135,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         Ok(false)
     }
 
-    fn exclude(&mut self, tag: u8) -> Result<(), Type2Error<T::Error>> {
+    fn exclude(&mut self, tag: u8) -> Result<(), Error<C::Error>> {
         let reserved = control_range(tag, [self.byte()?, self.byte()?, self.byte()?])?;
         if reserved.start < self.address
             || self
@@ -158,7 +149,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         Ok(())
     }
 
-    fn tlv_length(&mut self) -> Result<usize, Type2Error<T::Error>> {
+    fn tlv_length(&mut self) -> Result<usize, Error<C::Error>> {
         let length = match self.byte()? {
             0xff => {
                 let length = usize::from(u16::from_be_bytes([self.byte()?, self.byte()?]));
@@ -175,7 +166,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         Ok(length)
     }
 
-    fn next_address(&mut self) -> Result<usize, Type2Error<T::Error>> {
+    fn next_address(&mut self) -> Result<usize, Error<C::Error>> {
         while let Some(range) = self
             .excluded
             .iter()
@@ -209,7 +200,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         self.end - start - excluded
     }
 
-    fn window(&mut self, address: usize) -> Result<&[u8; 16], Type2Error<T::Error>> {
+    fn window(&mut self, address: usize) -> Result<&[u8; 16], Error<C::Error>> {
         let start = address / 16 * 16;
         if self.cached_start != start {
             self.cache = type2_read_window(self.card, Type2Page::containing(start)?)?;
@@ -218,12 +209,12 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         Ok(&self.cache)
     }
 
-    fn byte(&mut self) -> Result<u8, Type2Error<T::Error>> {
+    fn byte(&mut self) -> Result<u8, Error<C::Error>> {
         let address = self.next_address()?;
         Ok(self.window(address)?[address % 16])
     }
 
-    fn prepare_write(&mut self, message: &[u8]) -> Result<Type2Write, Type2Error<T::Error>> {
+    fn prepare_write(&mut self, message: &[u8]) -> Result<Type2Write, Error<C::Error>> {
         if !self.writable {
             return Err(Error::WriteAccess);
         }
@@ -291,7 +282,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         pages: &mut BTreeMap<Type2Page, PagePatch>,
         value: u8,
         message_bytes: usize,
-    ) -> Result<(), Type2Error<T::Error>> {
+    ) -> Result<(), Error<C::Error>> {
         let address = self.next_address()?;
         let page = Type2Page::containing(address)?;
         use alloc::collections::btree_map::Entry;
@@ -307,14 +298,14 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         Ok(())
     }
 
-    fn page(&mut self, page: Type2Page) -> Result<[u8; 4], Type2Error<T::Error>> {
+    fn page(&mut self, page: Type2Page) -> Result<[u8; 4], Error<C::Error>> {
         let offset = page.offset();
         let start = offset % 16;
         let window = self.window(offset)?;
         Ok(core::array::from_fn(|index| window[start + index]))
     }
 
-    fn write_page(&mut self, page: Type2Page, data: [u8; 4]) -> Result<(), Type2Error<T::Error>> {
+    fn write_page(&mut self, page: Type2Page, data: [u8; 4]) -> Result<(), Error<C::Error>> {
         let [a, b, c, d] = data;
         let (sector, address) = page.wire_address();
         select_sector(self.card, sector)?;
@@ -334,10 +325,10 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
     }
 }
 
-fn type2_read_window<T: Transport>(
-    card: &mut Type2Tag<'_, T>,
+fn type2_read_window<C: nfca::Selection>(
+    card: &mut Type2Tag<C>,
     page: Type2Page,
-) -> Result<[u8; 16], Type2Error<T::Error>> {
+) -> Result<[u8; 16], Error<C::Error>> {
     let (sector, address) = page.wire_address();
     select_sector(card, sector)?;
     type2_exchange(card, &[0x30, address])?
@@ -345,10 +336,10 @@ fn type2_read_window<T: Transport>(
         .map_err(|_| Error::Layout("Type 2 READ length"))
 }
 
-fn select_sector<T: Transport>(
-    card: &mut Type2Tag<'_, T>,
+fn select_sector<C: nfca::Selection>(
+    card: &mut Type2Tag<C>,
     sector: u8,
-) -> Result<(), Type2Error<T::Error>> {
+) -> Result<(), Error<C::Error>> {
     if card.sector == Some(sector) {
         return Ok(());
     }
@@ -364,15 +355,14 @@ fn select_sector<T: Transport>(
             [nak @ (0 | 1 | 4 | 5)] => return Err(Error::Type2Nak(*nak)),
             _ => return Err(Error::Layout("Type 2 SECTOR SELECT first response")),
         }
-        // The second packet succeeds with a passive ACK. Only a reader RF
-        // timeout demonstrates silence; a lost USB response leaves it unknown.
+        // The second packet succeeds with a passive ACK. Only the reader's
+        // report of silence demonstrates it; a failed exchange leaves it unknown.
         match card.card.exchange(&[sector, 0, 0, 0]) {
-            Err(TargetExchangeError::Exchange(reader::Error::RfStatus(1))) => Ok(()),
-            Ok(reply) if reply.status == 0 => match reply.data.as_slice() {
+            Ok(nfca::Reply::Silence) => Ok(()),
+            Ok(nfca::Reply::Data(data)) => match data.as_slice() {
                 [nak @ (0 | 1 | 4 | 5)] => Err(Error::Type2Nak(*nak)),
                 _ => Err(Error::Layout("Type 2 SECTOR SELECT second response")),
             },
-            Ok(reply) => Err(Error::Type2ReaderStatus(reply.status)),
             Err(error) => Err(Error::Exchange(error)),
         }
     })();
@@ -382,13 +372,12 @@ fn select_sector<T: Transport>(
     selected
 }
 
-fn type2_exchange<T: Transport>(
-    card: &mut Type2Tag<'_, T>,
+fn type2_exchange<C: nfca::Selection>(
+    card: &mut Type2Tag<C>,
     command: &[u8],
-) -> Result<Vec<u8>, Type2Error<T::Error>> {
-    let response = card.card.exchange(command).map_err(Error::Exchange)?;
-    if response.status != 0 {
-        return Err(Error::Type2ReaderStatus(response.status));
+) -> Result<Vec<u8>, Error<C::Error>> {
+    match card.card.exchange(command).map_err(Error::Exchange)? {
+        nfca::Reply::Data(data) => Ok(data),
+        nfca::Reply::Silence => Err(Error::NoResponse),
     }
-    Ok(response.data)
 }

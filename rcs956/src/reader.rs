@@ -17,12 +17,13 @@ pub use type1::Type1Target;
 
 use crate::{
     felica::BitRate,
-    iso14443, nfca, nfcb,
+    nfcb,
     transport::{Failure, Link, Progress, TransactionError, Transport},
 };
 use alloc::{string::String, vec, vec::Vec};
 use core::{error, fmt, mem, time::Duration};
 use felica_packet::{PacketError, PollRequest, PollResponse, Selection};
+use iso14443::{iso_dep, nfca};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
@@ -68,7 +69,7 @@ pub enum Error<E> {
     /// NFC-A activation data failed validation.
     TypeA(nfca::Error),
     /// NFC-B activation data failed validation.
-    TypeB(nfcb::Error),
+    TypeB(iso14443::nfcb::Error),
     /// Target activation reported a mode other than the one the command set up.
     TargetMode(u8),
     /// Payload exceeds the selected reader command's supported limit.
@@ -825,7 +826,7 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
-                let observation = match nfca::Observation::parse(data) {
+                let observation = match type_a_record(data) {
                     Ok(observation) => observation,
                     Err(error) => {
                         self.require_field_cycle();
@@ -860,25 +861,26 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
-                let observation = match nfcb::Observation::parse(data) {
+                let observation = match type_b_record(data) {
                     Ok(observation) => observation,
                     Err(error) => {
                         self.require_field_cycle();
-                        return Err(Error::TypeB(error));
+                        return Err(error);
                     }
                 };
                 self.apply_type_b_receiver()?;
-                let iso_dep = observation.supports_iso_dep();
+                let parameters = observation.iso_dep();
                 let target = TypeBTarget {
                     reader: self,
                     number: *target,
                     observation,
                     profile: options.profile,
                 };
-                Ok(Some(if iso_dep {
-                    TypeBSelection::IsoDep(TypeBBlockCard { target })
-                } else {
-                    TypeBSelection::Frame(TypeBFrameCard { target, timeout })
+                Ok(Some(match parameters {
+                    Some(parameters) => {
+                        TypeBSelection::IsoDep(TypeBBlockCard { target, parameters })
+                    }
+                    None => TypeBSelection::Frame(TypeBFrameCard { target, timeout }),
                 }))
             }
             _ => {
@@ -1128,7 +1130,12 @@ impl<E: error::Error + 'static> error::Error for TargetExchangeError<E> {
 /// The selection's activation assumptions hold while the card keeps the
 /// state that activation established. A command that leaves state which the
 /// next selection request does not clear must be declared with
-/// [`Self::require_field_cycle`] before it is sent.
+/// [`nfca::Selection::require_field_cycle`] before it is sent.
+///
+/// [`nfca::Selection::exchange`] is [`Self::exchange`] with the reader status
+/// interpreted: status 0 yields the reply bytes, the RF timeout status yields
+/// [`nfca::Reply::Silence`], and any other status is returned as
+/// [`Error::RfStatus`].
 #[derive(Debug)]
 pub struct TypeACard<'a, T: Transport> {
     reader: &'a mut Reader<T>,
@@ -1137,10 +1144,6 @@ pub struct TypeACard<'a, T: Transport> {
     timeout: RfTimeout,
 }
 impl<'a, T: Transport> TypeACard<'a, T> {
-    /// Validated activation data for this selection.
-    pub fn observation(&self) -> &nfca::Observation {
-        &self.observation
-    }
     /// Target identifier returned by the reader.
     pub fn target(&self) -> u8 {
         self.target
@@ -1159,11 +1162,6 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     /// the ATS frame waiting time.
     pub fn set_exchange_timeout(&mut self, timeout: RfTimeout) {
         self.timeout = timeout;
-    }
-    /// Make the next selection cycle the RF field before its request, because
-    /// the card now holds state that a selection request does not clear.
-    pub fn require_field_cycle(&mut self) {
-        self.reader.require_field_cycle();
     }
     /// Consume the typed selection and allow caller-defined card commands
     /// whose responses can span several reader fragments.
@@ -1261,6 +1259,30 @@ impl<'a, T: Transport> TypeACard<'a, T> {
             });
         }
         Ok(output)
+    }
+}
+
+impl<T: Transport> nfca::Selection for TypeACard<'_, T> {
+    type Error = TargetExchangeError<T::Error>;
+
+    /// Validated activation data for this selection.
+    fn observation(&self) -> &nfca::Observation {
+        &self.observation
+    }
+
+    fn exchange(&mut self, command: &[u8]) -> Result<nfca::Reply, Self::Error> {
+        match TypeACard::exchange(self, command) {
+            Ok(reply) if reply.status == 0 => Ok(nfca::Reply::Data(reply.data)),
+            Ok(reply) => Err(TargetExchangeError::Exchange(Error::RfStatus(reply.status))),
+            Err(TargetExchangeError::Exchange(Error::RfStatus(RF_TIMEOUT))) => {
+                Ok(nfca::Reply::Silence)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn require_field_cycle(&mut self) {
+        self.reader.require_field_cycle();
     }
 }
 
@@ -1450,29 +1472,43 @@ impl<T: Transport> RawTypeACard<'_, T> {
 
 /// NFC-B selection whose ATQB advertises ISO-DEP. The host runs the block
 /// protocol; the reader transfers each block and owns its CRC.
+///
+/// [`iso_dep::Selection::blocks`] applies the reader timing that every block
+/// transfer runs under: `32/02` selector 0x10 (a 3280 ms response step) and
+/// its `1C` timer. Each block keeps its own `A0` wait. Setup failure sends no
+/// block and leaves the reader requiring initialization.
 #[derive(Debug)]
 pub struct TypeBBlockCard<'a, T: Transport> {
     target: TypeBTarget<'a, T>,
+    parameters: iso_dep::Parameters,
 }
 impl<T: Transport> TypeBBlockCard<'_, T> {
     /// Validated activation data, including ATQB and negotiated CID.
-    pub fn observation(&self) -> &nfcb::Observation {
+    pub fn observation(&self) -> &iso14443::nfcb::Observation {
         &self.target.observation
     }
     /// Target identifier returned by the reader.
     pub fn target(&self) -> u8 {
         self.target.number
     }
-    /// Make the next selection cycle the RF field before its request, because
-    /// the card now holds state that a selection request does not clear.
-    pub fn require_field_cycle(&mut self) {
-        self.target.reader.require_field_cycle();
+}
+
+impl<T: Transport> iso_dep::Selection for TypeBBlockCard<'_, T> {
+    type Error = Error<T::Error>;
+    type Blocks<'s>
+        = TypeBBlocks<'s, T>
+    where
+        Self: 's;
+
+    fn parameters(&self) -> iso_dep::Parameters {
+        self.parameters
     }
-    /// Apply the reader timing that every block transfer runs under: `32/02`
-    /// selector 0x10 (a 3280 ms response step) and its `1C` timer. Each block
-    /// keeps its own `A0` wait. Failure sends no block and leaves the reader
-    /// requiring initialization.
-    pub fn blocks(&mut self) -> Result<TypeBBlocks<'_, T>, Error<T::Error>> {
+
+    fn maximum_block_bytes(&self) -> usize {
+        MAX_TYPE_B_BLOCK_BYTES
+    }
+
+    fn blocks(&mut self) -> Result<TypeBBlocks<'_, T>, Error<T::Error>> {
         let protocol = RfProtocol::TypeB(self.target.profile);
         self.target
             .reader
@@ -1482,20 +1518,29 @@ impl<T: Transport> TypeBBlockCard<'_, T> {
             protocol,
         })
     }
+
+    /// An RF status for which [`Error::is_rf_timeout`] holds.
+    fn is_rf_timeout(error: &Error<T::Error>) -> bool {
+        error.is_rf_timeout()
+    }
+
+    fn require_field_cycle(&mut self) {
+        self.target.reader.require_field_cycle();
+    }
 }
 
-/// Block transfer authority of an NFC-B ISO-DEP selection after its timing setup.
+/// Block transfer authority of an NFC-B ISO-DEP selection after its timing
+/// setup. A block holds at most [`MAX_TYPE_B_BLOCK_BYTES`] including CRC,
+/// and its wait must be encodable as an [`RfTimeout`].
 #[derive(Debug)]
 pub struct TypeBBlocks<'s, T: Transport> {
     reader: &'s mut Reader<T>,
     protocol: RfProtocol,
 }
-impl<T: Transport> TypeBBlocks<'_, T> {
-    /// Send one block of at most [`MAX_TYPE_B_BLOCK_BYTES`] including CRC,
-    /// without its CRC, and return the card's reply block without CRC. A
-    /// block that receives no answer within `wait` fails with an RF status
-    /// for which [`Error::is_rf_timeout`] holds.
-    pub fn transfer(&mut self, block: &[u8], wait: RfTimeout) -> Result<Vec<u8>, Error<T::Error>> {
+impl<T: Transport> iso_dep::Blocks for TypeBBlocks<'_, T> {
+    type Error = Error<T::Error>;
+
+    fn transfer(&mut self, block: &[u8], wait: Duration) -> Result<Vec<u8>, Error<T::Error>> {
         let maximum = MAX_TYPE_B_BLOCK_BYTES - 2;
         if block.len() > maximum {
             return Err(Error::InputLength {
@@ -1503,7 +1548,8 @@ impl<T: Transport> TypeBBlocks<'_, T> {
                 actual: block.len(),
             });
         }
-        self.reader.exchange_rf(block, wait, self.protocol)
+        self.reader
+            .exchange_rf(block, RfTimeout::new(wait)?, self.protocol)
     }
 }
 
@@ -1518,7 +1564,7 @@ pub enum TypeBSelection<'a, T: Transport> {
 
 impl<'a, T: Transport> TypeBSelection<'a, T> {
     /// Validated ATQB and ATTRIB data common to both selections.
-    pub fn observation(&self) -> &nfcb::Observation {
+    pub fn observation(&self) -> &iso14443::nfcb::Observation {
         &self.target().observation
     }
 
@@ -1539,7 +1585,7 @@ impl<'a, T: Transport> TypeBSelection<'a, T> {
 struct TypeBTarget<'a, T: Transport> {
     reader: &'a mut Reader<T>,
     number: u8,
-    observation: nfcb::Observation,
+    observation: iso14443::nfcb::Observation,
     profile: nfcb::RfProfile,
 }
 
@@ -1568,6 +1614,56 @@ impl<T: Transport> TypeBFrameCard<'_, T> {
             .reader
             .exchange_single_response(protocol, self.target.number, data, timeout)
     }
+}
+
+/// Largest ATS that the reader's NFC-A activation reports.
+const MAX_ATS_BYTES: usize = 62;
+
+/// Parse an NFC-A `4A` target record after its target number: SENS_RES,
+/// SEL_RES, the UID length, the UID and an optional ATS.
+fn type_a_record(data: &[u8]) -> Result<nfca::Observation, nfca::Error> {
+    let [sens_high, sens_low, sel_res, uid_length, rest @ ..] = data else {
+        return Err(nfca::Error::Truncated {
+            field: "NFC-A selection header",
+            minimum: 4,
+            actual: data.len(),
+        });
+    };
+    let uid_length = usize::from(*uid_length);
+    if !matches!(uid_length, 4 | 7 | 10) {
+        return Err(nfca::Error::UidLength(uid_length));
+    }
+    let (uid, ats) = rest
+        .split_at_checked(uid_length)
+        .ok_or(nfca::Error::Truncated {
+            field: "NFC-A UID",
+            minimum: 4 + uid_length,
+            actual: data.len(),
+        })?;
+    let ats = match ats {
+        [] => None,
+        [declared, ..] if ats.len() > MAX_ATS_BYTES => {
+            return Err(nfca::Error::AtsLength {
+                declared: usize::from(*declared),
+                actual: ats.len(),
+            });
+        }
+        ats => Some(nfca::Ats::parse(ats)?),
+    };
+    nfca::Observation::new([*sens_high, *sens_low], *sel_res, uid, ats)
+}
+
+/// Parse an NFC-B `4A` target record after its target number: the 12-byte
+/// ATQB, the ATTRIB response length and the complete ATTRIB response.
+fn type_b_record<E>(data: &[u8]) -> Result<iso14443::nfcb::Observation, Error<E>> {
+    let Some((atqb, [declared, attrib @ ..])) = data.split_first_chunk::<12>() else {
+        return Err(Error::Response("NFC-B target record length"));
+    };
+    let atqb = iso14443::nfcb::Atqb::new(*atqb).map_err(Error::TypeB)?;
+    if usize::from(*declared) != attrib.len() {
+        return Err(Error::Response("NFC-B ATTRIB response length"));
+    }
+    iso14443::nfcb::Observation::new(atqb, attrib).map_err(Error::TypeB)
 }
 
 /// Reject an empty or oversized card command before any reader setup.
@@ -1632,6 +1728,62 @@ impl<T: Transport> Selection for FelicaCard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn type_a_records_carry_uid_and_optional_ats() -> Result<(), nfca::Error> {
+        let observation = type_a_record(&[
+            0x04, 0x07, 0x28, 4, 0x00, 0xd4, 0x1e, 0x92, 6, 0x75, 0x80, 0x60, 2, 0x42,
+        ])?;
+        assert_eq!(observation.sens_res(), [4, 7]);
+        assert_eq!(observation.uid(), [0, 0xd4, 0x1e, 0x92]);
+        assert_eq!(observation.ats().map(nfca::Ats::fwi), Some(6));
+        assert!(
+            type_a_record(&[0, 0x44, 0, 7, 1, 2, 3, 4, 5, 6, 7])?
+                .ats()
+                .is_none()
+        );
+        assert!(matches!(
+            type_a_record(&[0, 4, 0, 5]),
+            Err(nfca::Error::UidLength(5))
+        ));
+        assert!(matches!(
+            type_a_record(&[0, 4, 0, 10, 1]),
+            Err(nfca::Error::Truncated { .. })
+        ));
+        let mut oversized = vec![0, 4, 0, 4, 1, 2, 3, 4, 63];
+        oversized.resize(9 + 62, 0);
+        assert!(matches!(
+            type_a_record(&oversized),
+            Err(nfca::Error::AtsLength {
+                declared: 63,
+                actual: 63
+            })
+        ));
+        Ok(())
+    }
+    #[test]
+    fn type_b_records_match_their_attrib_length() {
+        let record = [
+            0x50, 1, 2, 3, 4, 0x11, 0x22, 0x33, 0x44, 0, 0x51, 0x41, 1, 1,
+        ];
+        assert!(
+            type_b_record::<()>(&record)
+                .is_ok_and(|observation| observation.atqb().pupi() == [1, 2, 3, 4])
+        );
+        assert!(matches!(
+            type_b_record::<()>(&record[..13]),
+            Err(Error::Response(_))
+        ));
+        assert!(matches!(
+            type_b_record::<()>(&record[..12]),
+            Err(Error::Response(_))
+        ));
+        let mut empty = record;
+        empty[12] = 0;
+        assert!(matches!(
+            type_b_record::<()>(&empty[..13]),
+            Err(Error::TypeB(iso14443::nfcb::Error::MissingAttrib))
+        ));
+    }
     #[test]
     fn timeout_uses_ceil_and_rejects_overflow() {
         assert!(RfTimeout::new(Duration::ZERO).is_err());

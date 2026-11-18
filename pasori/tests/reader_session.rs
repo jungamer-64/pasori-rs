@@ -9,7 +9,7 @@ use pasori::{
         Reason, TransferCause,
     },
     felica::{self, BlockWrite, Card, CardError, ServiceEntry},
-    isodep::{self, TypeBCard},
+    isodep::{self, IsoDepCard},
     ndef::{self, Type3Tag},
     type1::Type1Tag,
     type2::{Type2EmulationError, Type2Event, Type2Tag, Type2Target},
@@ -18,7 +18,8 @@ use rcs956::{
     felica::BitRate,
     nfcb::PollOptions,
     reader::{
-        Error as ReaderError, FelicaCard, Reader, RfTimeout, TargetExchangeError, TypeBSelection,
+        Error as ReaderError, FelicaCard, Reader, RfTimeout, TargetExchangeError, TypeBBlockCard,
+        TypeBSelection,
     },
     transport::{Progress, TransactionError},
 };
@@ -838,9 +839,9 @@ fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error
 
 fn poll_iso_dep(
     reader: &mut Reader<Script>,
-) -> Result<Option<TypeBCard<'_, Script>>, Box<dyn Error>> {
+) -> Result<Option<IsoDepCard<TypeBBlockCard<'_, Script>>>, Box<dyn Error>> {
     match reader.poll_type_b(PollOptions::default(), timeout()?)? {
-        Some(TypeBSelection::IsoDep(card)) => Ok(Some(TypeBCard::new(card, None)?)),
+        Some(TypeBSelection::IsoDep(card)) => Ok(Some(IsoDepCard::new(card, None)?)),
         Some(TypeBSelection::Frame(_)) => Err("expected an ISO-DEP selection".into()),
         None => Ok(None),
     }
@@ -878,7 +879,7 @@ fn type_b_nad_and_timeout_recovery_use_only_the_current_rf_block() -> Result<(),
     else {
         return Err("expected ISO-DEP activation".into());
     };
-    let mut card = TypeBCard::new(card, node_address)?;
+    let mut card = IsoDepCard::new(card, node_address)?;
     assert_eq!(card.exchange_apdu(&[0xa4])?, [0xab, 0x90, 0]);
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -931,7 +932,7 @@ fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn 
     let mut reader = Reader::new(script);
     reader.initialize()?;
     let mut card = poll_iso_dep(&mut reader)?.ok_or("expected NFC-B card")?;
-    assert_eq!(card.selection().observation().pupi(), [1, 2, 3, 4]);
+    assert_eq!(card.selection().observation().atqb().pupi(), [1, 2, 3, 4]);
     assert_eq!(card.selection().target(), 9);
     let before = journal.borrow().requests.len();
     for input in [Vec::new(), vec![0; 65536]] {
@@ -983,7 +984,7 @@ fn rejected_activation_cycles_the_field_before_the_next_selection() -> Result<()
         return Err("expected ISO-DEP activation".into());
     };
     assert!(matches!(
-        TypeBCard::new(card, Some(isodep::NodeAddress::from_byte(0x12)?)),
+        IsoDepCard::new(card, Some(isodep::NodeAddress::from_byte(0x12)?)),
         Err(isodep::ParameterError::NadUnsupported)
     ));
     assert!(

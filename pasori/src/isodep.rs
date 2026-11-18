@@ -1,17 +1,17 @@
 //! Bounded ISO-DEP block exchange.
 //!
-//! The host runs the block protocol for NFC-B; the reader transfers each
-//! block and owns its CRC. The block engine owns sequencing, CID, chaining
-//! and WTX; the transfer channel owns each synchronous RF transfer and
-//! classifies RF timeouts. RF recovery requests a block within the same APDU
-//! exchange. Between APDUs, an R(NAK) probe confirms that the card is still
-//! in the field. NFC-A ISO-DEP runs in the reader firmware, and
-//! [`ApduExchange`] covers both.
+//! The host runs the block protocol of every [`iso_dep::Selection`]; the
+//! reader transfers each block and owns its CRC. The block engine owns
+//! sequencing, CID, chaining and WTX; the transfer channel owns each
+//! synchronous RF transfer and classifies RF timeouts. RF recovery requests a
+//! block within the same APDU exchange. Between APDUs, an R(NAK) probe
+//! confirms that the card is still in the field. The RC-S956 firmware runs
+//! ISO-DEP for its NFC-A cards itself, and [`ApduExchange`] covers both.
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
+use iso14443::iso_dep;
 use rcs956::{
-    nfcb,
-    reader::{self, MAX_TYPE_B_BLOCK_BYTES, RfTimeout, TypeACard, TypeBBlockCard},
+    reader::{self, TypeACard},
     transport::Transport,
 };
 
@@ -653,7 +653,8 @@ impl PreparedExchange<'_, '_> {
 }
 
 /// APDU exchange with an activated ISO-DEP card, whichever side runs the
-/// block protocol: the reader firmware for NFC-A, this crate for NFC-B.
+/// block protocol: the RC-S956 firmware for its NFC-A cards, this crate for
+/// every [`iso_dep::Selection`].
 pub trait ApduExchange {
     /// Failure of one exchange, with the progress its runner observes.
     type Error;
@@ -678,25 +679,27 @@ impl<T: Transport> ApduExchange for TypeACard<'_, T> {
     }
 }
 
-/// NFC-B ISO-DEP session over one reader selection, with a block-number
-/// state that cannot outlive the selection. Protocol failure poisons the
-/// session; it never replays APDUs.
+/// ISO-DEP session over one reader selection, with a block-number state that
+/// cannot outlive the selection. Protocol failure poisons the session; it
+/// never replays APDUs.
 #[derive(Debug)]
-pub struct TypeBCard<'a, T: Transport> {
-    card: TypeBBlockCard<'a, T>,
+pub struct IsoDepCard<S: iso_dep::Selection> {
+    card: S,
     session: Session,
 }
 
-impl<'a, T: Transport> TypeBCard<'a, T> {
-    /// Establish the block protocol from the selection's ATQB and ATTRIB
-    /// response, optionally addressing `node_address`. Parameters this
+impl<S: iso_dep::Selection> IsoDepCard<S> {
+    /// Establish the block protocol from the selection's activation
+    /// parameters, optionally addressing `node_address`. Parameters this
     /// profile cannot run end the selection: the next selection cycles the
     /// RF field.
-    pub fn new(
-        mut card: TypeBBlockCard<'a, T>,
-        node_address: Option<NodeAddress>,
-    ) -> Result<Self, ParameterError> {
-        match session(card.observation(), node_address) {
+    ///
+    /// # Errors
+    ///
+    /// Rejects a node address the card does not advertise, a CID outside
+    /// 1..=14, and a frame waiting time beyond FWI 14.
+    pub fn new(mut card: S, node_address: Option<NodeAddress>) -> Result<Self, ParameterError> {
+        match session(&card, node_address) {
             Ok(session) => Ok(Self { card, session }),
             Err(error) => {
                 card.require_field_cycle();
@@ -706,12 +709,12 @@ impl<'a, T: Transport> TypeBCard<'a, T> {
     }
 
     /// The reader selection, including its validated activation data.
-    pub fn selection(&self) -> &TypeBBlockCard<'a, T> {
+    pub fn selection(&self) -> &S {
         &self.card
     }
 
     /// Largest APDU this session admits: the local limit, the card buffer
-    /// advertised by MBLI, and the frame budget, whichever is smallest.
+    /// advertised by the activation, and the frame budget, whichever is smallest.
     pub fn maximum_apdu_bytes(&self) -> usize {
         self.session.maximum_apdu_bytes()
     }
@@ -720,68 +723,66 @@ impl<'a, T: Transport> TypeBCard<'a, T> {
     /// Errors distinguish reader setup (zero application progress) from RF
     /// transfer attempts. Each block uses its own FWI/WTX wait. Application
     /// APDUs are never retried.
-    pub fn exchange_apdu(
-        &mut self,
-        apdu: &[u8],
-    ) -> Result<Vec<u8>, Error<reader::Error<T::Error>>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure with its progress and partial response.
+    pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
         let exchange = self.session.prepare(apdu)?;
-        exchange.exchange(self.card.blocks(), is_rf_timeout, transfer)
+        exchange.exchange(self.card.blocks(), S::is_rf_timeout, transfer)
     }
 
     /// Confirm that the card still answers between APDUs, using the same
     /// reader setup as [`Self::exchange_apdu`]. The probe carries no
     /// application data and leaves block numbering unchanged. Any failure,
     /// including an absent card, invalidates the session.
-    pub fn check_presence(&mut self) -> Result<(), PresenceError<reader::Error<T::Error>>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns why the card was not confirmed.
+    pub fn check_presence(&mut self) -> Result<(), PresenceError<S::Error>> {
         let check = self.session.admit_presence_check()?;
-        check.run(self.card.blocks(), is_rf_timeout, transfer)
+        check.run(self.card.blocks(), S::is_rf_timeout, transfer)
     }
 }
 
-impl<T: Transport> ApduExchange for TypeBCard<'_, T> {
-    type Error = Error<reader::Error<T::Error>>;
+impl<S: iso_dep::Selection> ApduExchange for IsoDepCard<S> {
+    type Error = Error<S::Error>;
 
     fn maximum_apdu_bytes(&self) -> usize {
-        TypeBCard::maximum_apdu_bytes(self)
+        IsoDepCard::maximum_apdu_bytes(self)
     }
 
     fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        TypeBCard::exchange_apdu(self, apdu)
+        IsoDepCard::exchange_apdu(self, apdu)
     }
 }
 
 /// Validate the activation parameters and the session they grant.
-fn session(
-    observation: &nfcb::Observation,
+fn session<S: iso_dep::Selection>(
+    card: &S,
     node_address: Option<NodeAddress>,
 ) -> Result<Session, ParameterError> {
-    if node_address.is_some() && !observation.nad_supported() {
+    let parameters = card.parameters();
+    if node_address.is_some() && !parameters.nad_supported() {
         return Err(ParameterError::NadUnsupported);
     }
-    let cid = match observation.cid() {
-        0 => None,
-        cid => Some(cid),
-    };
     Session::new(
-        observation.frame_size(),
-        MAX_TYPE_B_BLOCK_BYTES,
-        cid,
-        block_frame_wait(observation.fwi()),
-        observation.maximum_command_bytes(),
+        parameters.frame_size(),
+        card.maximum_block_bytes(),
+        parameters.cid(),
+        block_frame_wait(parameters.fwi()),
+        parameters.maximum_command_bytes(),
         node_address,
     )
 }
 
-fn is_rf_timeout<E>(error: &reader::Error<E>) -> bool {
-    error.is_rf_timeout()
-}
-
-fn transfer<T: Transport>(
-    blocks: &mut reader::TypeBBlocks<'_, T>,
+fn transfer<B: iso_dep::Blocks>(
+    blocks: &mut B,
     block: &[u8],
     wait: Duration,
-) -> Result<Vec<u8>, reader::Error<T::Error>> {
-    blocks.transfer(block, RfTimeout::new(wait)?)
+) -> Result<Vec<u8>, B::Error> {
+    blocks.transfer(block, wait)
 }
 
 #[cfg(test)]
