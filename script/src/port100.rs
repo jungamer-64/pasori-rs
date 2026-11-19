@@ -38,7 +38,8 @@ pub fn command(command: u8, args: &[u8], data: &[u8]) -> Step {
 
 /// An InCommRF step that sends `packet` with a wait of `units` × 100 µs and
 /// answers with `status` and the `received` card bytes, whose last byte is
-/// complete.
+/// complete. Without card bytes the reply holds the status only, as a
+/// Port-100 reader answers.
 pub fn in_comm_rf(units: u16, packet: &[u8], status: u32, received: &[u8]) -> Step {
     let last_bits = if received.is_empty() { 0 } else { 8 };
     in_comm_rf_bits(units, packet, status, last_bits, received)
@@ -55,8 +56,10 @@ pub fn in_comm_rf_bits(
     let mut args = units.to_le_bytes().to_vec();
     args.extend_from_slice(packet);
     let mut data = status.to_le_bytes().to_vec();
-    data.push(last_bits);
-    data.extend_from_slice(received);
+    if !received.is_empty() {
+        data.push(last_bits);
+        data.extend_from_slice(received);
+    }
     Step {
         command: 0x04,
         args,

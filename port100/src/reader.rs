@@ -438,17 +438,19 @@ impl<T: Transport> Reader<T> {
         args.extend_from_slice(&wait.0.to_le_bytes());
         args.extend_from_slice(frame);
         let response = self.command(0x04, &args, wait.host_wait())?;
-        let Some((&[s0, s1, s2, s3, last_bits], data)) = response.split_first_chunk::<5>() else {
+        // Byte 5 and the card bytes follow the status only when the reader
+        // received card bytes.
+        let Some((&status, reply)) = response.split_first_chunk::<4>() else {
             return Err(Error::Response("InCommRF length"));
         };
-        match u32::from_le_bytes([s0, s1, s2, s3]) {
-            0 if data.is_empty() => Ok(None),
-            0 => Ok(Some(Received {
+        match (u32::from_le_bytes(status), reply) {
+            (0, [] | [_]) => Ok(None),
+            (0, [last_bits, data @ ..]) => Ok(Some(Received {
                 data: data.to_vec(),
-                last_bits,
+                last_bits: *last_bits,
             })),
-            RECEIVE_TIMEOUT => Ok(None),
-            status => {
+            (RECEIVE_TIMEOUT, _) => Ok(None),
+            (status, _) => {
                 self.require_field_cycle();
                 Err(Error::RfStatus(status))
             }
