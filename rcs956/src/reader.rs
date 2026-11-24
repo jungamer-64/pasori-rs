@@ -37,6 +37,9 @@ const RF_TIMEOUT: u8 = 0x01;
 const MAX_TYPE_A_RESPONSE_FRAGMENTS: usize = 256;
 /// `40` reader status bit announcing a further response fragment.
 const TARGET_MORE_INFORMATION: u8 = 0x40;
+/// Low six bits of the `40` status with which the reader abandoned an NFC-A
+/// ISO-DEP response too long to assemble.
+const READER_RESPONSE_OVERFLOW: u8 = 0x0e;
 
 /// Failures of reader initialization, RF configuration, or card exchange.
 #[derive(Debug)]
@@ -1197,6 +1200,8 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     /// accumulated response and requires reader initialization before another
     /// command can be sent. Each fragment may take four ATS frame waiting
     /// times plus about 9.9 s for WTX before the host abandons it as a deadline.
+    /// A card response longer than the reader assembles fails as
+    /// [`ApduCause::ReaderResponseLimit`].
     pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, ApduError<T::Error>> {
         const MAX_RESPONSE_BYTES: usize = 65_536;
         let mut progress = ApduProgress::default();
@@ -1224,7 +1229,7 @@ impl<'a, T: Transport> TypeACard<'a, T> {
             let mut response = self
                 .reader
                 .exchange_target(self.target, apdu, wait)
-                .map_err(ApduCause::Exchange)?;
+                .map_err(ApduCause::from_exchange)?;
             progress.delivered = true;
             loop {
                 if response.status & 0x80 != 0 {
@@ -1245,12 +1250,16 @@ impl<'a, T: Transport> TypeACard<'a, T> {
                 response = self
                     .reader
                     .exchange_target(self.target, &[], wait)
-                    .map_err(ApduCause::Exchange)?;
+                    .map_err(ApduCause::from_exchange)?;
             }
         })();
         if let Err(cause) = result {
             if progress.fragments != 0 {
                 self.reader.state = State::NeedsInitialization;
+            }
+            if matches!(cause, ApduCause::ReaderResponseLimit) {
+                // The reader only overflows while assembling a card response.
+                progress.delivered = true;
             }
             return Err(ApduError {
                 cause,
@@ -1306,6 +1315,14 @@ pub enum ApduCause<E> {
     /// The transaction carrying the APDU or a continuation failed; the APDU
     /// may have taken effect.
     Exchange(Error<E>),
+    /// The card's chained response outgrew what the reader assembles for one
+    /// `40` reply, and the reader ended the exchange with RF status `0E`
+    /// instead of returning a continuation fragment. The card received the
+    /// APDU, so it may have taken effect; the response is lost from the point
+    /// of overflow. On RC-S370/P (firmware `33 01 30 07`) responses of up to
+    /// 260 bytes, status word included, arrived whole and longer ones failed
+    /// this way before any of their bytes reached the host.
+    ReaderResponseLimit,
     /// A response fragment announced a node address, which this selection
     /// never requests.
     NodeAddress,
@@ -1315,13 +1332,25 @@ pub enum ApduCause<E> {
     Fragments,
 }
 
+impl<E> ApduCause<E> {
+    fn from_exchange(error: Error<E>) -> Self {
+        match error {
+            Error::RfStatus(status) if status & 0x3f == READER_RESPONSE_OVERFLOW => {
+                Self::ReaderResponseLimit
+            }
+            error => Self::Exchange(error),
+        }
+    }
+}
+
 /// Progress of one APDU through the reader's NFC-A ISO-DEP.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApduProgress {
     /// `40` transactions attempted, including unsuccessful ones. A nonzero
     /// count means the APDU was handed to the reader.
     pub fragments: usize,
-    /// The first response fragment arrived, so the card received the APDU.
+    /// The card received the APDU: a response fragment arrived, or the reader
+    /// reported [`ApduCause::ReaderResponseLimit`].
     pub delivered: bool,
     /// Response bytes accumulated before completion or failure.
     pub received_bytes: usize,
@@ -1353,6 +1382,9 @@ impl<E: fmt::Debug> fmt::Display for ApduError<E> {
             }
             ApduCause::Exchange(_) => f.write_str("reader ISO-DEP exchange failed")?,
             ApduCause::NodeAddress => f.write_str("response fragment announced a node address")?,
+            ApduCause::ReaderResponseLimit => {
+                f.write_str("APDU response exceeds what the reader assembles")?;
+            }
             ApduCause::ResponseBytes => f.write_str("APDU response exceeds its limit")?,
             ApduCause::Fragments => f.write_str("APDU response fragment limit exceeded")?,
         }

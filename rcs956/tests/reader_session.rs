@@ -613,6 +613,42 @@ fn type_a_apdu_continuation_sends_no_second_application_command() -> Result<(), 
 }
 
 #[test]
+fn type_a_apdu_response_overflow_reports_delivery_without_bytes() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        idle_receiver(),
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x1c, &[0x80, 0xe7, 3], &[]),
+        command(0x40, &[7, 0xb0], &[0x0e]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    let error = card
+        .exchange_apdu(&[0xb0])
+        .err()
+        .ok_or("expected response overflow")?;
+    assert!(matches!(error.cause, ApduCause::ReaderResponseLimit));
+    assert!(error.partial_response.is_empty());
+    assert!(error.progress.delivered);
+    assert_eq!(error.progress.fragments, 1);
+    assert_eq!(error.progress.received_bytes, 0);
+    assert!(matches!(
+        card.exchange_apdu(&[0xb0]),
+        Err(ApduError {
+            cause: ApduCause::SessionInvalid,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn mifare_classic_authority_is_limited_to_the_authenticated_sector() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
