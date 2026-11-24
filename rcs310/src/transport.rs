@@ -29,8 +29,11 @@ pub trait Transport: fmt::Debug {
     /// within the backend's timeout policy. Returning zero bytes ends the
     /// transaction with [`Failure::Deadline`].
     fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, Self::Error>;
-    /// Clear transport stalls and cached bytes. This does not cancel a reader
-    /// command or establish whether a prior card operation executed.
+    /// Discard cached input bytes. Do not reset or clear the halt of an
+    /// endpoint that has not stalled: the RC-S320 keeps its data toggle
+    /// across CLEAR_FEATURE(ENDPOINT_HALT), so such a reset can lose the next
+    /// transfer. This does not cancel a reader command or establish whether a
+    /// prior card operation executed.
     fn recover(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -352,7 +355,7 @@ impl<T: Transport> Link<T> {
         }
     }
 
-    /// Clear pipe state and cached input, then admit commands again. This
+    /// Recover the transport, then admit commands again. This
     /// never cancels a reader command or determines whether a preceding card
     /// operation executed.
     ///

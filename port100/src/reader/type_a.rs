@@ -142,8 +142,10 @@ impl<T: Transport> Reader<T> {
 ///
 /// [`nfca::Selection::exchange`] appends CRC to the command and checks the
 /// reply's CRC on the host, so that 4-bit ACK and NAK replies reach the
-/// caller; a 4-bit reply is recognised by the reader reporting four valid
-/// bits in its only byte. It waits as long as the activation steps.
+/// caller. A one-byte reply whose InCommRF response byte 5 is 4 is taken as
+/// a 4-bit reply, reading that byte as the number of valid bits in the last
+/// byte; this reading is inferred, not established. It waits as long as the
+/// activation steps.
 #[derive(Debug)]
 pub struct TypeACard<'a, T: Transport> {
     reader: &'a mut Reader<T>,

@@ -39,7 +39,7 @@ cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p pasor
 
 どの操作も自動で再送しない。例外は FALP の再送で、protocol 自体が順序番号で重複を排除する欠落 block の再要求と、応答のない送信切替 block の再送だけを行う。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みの progress を error に残す。transport 失敗後には RF readiness が失効する。reader への `initialize` は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 
-`rcs956` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。`port100` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、受信済み bytes を捨ててから command を許可する。`rcs310` には command を中断する手段がなく、回復は pipe と受信済み bytes の整理だけを行う。いずれでも、中断前のカード操作の結果不明は caller に残る。
+`rcs956` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。`port100` の回復では受信済み bytes を捨て、host ACK で未完了 command を中断し、もう一度受信済み bytes を捨ててから command を許可する。`rcs310` には command を中断する手段がなく、回復は受信済み bytes を捨てるだけである。この 2 つのリーダーは CLEAR_FEATURE(ENDPOINT_HALT) で data toggle を戻さないため、`Transport` の実装は stall していない endpoint を回復で reset しない。いずれでも、中断前のカード操作の結果不明は caller に残る。
 
 `rcs310` のリーダーは ACK の後に応答を返さないことがある。その取引は失敗として返すが stream は使える状態に残し、遅れて届く応答に備えて、次の取引は受信済み bytes を捨ててから送り、ACK より前の frame を拒否する。
 
@@ -51,7 +51,7 @@ NDEF の書込みはメッセージを非公開にしてから本文を更新し
 
 固定 packet vector はデバイスに送るフレームと応答の解釈を検証する。実機 capture は USB と RF の観測範囲を別途記録する。
 
-NFC-A／B の固定 vector はカード実機の成功証拠ではない。`rcs310` の固定 vector は Sony のドライバーの静的解析と第三者実装の挙動から組み立てたもので、RC-S310／RC-S320 の実機では確認していない。`port100` の固定 vector は Sony のドライバーの静的解析と ISO/IEC 14443 の frame から組み立てたもので、Port-100 の実機では確認していない。NFC-A の command 交換は CRC を host で検査し、InCommRF 応答の第 5 byte が 4 を示す 1 byte を 4-bit の ACK／NAK として受け取る。この byte をドライバーが 8 と比べることから最終 byte の有効 bit 数と推定したもので、実機の値は確認していない。全 firmware、全カード command／APDU の意味と副作用の成立は、固定 vector の検証対象に含めない。
+NFC-A／B の固定 vector はカード実機の成功証拠ではない。`rcs310` の固定 vector は Sony のドライバーの静的解析と第三者実装の挙動から組み立てたもので、RC-S310 と RC-S320 の実機では FeliCa の Polling と packet 交換を確認している。`port100` の固定 vector は Sony のドライバーの静的解析と ISO/IEC 14443 の frame から組み立てたもので、RC-S380 の実機では FeliCa の Polling と packet 交換、NFC-A と NFC-B の活性化、ISO-DEP の block 交換を確認している。NFC-A の command 交換は CRC を host で検査し、InCommRF 応答の第 5 byte が 4 を示す 1 byte を 4-bit の ACK／NAK として受け取る。この byte をドライバーが 8 と比べることから最終 byte の有効 bit 数と推定したもので、実機の値は確認していない。全 firmware、全カード command／APDU の意味と副作用の成立は、固定 vector の検証対象に含めない。
 
 ## 外部実装へ委譲する責務
 

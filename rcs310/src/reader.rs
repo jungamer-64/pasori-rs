@@ -175,9 +175,10 @@ impl<T: Transport> Reader<T> {
     /// The register values are those that Sony's driver package writes for
     /// the same observations. The RC-S320 family then receives `5A 80`, the
     /// form of command `5A` that the driver sends before a short card
-    /// exchange; an RC-S310 answers `5A` with the error frame, so it receives
-    /// none. The device-side meaning of the values and of `5A` is not
-    /// established here.
+    /// exchange. An RC-S310 answers `5A 80` with the error frame; the driver
+    /// gives it only the two-bit form of `5A` around card exchanges, which
+    /// this crate does not send, so it receives none. The device-side meaning
+    /// of the values and of `5A` is not established here.
     ///
     /// # Errors
     ///

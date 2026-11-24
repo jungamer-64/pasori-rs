@@ -209,8 +209,10 @@ enum State {
 #[derive(Debug)]
 struct Received {
     data: Vec<u8>,
-    /// Response byte 5, which the driver package compares with 8 to accept
-    /// a reply whose last byte is complete.
+    /// Response byte 5. The driver package accepts an NFC-A reply that the
+    /// reader checked only when this byte is 8; reading it as the number of
+    /// valid bits in the last byte is an inference, not an established
+    /// meaning.
     last_bits: u8,
 }
 
