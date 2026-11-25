@@ -1,10 +1,6 @@
 use crate::ndef::{Message, MessageError};
 use alloc::vec::Vec;
 use core::fmt;
-use rcs956::{
-    reader::{Error, Reader, RfTimeout, TypeATarget},
-    transport::Transport,
-};
 
 const MEMORY_BYTES: usize = 64;
 const DATA_START: usize = 16;
@@ -22,7 +18,7 @@ pub enum Type2EmulationError<E> {
     Message(MessageError),
     /// Setup, activation, reception or response failed at the reader
     /// boundary. The target is revoked.
-    Reader(Error<E>),
+    Reader(E),
     /// The initiator halted the tag.
     Halted,
 }
@@ -51,12 +47,6 @@ impl<E: core::error::Error + 'static> core::error::Error for Type2EmulationError
     }
 }
 
-impl<E> From<Error<E>> for Type2EmulationError<E> {
-    fn from(error: Error<E>) -> Self {
-        Self::Reader(error)
-    }
-}
-
 /// The disposition of one command received from a Type A reader.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Type2Event {
@@ -66,68 +56,6 @@ pub enum Type2Event {
     Ignored(Vec<u8>),
     /// The initiator halted the tag. Call [Type2Target::finish].
     Halted,
-}
-
-/// Exclusive passive target serving an immutable Type 2 memory image.
-#[derive(Debug)]
-pub struct Type2Target<'a, T: Transport> {
-    target: TypeATarget<'a, T>,
-    memory: [u8; MEMORY_BYTES],
-    halted: bool,
-}
-
-impl<'a, T: Transport> Type2Target<'a, T> {
-    /// Expose an NDEF message as a read-only Type 2 target at 106 kbps.
-    /// The UID is 08 followed by the supplied suffix. The message is checked
-    /// before the reader is reset and activated; [Type2Target::finish]
-    /// clears the target mode.
-    pub fn listen(
-        reader: &'a mut Reader<T>,
-        uid_suffix: [u8; 3],
-        message: &[u8],
-        timeout: RfTimeout,
-    ) -> Result<Self, Type2EmulationError<T::Error>> {
-        let length = message_length(message)?;
-        let target = reader.listen_type_a(uid_suffix, timeout)?;
-        let memory = memory_image(target.uid(), length, message);
-        Ok(Self {
-            target,
-            memory,
-            halted: false,
-        })
-    }
-
-    /// Receive one command and reply if it is a READ within the emulated
-    /// memory. READ wraps at the end of the static memory. An exchange
-    /// failure revokes the target and can leave response delivery uncertain.
-    pub fn serve_next(
-        &mut self,
-        timeout: RfTimeout,
-    ) -> Result<Type2Event, Type2EmulationError<T::Error>> {
-        if self.halted {
-            return Err(Type2EmulationError::Halted);
-        }
-        let command = self.target.receive(timeout)?;
-        Ok(match command.data() {
-            data if data == HALT => {
-                self.halted = true;
-                Type2Event::Halted
-            }
-            &[0x30, page @ 0..=15] => {
-                let start = usize::from(page) * 4;
-                let response: [u8; 16] =
-                    core::array::from_fn(|index| self.memory[(start + index) % MEMORY_BYTES]);
-                command.respond(&response)?;
-                Type2Event::Read(page)
-            }
-            data => Type2Event::Ignored(data.to_vec()),
-        })
-    }
-
-    /// Stop emulation and return the reader to RF-off readiness.
-    pub fn finish(self) -> Result<(), Error<T::Error>> {
-        self.target.finish()
-    }
 }
 
 /// The one-byte TLV length of a message that fits the emulated data area.
