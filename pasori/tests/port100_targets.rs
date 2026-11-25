@@ -4,7 +4,7 @@ use pasori::{
     felica_packet::Idm,
     ndef::{Type3EmulationError, Type3Event, Type3Target},
     port100::reader::{BitRate, Error, Reader, TargetWait},
-    type2::{Type2Event, Type2Target},
+    type2::{Type2EmulationError, Type2Event, Type2Target},
 };
 use reader_script::port100::{Script, Step, command, initialization, initialization_with};
 use std::{error::Error as StdError, time::Duration};
@@ -43,12 +43,15 @@ fn serves_a_type2_read_on_port100_after_a_stale_field_loss() -> Result<(), Box<d
     let page_three = [
         0xe1, 0x10, 6, 0x0f, 3, 3, 0xd0, 0, 0, 0xfe, 0, 0, 0, 0, 0, 0,
     ];
+    let page_fifteen = [0, 0, 0, 0, 8, 1, 2, 3, 8, 0, 0, 0, 0, 0, 0xff, 0xff];
     let mut steps = initialization();
     steps.extend(configure(0x0b));
     steps.extend([
         exchange(&parameters, 1, &[], &[0, 0, 0, 0, 4, 0, 0]),
         exchange(&parameters, 1, &[], &[0x0b, 0, 3, 0, 0, 0, 0, 0x30, 3]),
         exchange(&parameters, 0, &page_three, &[0x0b, 0, 0, 0, 0, 0, 0]),
+        exchange(&parameters, 0, &[], &[0x0b, 0, 0, 0, 0, 0, 0, 0x30, 15]),
+        exchange(&parameters, 0, &page_fifteen, &[0x0b, 0, 0, 0, 0, 0, 0]),
         exchange(&parameters, 0, &[], &[0x0b, 0, 0, 0, 0, 0, 0, 0x50, 0]),
     ]);
     steps.extend(initialization());
@@ -57,7 +60,12 @@ fn serves_a_type2_read_on_port100_after_a_stale_field_loss() -> Result<(), Box<d
     reader.initialize()?;
     let mut target = Type2Target::listen(&mut reader, [1, 2, 3], &MESSAGE, wait()?)?;
     assert_eq!(target.serve_next(wait()?)?, Type2Event::Read(3));
+    assert_eq!(target.serve_next(wait()?)?, Type2Event::Read(15));
     assert_eq!(target.serve_next(wait()?)?, Type2Event::Halted);
+    assert!(matches!(
+        target.serve_next(wait()?),
+        Err(Type2EmulationError::Halted)
+    ));
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
