@@ -94,9 +94,16 @@ impl<T: Transport> iso_dep::Blocks for IsoDepBlocks<'_, T> {
             });
         }
         let wait = ResponseWait::new(wait).ok_or(Error::WaitRange(wait))?;
-        self.reader
+        let received = self
+            .reader
             .transceive(self.settings, block, wait)?
-            .map(|received| received.data)
-            .ok_or(Error::NoResponse)
+            .ok_or(Error::NoResponse)?;
+        if matches!(self.settings, Settings::TypeA(_)) {
+            received.whole_bytes().inspect_err(|_| {
+                self.reader.require_field_cycle();
+            })
+        } else {
+            Ok(received.data)
+        }
     }
 }

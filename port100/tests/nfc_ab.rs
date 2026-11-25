@@ -95,6 +95,7 @@ fn an_iso_dep_card_is_activated_with_rats_and_carries_blocks() -> TestResult {
             in_comm_rf(WAIT_UNITS, &[0xe0, 0x80], 0, &ATS),
             in_comm_rf(100, &[0x02, 0x00, 0xa4], 0, &[0x02, 0x90, 0x00]),
             in_comm_rf(100, &[0xb2], RECEIVE_TIMEOUT, &[]),
+            in_comm_rf_bits(100, &[0xb2], 0, 4, &[0x02, 0x90, 0x00]),
         ],
         field_off(),
         type_a_configuration(),
@@ -125,6 +126,10 @@ fn an_iso_dep_card_is_activated_with_rats_and_carries_blocks() -> TestResult {
         let missing = blocks.transfer(&[0xb2], wait);
         assert!(matches!(missing, Err(Error::NoResponse)));
         assert!(matches!(
+            blocks.transfer(&[0xb2], wait),
+            Err(Error::CardReplyBitCount(4))
+        ));
+        assert!(matches!(
             blocks.transfer(&[0; MAX_BLOCK_BYTES - 1], wait),
             Err(Error::InputLength { .. })
         ));
@@ -135,6 +140,21 @@ fn an_iso_dep_card_is_activated_with_rats_and_carries_blocks() -> TestResult {
     }
     // A new activation starts from a field that was switched off.
     assert!(reader.poll_type_a(card_wait()?)?.is_none());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_partial_ats_cannot_activate_an_iso_dep_card() -> TestResult {
+    let (mut reader, journal) = initialized([
+        type_a_configuration(),
+        type_a_activation(&UID, 0x20),
+        vec![in_comm_rf_bits(WAIT_UNITS, &[0xe0, 0x80], 0, 4, &ATS)],
+    ])?;
+    assert!(matches!(
+        reader.poll_type_a(card_wait()?),
+        Err(Error::CardReplyBitCount(4))
+    ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

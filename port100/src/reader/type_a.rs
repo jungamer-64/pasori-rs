@@ -89,20 +89,22 @@ impl<T: Transport> Reader<T> {
         let Some(sens_res) = self.in_comm_rf(&[SENS_REQ], wait)? else {
             return Ok(None);
         };
-        let sens_res = <[u8; 2]>::try_from(sens_res.data.as_slice())
+        let sens_res = <[u8; 2]>::try_from(sens_res.whole_bytes()?.as_slice())
             .map_err(|_| Error::CardReply("SENS_RES length"))?;
         self.set_protocol(&COMPLETE_BYTES)?;
         let mut uid = Vec::with_capacity(10);
         let mut sel_res = None;
         for select in SELECT {
-            let [a, b, c, d, bcc] = <[u8; 5]>::try_from(self.card_reply(&[select, 0x20], wait)?)
-                .map_err(|_| Error::CardReply("SDD_RES length"))?;
+            let sdd_res = self.card_reply(&[select, 0x20], wait)?.whole_bytes()?;
+            let [a, b, c, d, bcc] =
+                <[u8; 5]>::try_from(sdd_res).map_err(|_| Error::CardReply("SDD_RES length"))?;
             if a ^ b ^ c ^ d != bcc {
                 return Err(Error::CardReply("SDD_RES BCC"));
             }
             self.set_protocol(&WITH_CRC)?;
             let sak = match self
                 .card_reply(&[select, 0x70, a, b, c, d, bcc], wait)?
+                .whole_bytes()?
                 .as_slice()
             {
                 [sak] => *sak,
@@ -126,7 +128,8 @@ impl<T: Transport> Reader<T> {
             cycle: false,
         });
         let ats = if sel_res & 0x24 == 0x20 {
-            let ats = nfca::Ats::parse(&self.card_reply(&RATS, wait)?).map_err(Error::TypeA)?;
+            let ats = nfca::Ats::parse(&self.card_reply(&RATS, wait)?.whole_bytes()?)
+                .map_err(Error::TypeA)?;
             self.link.wait(ats.startup_guard());
             Some(ats)
         } else {

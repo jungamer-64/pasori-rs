@@ -70,7 +70,7 @@ impl<T: Transport> Reader<T> {
         let mut attrib = [ATTRIB, p0, p1, p2, p3, 0, 0, 0, 0];
         attrib[5..].copy_from_slice(&ATTRIB_PARAMETERS);
         let response = self.card_reply(&attrib, wait)?;
-        let observation = nfcb::Observation::new(atqb, &response).map_err(Error::TypeB)?;
+        let observation = nfcb::Observation::new(atqb, &response.data).map_err(Error::TypeB)?;
         if observation.cid() != 0 {
             return Err(Error::CardReply("ATTRIB CID differs from the assigned 0"));
         }

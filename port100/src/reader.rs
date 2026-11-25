@@ -70,6 +70,8 @@ pub enum Error<E> {
     TypeB(nfcb::Error),
     /// A card reply did not have the layout its command requires.
     CardReply(&'static str),
+    /// An NFC-A reply that requires whole bytes reported this final bit count.
+    CardReplyBitCount(u8),
     /// A card reply that the host checks failed its CRC.
     CardCrc,
     /// The NFC-B card's ATQB does not advertise ISO-DEP, the only protocol
@@ -110,6 +112,12 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
             Self::TypeA(_) => f.write_str("invalid NFC-A activation"),
             Self::TypeB(_) => f.write_str("invalid NFC-B activation"),
             Self::CardReply(reason) => write!(f, "malformed card reply: {reason}"),
+            Self::CardReplyBitCount(bits) => {
+                write!(
+                    f,
+                    "expected 8 bits in the last NFC-A reply byte, received {bits}"
+                )
+            }
             Self::CardCrc => f.write_str("card reply failed its CRC"),
             Self::NotIsoDep => f.write_str("NFC-B card does not advertise ISO-DEP"),
             Self::FieldReset => f.write_str("RF settings of the selection were lost"),
@@ -214,6 +222,16 @@ struct Received {
     /// valid bits in the last byte is an inference, not an established
     /// meaning.
     last_bits: u8,
+}
+
+impl Received {
+    fn whole_bytes<E>(self) -> Result<Vec<u8>, Error<E>> {
+        if self.last_bits == 8 {
+            Ok(self.data)
+        } else {
+            Err(Error::CardReplyBitCount(self.last_bits))
+        }
+    }
 }
 
 /// Exclusive reader owner. Uncertain transport failures revoke readiness.
@@ -417,10 +435,12 @@ impl<T: Transport> Reader<T> {
     }
 
     /// Send one RF frame within an activation and require a card reply.
-    fn card_reply(&mut self, frame: &[u8], wait: ResponseWait) -> Result<Vec<u8>, Error<T::Error>> {
-        self.in_comm_rf(frame, wait)?
-            .map(|received| received.data)
-            .ok_or(Error::NoResponse)
+    fn card_reply(
+        &mut self,
+        frame: &[u8],
+        wait: ResponseWait,
+    ) -> Result<Received, Error<T::Error>> {
+        self.in_comm_rf(frame, wait)?.ok_or(Error::NoResponse)
     }
 
     /// Send one RF frame with InCommRF and return the card's reply, or
