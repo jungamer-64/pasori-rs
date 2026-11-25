@@ -3,7 +3,8 @@
 use pasori::{
     felica_packet::Idm,
     ndef::{
-        Type3EmulationError, Type3Event, Type3Target, Type4EmulationError, Type4Event, Type4Target,
+        MAX_TYPE4_EMULATED_NDEF_BYTES, Type3EmulationError, Type3Event, Type3Target,
+        Type4EmulationError, Type4Event, Type4NdefChange, Type4NdefFile, Type4Target,
     },
     port100::reader::{BitRate, Error, Reader, TargetWait},
     type2::{Type2EmulationError, Type2Event, Type2Target},
@@ -316,4 +317,193 @@ fn type4a_field_loss_clears_selection_and_transmit_failure_revokes() -> Result<(
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
+}
+
+const TYPE4_ATS: [u8; 4] = [4, 0x68, 0x80, 0];
+const SELECT_TYPE4_APP: [u8; 14] = [2, 0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0];
+const SELECT_TYPE4_NDEF_EVEN: [u8; 8] = [2, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4];
+const SELECT_TYPE4_NDEF_ODD: [u8; 8] = [3, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4];
+
+#[test]
+fn type4a_writes_and_reads_ndef_with_chaining_and_replay() -> Result<(), Box<dyn StdError>> {
+    use Type4Event::{Activated, Block, Deselected, Exchange, NdefChanged};
+    use Type4NdefChange::{Cleared, Published};
+    let message = [0xd5, 0, 5, 1, 2, 3, 4, 5];
+    let transfer = |send: &[u8], receive: &[u8]| type4_exchange(0, send, WAIT_MS, 0, receive);
+    let begin = [3, 0, 0xd6, 0, 0, 4, 0, 0, 0xd5, 0];
+    let publish = [3, 0, 0xd6, 0, 0, 2, 0, 8];
+    let mut steps = initialization();
+    steps.extend(configure(0x0b));
+    steps.extend([
+        type4_exchange(1, &[], WAIT_MS, 0, &[0xe0, 0x50]),
+        transfer(&TYPE4_ATS, &SELECT_TYPE4_APP),
+        transfer(&[2, 0x90, 0], &[3, 0, 0xa4, 0, 0x0c, 2, 0xe1, 3]),
+        transfer(&[3, 0x90, 0], &[2, 0, 0xb0, 0, 0, 15]),
+        transfer(
+            &[
+                2, 0, 15, 0x20, 0, 255, 0, 255, 4, 6, 0xe1, 4, 0, 18, 0, 0, 0x90, 0,
+            ],
+            &[3, 0, 0xd6, 0, 0, 2, 0, 0],
+        ),
+        transfer(&[3, 0x69, 0x82], &SELECT_TYPE4_NDEF_EVEN),
+        transfer(&[2, 0x90, 0], &begin),
+        transfer(&[3, 0x90, 0], &begin),
+        transfer(&[3, 0x90, 0], &[0x12, 0, 0xd6, 0, 4, 6, 5, 1]),
+        transfer(&[0xa2], &[3, 2, 3, 4, 5]),
+        transfer(&[3, 0x90, 0], &[2, 0, 0xb0, 0, 0, 10]),
+        transfer(&[2, 0, 0, 0xd5, 0, 5, 1, 2, 3, 4, 5, 0x90, 0], &publish),
+        transfer(&[3, 0x90, 0], &publish),
+        transfer(&[3, 0x90, 0], &[2, 0, 0xb0, 0, 0, 10]),
+        transfer(
+            &[2, 0, 8, 0xd5, 0, 5, 1, 2, 3, 4, 5, 0x90, 0],
+            &[3, 0, 0xd6, 0, 0, 5, 0, 3, 0xd0, 0, 0],
+        ),
+        transfer(&[3, 0x90, 0], &[0xc2]),
+        type4_exchange(0, &[0xc2], 0, 0, &[]),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut file = Type4NdefFile::new(16, &[])?;
+    let mut target = Type4Target::listen_writable(&mut reader, [1, 2, 3], &mut file)?;
+    let wait = wait()?;
+    for expected in [
+        Activated,
+        Exchange,
+        Exchange,
+        Exchange,
+        Exchange,
+        Exchange,
+        NdefChanged(Cleared),
+        Block,
+        Block,
+        Exchange,
+        Exchange,
+        NdefChanged(Published { length: 8 }),
+        Block,
+        Exchange,
+        NdefChanged(Published { length: 3 }),
+        Deselected,
+    ] {
+        assert_eq!(target.serve_next(wait)?, expected);
+        match expected {
+            NdefChanged(Cleared) => assert!(target.message().is_empty()),
+            NdefChanged(Published { length: 8 }) => assert_eq!(target.message(), message),
+            _ => {}
+        }
+    }
+    target.finish()?;
+    assert_eq!(file.message(), MESSAGE);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type4a_discards_staged_bytes_and_retains_publication_after_field_loss()
+-> Result<(), Box<dyn StdError>> {
+    use Type4Event::{Activated, Exchange, FieldOff, NdefChanged};
+    use Type4NdefChange::{Cleared, Published};
+    let transfer = |send: &[u8], receive: &[u8]| type4_exchange(0, send, WAIT_MS, 0, receive);
+    let rats = || type4_exchange(1, &[], WAIT_MS, 0, &[0xe0, 0x50]);
+    let read = [2, 0, 0xb0, 0, 0, 6];
+    let mut steps = initialization();
+    steps.extend(configure(0x0b));
+    steps.extend([
+        rats(),
+        transfer(&TYPE4_ATS, &SELECT_TYPE4_APP),
+        transfer(&[2, 0x90, 0], &SELECT_TYPE4_NDEF_ODD),
+        transfer(
+            &[3, 0x90, 0],
+            &[2, 0, 0xd6, 0, 0, 6, 0, 0, 0xd5, 0, 1, 0x77],
+        ),
+        type4_exchange(0, &[2, 0x90, 0], WAIT_MS, 0x80, &[]),
+        type4_exchange(0, &[], WAIT_MS, 0x400, &[]),
+        rats(),
+        transfer(&TYPE4_ATS, &SELECT_TYPE4_APP),
+        transfer(&[2, 0x90, 0], &SELECT_TYPE4_NDEF_ODD),
+        transfer(&[3, 0x90, 0], &read),
+        transfer(
+            &[2, 0, 0, 0, 0, 0, 0, 0x90, 0],
+            &[3, 0, 0xd6, 0, 0, 2, 0, 4],
+        ),
+        transfer(
+            &[3, 0x69, 0x85],
+            &[2, 0, 0xd6, 0, 0, 6, 0, 4, 0xd5, 0, 1, 0x99],
+        ),
+        type4_exchange(0, &[2, 0x90, 0], WAIT_MS, 0x400, &[]),
+        rats(),
+        transfer(&TYPE4_ATS, &SELECT_TYPE4_APP),
+        transfer(&[2, 0x90, 0], &SELECT_TYPE4_NDEF_ODD),
+        transfer(&[3, 0x90, 0], &read),
+        transfer(
+            &[2, 0, 4, 0xd5, 0, 1, 0x99, 0x90, 0],
+            &[3, 0, 0xd6, 0, 0, 2, 0, 0],
+        ),
+        type4_exchange(0, &[3, 0x90, 0], WAIT_MS, 0x880, &[]),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut file = Type4NdefFile::new(8, &MESSAGE)?;
+    let mut target = Type4Target::listen_writable(&mut reader, [1, 2, 3], &mut file)?;
+    let wait = wait()?;
+    for expected in [
+        Activated,
+        Exchange,
+        Exchange,
+        NdefChanged(Cleared),
+        FieldOff,
+        Activated,
+        Exchange,
+        Exchange,
+        Exchange,
+        Exchange,
+    ] {
+        assert_eq!(target.serve_next(wait)?, expected);
+    }
+    assert!(target.message().is_empty());
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::NdefResponse {
+            change: Published { length: 4 },
+            cause: Error::TargetFieldOff,
+        })
+    ));
+    for expected in [Activated, Exchange, Exchange, Exchange] {
+        assert_eq!(target.serve_next(wait)?, expected);
+    }
+    assert_eq!(target.message(), [0xd5, 0, 1, 0x99]);
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::NdefResponse {
+            change: Cleared,
+            cause: Error::RfStatus(0x880),
+        })
+    ));
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::Inactive)
+    ));
+    target.finish()?;
+    assert!(file.message().is_empty());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type4a_validates_read_only_ndef_before_configuring_the_reader() {
+    let (script, journal) = Script::new(Vec::new());
+    let mut reader = Reader::new(script);
+    let long = vec![0; MAX_TYPE4_EMULATED_NDEF_BYTES + 1];
+    assert!(matches!(
+        Type4Target::listen(&mut reader, [1, 2, 3], &long),
+        Err(Type4EmulationError::MessageLength(_))
+    ));
+    assert!(matches!(
+        Type4Target::listen(&mut reader, [1, 2, 3], &[0xd0]),
+        Err(Type4EmulationError::Message(_))
+    ));
+    assert!(journal.borrow().commands.is_empty());
 }

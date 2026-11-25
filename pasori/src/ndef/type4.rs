@@ -5,7 +5,10 @@ use core::ops::Range;
 
 mod target;
 
-pub use target::{MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4Target};
+pub use target::{
+    MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4NdefChange, Type4NdefFile,
+    Type4NdefFileError, Type4Target,
+};
 
 const UPDATE_BINARY_HEADER_BYTES: usize = 5;
 const NDEF_APP_ID: [u8; 7] = [0xd2, 0x76, 0, 0, 0x85, 1, 1];

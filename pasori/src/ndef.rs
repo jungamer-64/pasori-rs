@@ -15,8 +15,8 @@ pub use type3::{
     Type3Target,
 };
 pub use type4::{
-    MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4Target, read_type4,
-    write_type4,
+    MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4NdefChange, Type4NdefFile,
+    Type4NdefFileError, Type4Target, read_type4, write_type4,
 };
 
 use core::fmt;

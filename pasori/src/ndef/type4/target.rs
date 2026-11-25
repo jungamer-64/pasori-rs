@@ -1,29 +1,26 @@
-//! A read-only NDEF file system carried by an NFC-A ISO-DEP target.
+//! An NDEF file system carried by an NFC-A ISO-DEP target.
 
-use super::{CAPABILITY_CONTAINER_ID, NDEF_APP_ID, SHORT_FILE_END};
+mod file;
+
+pub use file::{MAX_TYPE4_EMULATED_NDEF_BYTES, Type4NdefChange, Type4NdefFile, Type4NdefFileError};
+
 use crate::{
     isodep::target::{Action, Progress, Session},
-    ndef::{Message, MessageError},
+    ndef::MessageError,
 };
-use alloc::vec::Vec;
 use core::fmt;
+use file::{Application, Files};
 use iso14443::nfca::Rats;
 use port100::{
     reader::{self, IsoDepATarget, TargetWait},
     transport::Transport,
 };
 
-const NDEF_FILE_ID: u16 = 0xe104;
-const READ_LIMIT: u8 = 255;
-const NLEN_BYTES: usize = 2;
 // The observed Port-100 ATS advertises FSC 256 and FWI 8 at 106 kbps.
 const ATS: [u8; 4] = [4, 0x68, 0x80, 0];
 const FSC: u16 = 256;
 // This is the 64-byte framing range exercised by the RC-S370/P initiator.
 const OUTBOUND_FRAME_BYTES: u16 = 64;
-
-/// Maximum read-only NDEF message in the short-offset Type 4 file.
-pub const MAX_TYPE4_EMULATED_NDEF_BYTES: usize = SHORT_FILE_END - NLEN_BYTES;
 
 /// Failure preparing or operating a Type 4A target.
 #[derive(Debug)]
@@ -37,6 +34,15 @@ pub enum Type4EmulationError<E> {
     /// The initiator's field went away during a response. Delivery may be
     /// unknown. The next receive can wait for a new activation.
     ResponseFieldOff,
+    /// The change was applied to the emulated file before attempting to
+    /// send the response. The initiator may not have received the response.
+    /// Field loss allows a fresh activation. Other causes revoke the target.
+    NdefResponse {
+        /// The change already applied to the published NDEF.
+        change: Type4NdefChange,
+        /// The reader's response failure.
+        cause: reader::Error<E>,
+    },
     /// An unfinished command exhausted the short APDU budget. Finish the
     /// target before listening again.
     CommandLimit,
@@ -54,6 +60,12 @@ impl<E: fmt::Debug> fmt::Display for Type4EmulationError<E> {
             Self::Message(error) => write!(f, "invalid NDEF message: {error}"),
             Self::Reader(error) => write!(f, "Type 4A target: {error}"),
             Self::ResponseFieldOff => f.write_str("field lost during Type 4A response"),
+            Self::NdefResponse { change, cause } => {
+                write!(
+                    f,
+                    "Type 4A response failed after NDEF change {change:?}: {cause}"
+                )
+            }
             Self::CommandLimit => f.write_str("chained command exceeds the short APDU limit"),
             Self::Inactive => f.write_str("Type 4A target session has ended"),
         }
@@ -64,7 +76,7 @@ impl<E: core::error::Error + 'static> core::error::Error for Type4EmulationError
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Message(error) => Some(error),
-            Self::Reader(error) => Some(error),
+            Self::Reader(error) | Self::NdefResponse { cause: error, .. } => Some(error),
             _ => None,
         }
     }
@@ -79,6 +91,8 @@ pub enum Type4Event {
     Block,
     /// Sent the final or only block of an APDU response.
     Exchange,
+    /// Applied a change to the published NDEF and sent the APDU response.
+    NdefChanged(Type4NdefChange),
     /// Left an unrelated or invalid frame unanswered.
     Ignored,
     /// No frame arrived within the receive wait.
@@ -90,7 +104,7 @@ pub enum Type4Event {
     Deselected,
 }
 
-/// Exclusive Port-100 NFC-A target exposing an immutable Type 4 NDEF message.
+/// Exclusive Port-100 NFC-A target exposing a Type 4 NDEF file.
 /// Each ISO-DEP activation starts with no application or file selected.
 #[derive(Debug)]
 pub struct Type4Target<'r, 'm, T: Transport> {
@@ -104,20 +118,40 @@ enum State {
     WaitingForRats,
     Active {
         session: Session,
-        selected: Selection,
+        application: Application,
     },
     Inactive,
 }
 
 impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
-    /// Configure the reader with UID `08` followed by the supplied suffix.
+    /// Expose a read-only file with UID `08` followed by the supplied suffix.
     /// Input is validated before reader I/O. An empty message sets NLEN to zero.
     pub fn listen(
         reader: &'r mut reader::Reader<T>,
         suffix: [u8; 3],
         message: &'m [u8],
     ) -> Result<Self, Type4EmulationError<T::Error>> {
-        let files = Files::new(message)?;
+        Self::start(reader, suffix, Files::read_only(message)?)
+    }
+
+    /// Expose a writable file with UID `08` followed by the supplied suffix.
+    /// Any initiator that selects the NDEF file can update its contents.
+    /// The caller retains the published contents after the target releases
+    /// its exclusive borrow of the file. Clearing NLEN takes effect immediately.
+    /// An unfinished update loses its staged bytes when its activation ends.
+    pub fn listen_writable(
+        reader: &'r mut reader::Reader<T>,
+        suffix: [u8; 3],
+        file: &'m mut Type4NdefFile,
+    ) -> Result<Self, Type4EmulationError<T::Error>> {
+        Self::start(reader, suffix, Files::Writable(file))
+    }
+
+    fn start(
+        reader: &'r mut reader::Reader<T>,
+        suffix: [u8; 3],
+        files: Files<'m>,
+    ) -> Result<Self, Type4EmulationError<T::Error>> {
         let target = reader
             .listen_iso_dep_a(suffix)
             .map_err(Type4EmulationError::Reader)?;
@@ -126,6 +160,12 @@ impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
             state: State::WaitingForRats,
             files,
         })
+    }
+
+    /// Borrow the published NDEF bytes, including after a response failure.
+    /// An empty slice corresponds to NLEN zero.
+    pub fn message(&self) -> &[u8] {
+        self.files.message()
     }
 
     /// Handle one frame. The response and next receive can share one USB
@@ -150,6 +190,7 @@ impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
                 return Err(Type4EmulationError::Reader(error));
             }
         };
+        let mut ndef_change = None;
         let (result, event) = match &mut self.state {
             State::WaitingForRats => {
                 let Some(rats) = Rats::parse(command.data()) else {
@@ -157,12 +198,19 @@ impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
                 };
                 self.state = State::Active {
                     session: Session::new(rats.frame_size(), FSC, OUTBOUND_FRAME_BYTES),
-                    selected: Selection::None,
+                    application: Application::default(),
                 };
                 (command.respond_and_wait(&ATS, wait), Type4Event::Activated)
             }
-            State::Active { session, selected } => {
-                match session.receive(command.data(), |apdu| self.files.execute(selected, apdu)) {
+            State::Active {
+                session,
+                application,
+            } => {
+                match session.receive(command.data(), |apdu| {
+                    let (reply, change) = self.files.execute(application, apdu);
+                    ndef_change = change;
+                    reply
+                }) {
                     Action::Ignore => return Ok(Type4Event::Ignored),
                     Action::Reply(reply, progress) => (
                         command.respond_and_wait(&reply, wait),
@@ -183,197 +231,24 @@ impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
             }
             State::Inactive => return Err(Type4EmulationError::Inactive),
         };
-        match result {
-            Ok(()) => Ok(event),
-            Err(reader::Error::TargetFieldOff) => {
-                self.state = State::WaitingForRats;
-                Err(Type4EmulationError::ResponseFieldOff)
-            }
-            Err(error) => {
-                self.state = State::Inactive;
-                Err(Type4EmulationError::Reader(error))
-            }
+        if let Err(cause) = result {
+            let field_off = matches!(cause, reader::Error::TargetFieldOff);
+            self.state = if field_off {
+                State::WaitingForRats
+            } else {
+                State::Inactive
+            };
+            return Err(match ndef_change {
+                Some(change) => Type4EmulationError::NdefResponse { change, cause },
+                None if field_off => Type4EmulationError::ResponseFieldOff,
+                None => Type4EmulationError::Reader(cause),
+            });
         }
+        Ok(ndef_change.map_or(event, Type4Event::NdefChanged))
     }
 
     /// Stop the target and restore reader readiness.
     pub fn finish(self) -> Result<(), reader::Error<T::Error>> {
         self.target.finish()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Selection {
-    None,
-    Application,
-    File(File),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum File {
-    CapabilityContainer,
-    Ndef,
-}
-
-#[derive(Debug)]
-struct Files<'m> {
-    message: &'m [u8],
-    nlen: u16,
-    cc: [u8; 15],
-}
-
-fn ndef_file_size(nlen: u16) -> u16 {
-    (nlen + 2).max(5)
-}
-
-impl<'m> Files<'m> {
-    fn new<E>(message: &'m [u8]) -> Result<Self, Type4EmulationError<E>> {
-        let length = message.len();
-        let nlen = u16::try_from(length)
-            .ok()
-            .filter(|_| length <= MAX_TYPE4_EMULATED_NDEF_BYTES)
-            .ok_or(Type4EmulationError::MessageLength(length))?;
-        if !message.is_empty() {
-            Message::parse(message).map_err(Type4EmulationError::Message)?;
-        }
-        let [id_high, id_low] = NDEF_FILE_ID.to_be_bytes();
-        let [size_high, size_low] = ndef_file_size(nlen).to_be_bytes();
-        Ok(Self {
-            message,
-            nlen,
-            cc: [
-                0, 15, 0x20, 0, READ_LIMIT, 0, 255, 4, 6, id_high, id_low, size_high, size_low, 0,
-                0xff,
-            ],
-        })
-    }
-
-    fn execute(&self, selected: &mut Selection, apdu: &[u8]) -> Vec<u8> {
-        let [class, instruction, p1, p2, body @ ..] = apdu else {
-            return if apdu.is_empty() {
-                Vec::new()
-            } else {
-                status(0x6700)
-            };
-        };
-        if *class != 0 {
-            return status(0x6e00);
-        }
-        match *instruction {
-            0xa4 => Self::select(selected, [*p1, *p2], body),
-            0xb0 => self.read(*selected, [*p1, *p2], body),
-            0xd6 if matches!(selected, Selection::File(_)) => status(0x6982),
-            0xd6 => status(0x6986),
-            _ => status(0x6d00),
-        }
-    }
-
-    fn select(selected: &mut Selection, parameters: [u8; 2], body: &[u8]) -> Vec<u8> {
-        match parameters {
-            [4, 0] => {
-                let [7, data @ ..] = body else {
-                    return status(0x6700);
-                };
-                let Some((aid, [] | [0])) = data.split_first_chunk::<7>() else {
-                    return status(0x6700);
-                };
-                if aid != &NDEF_APP_ID {
-                    return status(0x6a82);
-                }
-                *selected = Selection::Application;
-            }
-            [0, 0x0c] => {
-                let &[2, high, low] = body else {
-                    return status(0x6700);
-                };
-                if matches!(selected, Selection::None) {
-                    return status(0x6a82);
-                }
-                let file = match u16::from_be_bytes([high, low]) {
-                    CAPABILITY_CONTAINER_ID => File::CapabilityContainer,
-                    NDEF_FILE_ID => File::Ndef,
-                    _ => return status(0x6a82),
-                };
-                *selected = Selection::File(file);
-            }
-            _ => return status(0x6a86),
-        }
-        status(0x9000)
-    }
-
-    fn read(&self, selected: Selection, address: [u8; 2], body: &[u8]) -> Vec<u8> {
-        let &[length @ 1..=READ_LIMIT] = body else {
-            return status(0x6700);
-        };
-        let Selection::File(file) = selected else {
-            return status(0x6986);
-        };
-        let offset = usize::from(u16::from_be_bytes(address));
-        let size = match file {
-            File::CapabilityContainer => self.cc.len(),
-            File::Ndef => usize::from(ndef_file_size(self.nlen)),
-        };
-        if offset >= size {
-            return status(0x6b00);
-        }
-        let requested_end = offset + usize::from(length);
-        let end = requested_end.min(size);
-        let mut response = Vec::with_capacity(end - offset + 2);
-        match file {
-            File::CapabilityContainer => response.extend_from_slice(&self.cc[offset..end]),
-            File::Ndef => {
-                if offset < NLEN_BYTES {
-                    response
-                        .extend_from_slice(&self.nlen.to_be_bytes()[offset..end.min(NLEN_BYTES)]);
-                }
-                let start = offset.saturating_sub(NLEN_BYTES);
-                let end_of_message = end.saturating_sub(NLEN_BYTES).min(self.message.len());
-                if start < end_of_message {
-                    response.extend_from_slice(&self.message[start..end_of_message]);
-                }
-                response.resize(end - offset, 0);
-            }
-        }
-        let word: u16 = if end == requested_end { 0x9000 } else { 0x6282 };
-        response.extend(word.to_be_bytes());
-        response
-    }
-}
-
-fn status(word: u16) -> Vec<u8> {
-    word.to_be_bytes().to_vec()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::convert::Infallible;
-
-    #[test]
-    fn ndef_file_capacity_includes_the_length_field() -> Result<(), Type4EmulationError<Infallible>>
-    {
-        let selected = Selection::File(File::Ndef);
-        let empty = Files::new(&[])?;
-        assert_eq!(&empty.cc[11..], &[0, 5, 0, 0xff]);
-        assert_eq!(empty.read(selected, [0, 0], &[5]), [0, 0, 0, 0, 0, 0x90, 0]);
-
-        let mut message = alloc::vec![0xc5, 0, 0, 0, 0x7f, 0xf8];
-        message.resize(MAX_TYPE4_EMULATED_NDEF_BYTES, 0xa5);
-        let full = Files::new(&message)?;
-        assert_eq!(&full.cc[11..], &[0x80, 0, 0, 0xff]);
-        assert_eq!(full.read(selected, [0, 1], &[3]), [0xfe, 0xc5, 0, 0x90, 0]);
-        assert_eq!(full.read(selected, [0x7f, 0xff], &[2]), [0xa5, 0x62, 0x82]);
-        assert_eq!(full.read(selected, [0x80, 0], &[1]), [0x6b, 0]);
-
-        message.push(0);
-        assert!(matches!(
-            Files::new::<Infallible>(&message),
-            Err(Type4EmulationError::MessageLength(_))
-        ));
-        assert!(matches!(
-            Files::new::<Infallible>(&[0xd0]),
-            Err(Type4EmulationError::Message(_))
-        ));
-        Ok(())
     }
 }
