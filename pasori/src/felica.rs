@@ -92,88 +92,6 @@ impl fmt::Display for CardError {
 
 impl core::error::Error for CardError {}
 
-/// Build a one-service Read Without Encryption packet for at most 12 blocks.
-///
-/// The service code is little-endian. Block numbers through 255 use the two-byte
-/// list element; larger numbers use the three-byte form. No CRC is appended.
-///
-/// # Errors
-///
-/// Rejects an empty block list or more than 12 blocks. Individual card products
-/// can have additional restrictions beyond this baseline packet format.
-pub fn read_without_encryption(
-    idm: Idm,
-    service_code: u16,
-    blocks: &[u16],
-) -> Result<Vec<u8>, CardError> {
-    let count =
-        block_count(blocks.len(), MAX_READ_BLOCKS).ok_or(CardError::BlockCount(blocks.len()))?;
-    let mut packet = block_list(0x06, idm, service_code, count, blocks.iter().copied());
-    set_length(&mut packet)?;
-    Ok(packet)
-}
-
-/// A block address and the 16 bytes to replace at that address.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockWrite {
-    /// Block number within the selected service.
-    pub block: u16,
-    /// Replacement bytes in wire order.
-    pub data: [u8; 16],
-}
-
-pub(crate) fn write_without_encryption(
-    idm: Idm,
-    service: u16,
-    blocks: &[BlockWrite],
-) -> Result<Vec<u8>, CardError> {
-    let count = block_count(blocks.len(), MAX_WRITE_BLOCKS)
-        .ok_or(CardError::WriteBlockCount(blocks.len()))?;
-    let mut packet = block_list(
-        0x08,
-        idm,
-        service,
-        count,
-        blocks.iter().map(|entry| entry.block),
-    );
-    for entry in blocks {
-        packet.extend_from_slice(&entry.data);
-    }
-    set_length(&mut packet)?;
-    Ok(packet)
-}
-
-/// The packet's block-count byte for 1 to `maximum` blocks.
-fn block_count(blocks: usize, maximum: usize) -> Option<u8> {
-    u8::try_from(blocks)
-        .ok()
-        .filter(|count| (1..=maximum).contains(&usize::from(*count)))
-}
-
-fn block_list(
-    command: u8,
-    idm: Idm,
-    service: u16,
-    count: u8,
-    blocks: impl Iterator<Item = u16>,
-) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(14 + usize::from(count) * 3);
-    packet.extend_from_slice(&[0, command]);
-    packet.extend_from_slice(idm.as_bytes());
-    packet.push(1);
-    packet.extend_from_slice(&service.to_le_bytes());
-    packet.push(count);
-    for block in blocks {
-        let [low, high] = block.to_le_bytes();
-        if high == 0 {
-            packet.extend_from_slice(&[0x80, low]);
-        } else {
-            packet.extend_from_slice(&[0, low, high]);
-        }
-    }
-    packet
-}
-
 fn set_length(packet: &mut [u8]) -> Result<(), CardError> {
     packet[0] = u8::try_from(packet.len()).map_err(|_| CardError::Length {
         expected: 255,
@@ -428,35 +346,6 @@ impl<S: Selection> Card<S> {
 
     fn idm(&self) -> Idm {
         self.selection.poll_response().idm
-    }
-
-    /// Read up to twelve blocks from one unencrypted service. The caller chooses
-    /// a service known to exist on this card; no card data is written.
-    pub fn read_without_encryption(
-        &mut self,
-        service: u16,
-        blocks: &[u16],
-    ) -> Result<ReadResponse, Error<S::Error>> {
-        let idm = self.idm();
-        let request = read_without_encryption(idm, service, blocks).map_err(Error::Request)?;
-        let response = self.exchange_packet(&request)?;
-        ReadResponse::parse(&response, idm, blocks.len()).map_err(Error::Response)
-    }
-
-    /// Write blocks to one service with Write Without Encryption. Card-specific
-    /// limits still apply. [`Error::Request`] means validation stopped the
-    /// command before sending. [`Error::Response`] means it was sent and the
-    /// write outcome may be uncertain. Reader failures carry their own
-    /// transaction progress.
-    pub fn write_without_encryption(
-        &mut self,
-        service: u16,
-        blocks: &[BlockWrite],
-    ) -> Result<(), Error<S::Error>> {
-        let idm = self.idm();
-        let request = write_without_encryption(idm, service, blocks).map_err(Error::Request)?;
-        let response = self.exchange_packet(&request)?;
-        write_response(&response, idm).map_err(Error::Response)
     }
 
     /// Confirm that the selected card still answers at its IDm, using Request
