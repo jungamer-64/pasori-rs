@@ -1,6 +1,6 @@
 //! NFC-A and NFC-B activation and whole-byte ISO-DEP block exchange.
 
-use super::{Error, Profile, Reader, ResponseWait, apdu};
+use super::{Error, IccResponsePolicy, Profile, Reader, ResponseWait, apdu};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -38,7 +38,11 @@ impl<T: Transport> Reader<T> {
     ) -> Result<Option<IsoDepCard<'_, T>>, Error<T::Error>> {
         self.rf_off()?;
         self.energize()?;
-        let sak = match self.objects(&Profile::TypeA.switch_command(), |objects| objects.sak()) {
+        let sak = match self.objects(
+            &Profile::TypeA.switch_command(),
+            IccResponsePolicy::Unique,
+            |objects| objects.sak(),
+        ) {
             Err(Error::DeviceApdu(error)) if error.icc_timeout() => return Ok(None),
             result => result?,
         };
@@ -51,7 +55,7 @@ impl<T: Transport> Reader<T> {
         self.acknowledge(&Profile::TypeA.framing_command())?;
         self.enable_profile(Profile::TypeA);
         let result = self
-            .exchange_rf(&[0xe0, 0x80], wait)
+            .exchange_rf(&[0xe0, 0x80], wait, IccResponsePolicy::Unique)
             .and_then(|ats| nfca::Ats::parse(&ats).map_err(Error::TypeA));
         let ats = match result {
             Ok(ats) => ats,
@@ -108,7 +112,7 @@ impl<T: Transport> Reader<T> {
         afi: u8,
         wait: ResponseWait,
     ) -> Result<Option<(nfcb::Observation, iso_dep::Parameters)>, Error<T::Error>> {
-        let atqb = match self.exchange_rf(&[0x05, afi, 0x00], wait) {
+        let atqb = match self.exchange_rf(&[0x05, afi, 0x00], wait, IccResponsePolicy::Unique) {
             Err(Error::NoResponse) => return Ok(None),
             result => result?,
         };
@@ -120,7 +124,11 @@ impl<T: Transport> Reader<T> {
         }
         // Default guard and framing, FSDI 8, 106 kbps, ISO-DEP, CID zero.
         let [a, b, c, d] = atqb.pupi();
-        let attrib = self.exchange_rf(&[0x1d, a, b, c, d, 0x00, 0x08, 0x01, 0x00], wait)?;
+        let attrib = self.exchange_rf(
+            &[0x1d, a, b, c, d, 0x00, 0x08, 0x01, 0x00],
+            wait,
+            IccResponsePolicy::Unique,
+        )?;
         let observation = nfcb::Observation::new(atqb, &attrib).map_err(Error::TypeB)?;
         if observation.cid() != 0 {
             return Err(Error::AttribCid(observation.cid()));
@@ -191,7 +199,9 @@ impl<T: Transport> iso_dep::Blocks for IsoDepBlocks<'_, T> {
             return Err(Error::InputLength(block.len()));
         }
         let wait = ResponseWait::new(wait).ok_or(Error::WaitRange(wait))?;
-        let response = self.reader.exchange_rf(block, wait)?;
+        let response = self
+            .reader
+            .exchange_rf(block, wait, IccResponsePolicy::Unique)?;
         if response.is_empty() || response.len() > MAX_BLOCK_WITHOUT_CRC {
             self.reader.invalidate_field();
             return Err(Error::ReplyLength(response.len()));

@@ -1,6 +1,6 @@
 //! FeliCa polling and packet exchange at 212 kbps.
 
-use super::{Error, Field, Profile, Reader, ResponseWait, Session, apdu};
+use super::{Error, Field, IccResponsePolicy, Profile, Reader, ResponseWait, Session, apdu};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -11,6 +11,8 @@ const MAX_PACKET: usize = u8::MAX as usize;
 impl<T: Transport> Reader<T> {
     /// Send FeliCa Polling at 212 kbps. The selected card uses the same wait
     /// for later exchanges. Returns `None` when the reader reports an RF timeout.
+    /// If the reader returns multiple ICC Response objects, the last one
+    /// supplies the card reply.
     ///
     /// # Errors
     ///
@@ -37,7 +39,7 @@ impl<T: Transport> Reader<T> {
             self.enable_profile(Profile::Felica);
         }
         let packet = request.encode();
-        let response = match self.exchange_rf(&packet, wait) {
+        let response = match self.exchange_rf(&packet, wait, IccResponsePolicy::LastPollingReply) {
             Err(Error::NoResponse) => return Ok(None),
             result => result?,
         };
@@ -88,7 +90,7 @@ impl<T: Transport> Selection for FelicaCard<'_, T> {
         validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         let result = self
             .reader
-            .exchange_rf(packet, self.wait)
+            .exchange_rf(packet, self.wait, IccResponsePolicy::Unique)
             .and_then(|response| {
                 validate_length(&response, 2).map_err(Error::FelicaResponse)?;
                 Ok(response)

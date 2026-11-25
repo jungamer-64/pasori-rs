@@ -168,8 +168,14 @@ pub(crate) struct Objects<'a> {
     switch: Option<&'a [u8]>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum IccResponsePolicy {
+    Unique,
+    LastPollingReply,
+}
+
 impl<'a> Objects<'a> {
-    pub(crate) fn parse(response: &'a [u8]) -> Result<Self, ApduError> {
+    pub(crate) fn parse(response: &'a [u8], policy: IccResponsePolicy) -> Result<Self, ApduError> {
         let mut input = response_body(response)?;
         let mut status = None;
         let mut rx_bits = None;
@@ -182,7 +188,10 @@ impl<'a> Objects<'a> {
                 GENERIC_STATUS => set(&mut status, tag, sized(tag, value)?)?,
                 RX_BITS => set(&mut rx_bits, tag, sized(tag, value)?)?,
                 RX_STATUS => set(&mut rx_status, tag, sized(tag, value)?)?,
-                ICC_RESPONSE => set(&mut icc_response, tag, value)?,
+                ICC_RESPONSE => match policy {
+                    IccResponsePolicy::Unique => set(&mut icc_response, tag, value)?,
+                    IccResponsePolicy::LastPollingReply => icc_response = Some(value),
+                },
                 SWITCH_RESPONSE => set(&mut switch, tag, value)?,
                 _ => {}
             }

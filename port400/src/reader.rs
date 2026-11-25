@@ -8,7 +8,7 @@ pub use felica::FelicaCard;
 pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard};
 
 use crate::{
-    apdu::{self, Objects},
+    apdu::{self, IccResponsePolicy, Objects},
     transport::{Link, READ_CAPACITY, TransactionError, Transport},
 };
 use alloc::vec::Vec;
@@ -385,12 +385,15 @@ impl<T: Transport> Reader<T> {
     }
 
     fn acknowledge(&mut self, command: &[u8]) -> Result<(), Error<T::Error>> {
-        self.objects(command, |objects| objects.require_success())
+        self.objects(command, IccResponsePolicy::Unique, |objects| {
+            objects.require_success()
+        })
     }
 
     fn objects<R>(
         &mut self,
         command: &[u8],
+        response_policy: IccResponsePolicy,
         interpret: impl FnOnce(Objects<'_>) -> Result<R, ApduError>,
     ) -> Result<R, Error<T::Error>> {
         let mut response = [0; READ_CAPACITY];
@@ -398,7 +401,7 @@ impl<T: Transport> Reader<T> {
             .link
             .escape(command, &mut response)
             .map_err(Error::Ccid)?;
-        let result = Objects::parse(response).and_then(interpret);
+        let result = Objects::parse(response, response_policy).and_then(interpret);
         if result
             .as_ref()
             .is_err_and(|error| error.session_sequence_invalid())
@@ -413,12 +416,15 @@ impl<T: Transport> Reader<T> {
         &mut self,
         packet: &[u8],
         wait: ResponseWait,
+        response_policy: IccResponsePolicy,
     ) -> Result<Vec<u8>, Error<T::Error>> {
         self.require_configured_field()?;
         let mut buffer = [0; apdu::EXCHANGE_CAPACITY];
         let command =
             apdu::exchange(packet, wait.0, &mut buffer).ok_or(Error::InputLength(packet.len()))?;
-        match self.objects(command, |objects| objects.received().map(<[u8]>::to_vec)) {
+        match self.objects(command, response_policy, |objects| {
+            objects.received().map(<[u8]>::to_vec)
+        }) {
             Err(Error::DeviceApdu(error)) if error.icc_timeout() => Err(Error::NoResponse),
             Err(error) => {
                 self.invalidate_field();

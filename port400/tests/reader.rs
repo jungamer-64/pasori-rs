@@ -266,10 +266,6 @@ fn no_card_is_distinct_from_reader_status_and_broken_tlvs() -> Result<(), Box<dy
             &[0xc0, 3, 0, 0x90, 0, 0x97, 0x82, 1, 0, 0x90, 0],
             ApduError::InvalidTlv,
         ),
-        (
-            &[0xc0, 3, 0, 0x90, 0, 0x97, 0, 0x97, 0, 0x90, 0],
-            ApduError::DuplicateTag(0x97),
-        ),
     ];
     for &(response, error) in samples {
         let steps = initialization()
@@ -284,6 +280,40 @@ fn no_card_is_distinct_from_reader_status_and_broken_tlvs() -> Result<(), Box<dy
         );
         assert!(reader.into_transport().is_exhausted());
     }
+    Ok(())
+}
+
+#[test]
+fn polling_uses_the_last_icc_response_object() -> Result<(), Box<dyn StdError>> {
+    let mut first_reply = POLLED;
+    first_reply[2] = 0xab;
+    let multiple_replies = [
+        &[0xc0, 3, 0, 0x90, 0, 0x97, 18][..],
+        &first_reply,
+        &[0x97, 18],
+        &POLLED,
+        &[0x90, 0],
+    ]
+    .concat();
+    let packet = [3, 0x81, 0xaa];
+    let steps = initialization().into_iter().chain(felica()).chain([
+        command(&rf_apdu(WAIT_US, &POLL), &multiple_replies),
+        command(&rf_apdu(WAIT_US, &packet), &multiple_replies),
+    ]);
+    let mut reader = Reader::new(Script::new(steps));
+    reader.initialize()?;
+    let mut card = reader
+        .poll_felica(PollRequest::new(0xffff, 0, 0)?, response_wait()?)?
+        .ok_or("missing card")?;
+    assert_eq!(
+        card.poll_response().idm,
+        felica_packet::Idm::new([1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    assert!(matches!(
+        card.exchange_packet(&packet),
+        Err(Error::DeviceApdu(ApduError::DuplicateTag(0x97)))
+    ));
+    assert!(reader.into_transport().is_exhausted());
     Ok(())
 }
 
