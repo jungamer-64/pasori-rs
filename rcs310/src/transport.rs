@@ -201,7 +201,6 @@ pub struct Link<T: Transport> {
 #[derive(Debug, PartialEq, Eq)]
 enum StreamState {
     Ready,
-    Unanswered,
     RecoveryRequired,
 }
 
@@ -258,12 +257,6 @@ impl<T: Transport> Link<T> {
             .ok_or(not_sent(Failure::Deadline))?;
         match self.state {
             StreamState::Ready => {}
-            StreamState::Unanswered => {
-                self.state = StreamState::RecoveryRequired;
-                self.transport
-                    .recover()
-                    .map_err(|e| not_sent(Failure::Io(e)))?;
-            }
             StreamState::RecoveryRequired => return Err(not_sent(Failure::RecoveryRequired)),
         }
         match self.transact(&frame, expected, deadline) {
@@ -274,12 +267,7 @@ impl<T: Transport> Link<T> {
                     data,
                 })
             }
-            Err(error) => {
-                if error.is_unanswered() {
-                    self.state = StreamState::Unanswered;
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -363,11 +351,12 @@ impl<T: Transport> Link<T> {
     ///
     /// A transport failure leaves the link requiring recovery.
     pub fn recover(&mut self) -> Result<(), TransactionError<T::Error>> {
-        self.state = StreamState::RecoveryRequired;
+        if self.state != StreamState::Ready {
+            return Err(not_sent(Failure::RecoveryRequired));
+        }
         self.transport
             .recover()
             .map_err(|e| not_sent(Failure::Io(e)))?;
-        self.state = StreamState::Ready;
         Ok(())
     }
 
