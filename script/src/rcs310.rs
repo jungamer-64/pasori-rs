@@ -15,8 +15,8 @@ pub enum Answer {
     Data(Vec<u8>),
     /// ACK, then no response before the host deadline.
     Unanswered,
-    /// ACK, no response before the host deadline, then a response with
-    /// these data bytes that the host must discard.
+    /// ACK, timeout, then these reply bytes arrive after the next command's
+    /// ACK, even if the host drained USB input before issuing that command.
     UnansweredThenLate(Vec<u8>),
     /// ACK followed by the `7F` error frame.
     ReaderError,
@@ -77,6 +77,7 @@ pub struct Script {
     descriptor: Descriptor,
     steps: VecDeque<Step>,
     input: VecDeque<Input>,
+    late_reply: Option<Vec<u8>>,
     journal: Rc<RefCell<Journal>>,
     elapsed: Duration,
 }
@@ -95,6 +96,7 @@ impl Script {
                 descriptor,
                 steps: steps.into(),
                 input: VecDeque::new(),
+                late_reply: None,
                 journal: Rc::clone(&journal),
                 elapsed: Duration::ZERO,
             },
@@ -170,6 +172,9 @@ impl Transport for Script {
             journal.remaining = self.steps.len();
         }
         self.input.push_back(Input::Bytes(ACK.to_vec()));
+        if let Some(reply) = self.late_reply.take() {
+            self.input.push_back(Input::Bytes(reply));
+        }
         match step.answer {
             Answer::Data(data) => self
                 .input
@@ -177,8 +182,7 @@ impl Transport for Script {
             Answer::Unanswered => self.input.push_back(Input::Silence),
             Answer::UnansweredThenLate(data) => {
                 self.input.push_back(Input::Silence);
-                self.input
-                    .push_back(Input::Bytes(response(command, &data)?));
+                self.late_reply = Some(response(command, &data)?);
             }
             Answer::ReaderError => self.input.push_back(Input::Bytes(reader_frame(&[0x7f])?)),
         }
@@ -240,6 +244,7 @@ pub fn rcs320_initialization() -> Vec<Step> {
         command(0x62, &[0x21, 0x25, 0x58], &[0]),
         command(0x5a, &[0x80], &[0]),
         command(0x54, &[], &[0]),
+        command(0x5e, &[0x01], &[0]),
     ]
 }
 

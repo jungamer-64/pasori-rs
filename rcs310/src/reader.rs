@@ -2,7 +2,7 @@
 
 use crate::{
     device::{self, Descriptor, Family, Product, Variant},
-    transport::{Failure, Link, Progress, TransactionError, Transport},
+    transport::{CARD_EXCHANGE, Failure, Link, Progress, TransactionError, Transport},
 };
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
@@ -13,8 +13,6 @@ use felica_packet::{PacketError, PollRequest, PollResponse, Selection};
 pub const MAX_PACKET_BYTES: usize = 254;
 /// Host wait of commands that do not reach a card.
 const READER_WAIT: Duration = Duration::from_secs(1);
-/// Time the RF field stays off so that a card loses its state.
-const FIELD_OFF_SETTLE: Duration = Duration::from_millis(5);
 /// Register write flag in the count byte of command `62`.
 const REGISTER_WRITE: u8 = 0x20;
 /// Largest register count of one `62` command.
@@ -39,6 +37,10 @@ pub enum Error<E> {
     RegisterStatus(u8),
     /// A register write did not hold its value when read back.
     RegisterReadback,
+    /// Explicit RF speed selection is unavailable for this product.
+    UnsupportedBitRateControl(Product),
+    /// The reader rejected the requested RF setting.
+    RfModeStatus(u8),
     /// A FeliCa packet was malformed before it was sent.
     FelicaRequest(PacketError),
     /// A FeliCa reply was malformed. The packet that caused it was sent and
@@ -46,7 +48,8 @@ pub enum Error<E> {
     FelicaResponse(PacketError),
     /// The reader acknowledged the packet but returned no card reply before
     /// the wait elapsed. The card may have received the packet and taken
-    /// effect; the reader remains usable.
+    /// effect. This selection is revoked. Poll again to stop the field and
+    /// select a card on a synchronized stream.
     NoResponse,
     /// Packet exceeds what one `5C` command carries.
     InputLength {
@@ -73,6 +76,10 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
             Self::Response(reason) => write!(f, "malformed reader response: {reason}"),
             Self::RegisterStatus(status) => write!(f, "register command returned {status:02X}"),
             Self::RegisterReadback => f.write_str("register write did not hold"),
+            Self::UnsupportedBitRateControl(product) => {
+                write!(f, "RF speed selection is unavailable for {product:?}")
+            }
+            Self::RfModeStatus(status) => write!(f, "RF mode returned status {status:02X}"),
             Self::FelicaRequest(_) => f.write_str("FeliCa request rejected before sending"),
             Self::FelicaResponse(_) => {
                 f.write_str("FeliCa response failed; the command may have taken effect")
@@ -81,6 +88,24 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
             Self::InputLength { maximum, actual } => {
                 write!(f, "input of {actual} bytes exceeds {maximum}")
             }
+        }
+    }
+}
+
+/// FeliCa RF speed selectable on RC-S310 and RC-S320.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitRate {
+    /// 212 kbps.
+    Kbps212,
+    /// 424 kbps.
+    Kbps424,
+}
+
+impl BitRate {
+    const fn selector(self) -> u8 {
+        match self {
+            Self::Kbps212 => 0x01,
+            Self::Kbps424 => 0x03,
         }
     }
 }
@@ -134,7 +159,7 @@ enum Field {
 #[derive(Debug)]
 enum State {
     NeedsInitialization,
-    Ready(Field),
+    Ready { product: Product, field: Field },
 }
 
 /// Exclusive reader owner. Uncertain transport failures revoke readiness.
@@ -145,7 +170,7 @@ pub struct Reader<T: Transport> {
 }
 
 impl<T: Transport> Reader<T> {
-    /// Own a newly opened transport. Initialization sends no data until requested.
+    /// Own a synchronized transport with no outstanding reader command.
     pub fn new(transport: T) -> Self {
         Self {
             link: Link::new(transport),
@@ -159,7 +184,11 @@ impl<T: Transport> Reader<T> {
             Err(e) => {
                 // A rejected, never-sent request leaves reader and card state
                 // unchanged unless the stream itself already requires recovery.
-                if e.progress != Progress::NotSent || matches!(e.failure, Failure::RecoveryRequired)
+                if e.progress != Progress::NotSent
+                    || matches!(
+                        e.failure,
+                        Failure::RecoveryRequired | Failure::ReconnectRequired
+                    )
                 {
                     self.state = State::NeedsInitialization;
                 }
@@ -169,8 +198,9 @@ impl<T: Transport> Reader<T> {
     }
 
     /// Recover the transport, identify the reader, write the initial register
-    /// values for its variant, and leave the RF field off. Failure leaves the
-    /// reader uninitialized; no command replay.
+    /// values for its variant, and leave the RF field off. RC-S310 and
+    /// RC-S320 are configured for 212 kbps after their register writes.
+    /// Failure leaves the reader uninitialized; no command replay.
     ///
     /// The register values are those that Sony's driver package writes for
     /// the same observations. The RC-S320 family then receives `5A 80`, the
@@ -184,6 +214,8 @@ impl<T: Transport> Reader<T> {
     ///
     /// Rejects an unsupported descriptor before sending any command, and
     /// register observations without known initial values before writing.
+    /// A stream with unconfirmed command completion may require a new
+    /// synchronized connection.
     pub fn initialize(&mut self) -> Result<ReaderInfo, Error<T::Error>> {
         self.state = State::NeedsInitialization;
         let descriptor = self.link.descriptor();
@@ -231,13 +263,57 @@ impl<T: Transport> Reader<T> {
             }
         };
         self.switch_field_off()?;
+        if product.supports_bit_rate_control() {
+            self.apply_bit_rate(BitRate::Kbps212)?;
+        }
         let info = ReaderInfo {
             descriptor,
             product,
             firmware,
         };
-        self.state = State::Ready(Field::Off);
+        self.state = State::Ready {
+            product,
+            field: Field::Off,
+        };
         Ok(info)
+    }
+
+    /// Configure the reader's FeliCa bit rate with the RF field off.
+    ///
+    /// # Errors
+    ///
+    /// Requires an initialized RC-S310 or RC-S320. An unconfirmed speed
+    /// setting requires initialization before further card exchanges.
+    pub fn set_bit_rate(&mut self, rate: BitRate) -> Result<(), Error<T::Error>> {
+        let State::Ready { product, field } = self.state else {
+            return Err(Error::NotInitialized);
+        };
+        if !product.supports_bit_rate_control() {
+            return Err(Error::UnsupportedBitRateControl(product));
+        }
+        if field != Field::Off {
+            self.rf_off()?;
+        }
+        self.state = State::NeedsInitialization;
+        self.apply_bit_rate(rate)?;
+        self.state = State::Ready {
+            product,
+            field: Field::Off,
+        };
+        Ok(())
+    }
+
+    fn apply_bit_rate(&mut self, rate: BitRate) -> Result<(), Error<T::Error>> {
+        // The speed command also establishes RF settings that the initial
+        // register writes can disturb, even at the same speed.
+        match self
+            .command(0x5e, &[rate.selector()], READER_WAIT)?
+            .as_slice()
+        {
+            [0] => Ok(()),
+            [status] => Err(Error::RfModeStatus(*status)),
+            _ => Err(Error::Response("RF mode status length")),
+        }
     }
 
     fn read_registers<const N: usize>(
@@ -284,17 +360,16 @@ impl<T: Transport> Reader<T> {
     }
 
     fn switch_field_off(&mut self) -> Result<(), Error<T::Error>> {
-        match self.command(0x54, &[], READER_WAIT)?.as_slice() {
-            [0] => {}
-            _ => return Err(Error::Response("RF off status")),
+        if let Err(error) = self.link.stop_field() {
+            self.state = State::NeedsInitialization;
+            return Err(Error::Transaction(error));
         }
-        self.link.wait(FIELD_OFF_SETTLE);
         Ok(())
     }
 
     fn field(&mut self) -> Result<&mut Field, Error<T::Error>> {
         match &mut self.state {
-            State::Ready(field) => Ok(field),
+            State::Ready { field, .. } => Ok(field),
             State::NeedsInitialization => Err(Error::NotInitialized),
         }
     }
@@ -322,8 +397,8 @@ impl<T: Transport> Reader<T> {
     ///
     /// # Errors
     ///
-    /// Requires initialization. A malformed polling response requires a field
-    /// cycle before the next selection.
+    /// Requires initialization. An unanswered transaction or malformed polling
+    /// response requires a confirmed RF off before the next selection.
     pub fn poll_felica(
         &mut self,
         request: PollRequest,
@@ -363,17 +438,15 @@ impl<T: Transport> Reader<T> {
                 actual: packet.len(),
             });
         }
-        let response = match self.link.command(0x5c, packet, wait.duration()) {
+        let response = match self.link.command(CARD_EXCHANGE, packet, wait.duration()) {
             Ok(response) => response.data,
             Err(error) if error.is_unanswered() => {
-                if field == Field::Off {
-                    *self.field()? = Field::On;
-                }
+                self.require_field_cycle();
                 return Ok(None);
             }
             Err(error) => {
                 if error.progress != Progress::NotSent
-                    || matches!(error.failure, Failure::RecoveryRequired)
+                    || matches!(error.failure, Failure::ReconnectRequired)
                 {
                     self.state = State::NeedsInitialization;
                 }
@@ -388,7 +461,7 @@ impl<T: Transport> Reader<T> {
     }
 
     fn require_field_cycle(&mut self) {
-        if let State::Ready(field) = &mut self.state {
+        if let State::Ready { field, .. } = &mut self.state {
             *field = Field::CycleRequired;
         }
     }
@@ -398,7 +471,7 @@ impl<T: Transport> Reader<T> {
 ///
 /// [`Selection::exchange_packet`] carries one packet with `5C` and waits as
 /// long as the Polling that selected the card; a missing reply is
-/// [`Error::NoResponse`].
+/// [`Error::NoResponse`] and revokes further exchanges on this selection.
 #[derive(Debug)]
 pub struct FelicaCard<'a, T: Transport> {
     reader: &'a mut Reader<T>,

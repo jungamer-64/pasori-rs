@@ -48,6 +48,8 @@ pub enum Progress {
     Sent,
     /// ACK received; a matching response is still needed.
     Acknowledged,
+    /// Matching reader response received.
+    Completed,
 }
 
 /// Machine-readable failure independent of display text.
@@ -57,8 +59,12 @@ pub enum Failure<E> {
     Frame(FrameError),
     /// OS/device transport failure.
     Io(E),
-    /// A prior failed transaction requires explicit recovery.
+    /// An acknowledged card command requires RF off before reuse.
     RecoveryRequired,
+    /// Completion could not be established. Use a synchronized connection.
+    ReconnectRequired,
+    /// RF off completed without the success response `55 00`.
+    FieldOffResponse(Vec<u8>),
     /// Finite host deadline expired.
     Deadline,
     /// A short host transfer cannot establish command completion.
@@ -125,6 +131,12 @@ impl<E: fmt::Debug> fmt::Display for TransactionError<E> {
             Failure::Frame(_) => f.write_str("invalid frame")?,
             Failure::Io(_) => f.write_str("transport I/O failed")?,
             Failure::RecoveryRequired => f.write_str("stream requires recovery")?,
+            Failure::ReconnectRequired => {
+                f.write_str("stream requires a synchronized connection")?
+            }
+            Failure::FieldOffResponse(data) => {
+                write!(f, "unexpected RF-off response: {data:02X?}")?
+            }
             Failure::Deadline => f.write_str("host deadline expired")?,
             Failure::ShortWrite {
                 requested,
@@ -161,6 +173,7 @@ impl<E: fmt::Debug> fmt::Display for TransactionError<E> {
             Progress::Sending => " while sending",
             Progress::Sent => " before ACK",
             Progress::Acknowledged => " after ACK",
+            Progress::Completed => " after the reader reply",
         })
     }
 }
@@ -187,11 +200,9 @@ pub struct Response {
 /// Owner of a single, serialized command stream.
 ///
 /// The reader answers a command with ACK and then its response; the host
-/// never sends ACK. A command whose response does not arrive before its
-/// deadline leaves the stream unanswered: the reader may still send that
-/// response, so the next transaction first discards cached input and then
-/// accepts only ACK before its own response. Every other failure after the
-/// first write attempt requires [`Link::recover`].
+/// never sends ACK. If an acknowledged `5C` times out, its `5D` can arrive
+/// during a later transaction. Before reuse, [`Link::recover`] must confirm
+/// RF off with the distinct response `55 00`.
 #[derive(Debug)]
 pub struct Link<T: Transport> {
     transport: T,
@@ -201,8 +212,14 @@ pub struct Link<T: Transport> {
 #[derive(Debug, PartialEq, Eq)]
 enum StreamState {
     Ready,
-    RecoveryRequired,
+    CardReplyPending,
+    ReconnectRequired,
 }
+
+pub(crate) const CARD_EXCHANGE: u8 = 0x5c;
+const FIELD_OFF: u8 = 0x54;
+const FIELD_OFF_WAIT: Duration = Duration::from_secs(1);
+const FIELD_OFF_SETTLE: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Deadline(Duration);
@@ -218,7 +235,8 @@ impl Deadline {
 }
 
 impl<T: Transport> Link<T> {
-    /// Take ownership of a newly opened transport without sending data.
+    /// Take ownership of a synchronized transport without sending data.
+    /// The caller must exclude outstanding commands from earlier owners.
     pub fn new(transport: T) -> Self {
         Self {
             transport,
@@ -236,10 +254,9 @@ impl<T: Transport> Link<T> {
     ///
     /// # Errors
     ///
-    /// Rejects `FF`, which has no response command, before sending.
-    /// [`TransactionError::is_unanswered`] failures leave the stream usable;
-    /// every other failure after the first write attempt requires
-    /// [`Link::recover`].
+    /// Rejects `FF` before sending. An acknowledged `5C` deadline requires
+    /// [`Link::recover`]. Other unconfirmed completions require a synchronized
+    /// connection.
     pub fn command(
         &mut self,
         command: u8,
@@ -257,9 +274,10 @@ impl<T: Transport> Link<T> {
             .ok_or(not_sent(Failure::Deadline))?;
         match self.state {
             StreamState::Ready => {}
-            StreamState::RecoveryRequired => return Err(not_sent(Failure::RecoveryRequired)),
+            StreamState::CardReplyPending => return Err(not_sent(Failure::RecoveryRequired)),
+            StreamState::ReconnectRequired => return Err(not_sent(Failure::ReconnectRequired)),
         }
-        match self.transact(&frame, expected, deadline) {
+        match self.transact(&frame, expected, deadline, None) {
             Ok(data) => {
                 self.state = StreamState::Ready;
                 Ok(Response {
@@ -267,17 +285,26 @@ impl<T: Transport> Link<T> {
                     data,
                 })
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if command == CARD_EXCHANGE && error.is_unanswered() {
+                    self.state = StreamState::CardReplyPending;
+                }
+                if error.progress == Progress::Completed {
+                    self.state = StreamState::Ready;
+                }
+                Err(error)
+            }
         }
     }
 
-    /// Run one admitted transaction. The stream stays in `RecoveryRequired`
+    /// Run one admitted transaction. The stream stays in `ReconnectRequired`
     /// from the first write until the caller publishes the next state.
     fn transact(
         &mut self,
         frame: &[u8],
         expected: u8,
         deadline: Deadline,
+        mut late_response: Option<u8>,
     ) -> Result<Vec<u8>, TransactionError<T::Error>> {
         let remaining = deadline
             .remaining(self.transport.monotonic_time())
@@ -294,8 +321,25 @@ impl<T: Transport> Link<T> {
                     progress = Progress::Acknowledged;
                     continue;
                 }
-                Ok(Frame::Nak) => Failure::Nak,
-                Ok(Frame::ReaderError) => Failure::ReaderError,
+                Ok(Frame::Nak) if progress == Progress::Sent && pending.is_empty() => {
+                    return Err(TransactionError {
+                        progress: Progress::Completed,
+                        failure: Failure::Nak,
+                    });
+                }
+                Ok(Frame::ReaderError) if progress == Progress::Acknowledged => {
+                    if pending.is_empty() {
+                        return Err(TransactionError {
+                            progress: Progress::Completed,
+                            failure: Failure::ReaderError,
+                        });
+                    }
+                    Failure::TrailingData
+                }
+                Ok(Frame::Data { command, .. }) if late_response == Some(command) => {
+                    late_response = None;
+                    continue;
+                }
                 Ok(Frame::Data {
                     command: actual,
                     data,
@@ -308,7 +352,9 @@ impl<T: Transport> Link<T> {
                         return Ok(data.to_vec());
                     }
                 }
-                Ok(Frame::Ack | Frame::Data { .. }) => Failure::UnexpectedFrame,
+                Ok(Frame::Ack | Frame::Nak | Frame::ReaderError | Frame::Data { .. }) => {
+                    Failure::UnexpectedFrame
+                }
             };
             return Err(TransactionError { progress, failure });
         }
@@ -321,7 +367,7 @@ impl<T: Transport> Link<T> {
         frame: &[u8],
         timeout: Duration,
     ) -> Result<(), TransactionError<T::Error>> {
-        self.state = StreamState::RecoveryRequired;
+        self.state = StreamState::ReconnectRequired;
         let sending = |failure| TransactionError {
             progress: Progress::Sending,
             failure,
@@ -343,25 +389,63 @@ impl<T: Transport> Link<T> {
         }
     }
 
-    /// Recover the transport, then admit commands again. This
-    /// never cancels a reader command or determines whether a preceding card
-    /// operation executed.
+    /// Discard cached input on a synchronized stream. After an acknowledged
+    /// card-command deadline, confirm RF off and discard remaining input.
+    /// The preceding card command may already have taken effect.
     ///
     /// # Errors
     ///
-    /// A transport failure leaves the link requiring recovery.
+    /// An unconfirmed RF-off transaction or a failed final drain requires a
+    /// synchronized connection before further use.
     pub fn recover(&mut self) -> Result<(), TransactionError<T::Error>> {
-        if self.state != StreamState::Ready {
-            return Err(not_sent(Failure::RecoveryRequired));
+        match self.state {
+            StreamState::Ready => self
+                .transport
+                .recover()
+                .map_err(|e| not_sent(Failure::Io(e))),
+            StreamState::CardReplyPending => self.stop_field(),
+            StreamState::ReconnectRequired => Err(not_sent(Failure::ReconnectRequired)),
         }
-        self.transport
-            .recover()
-            .map_err(|e| not_sent(Failure::Io(e)))?;
-        Ok(())
     }
 
-    pub(crate) fn wait(&mut self, duration: Duration) {
-        self.transport.wait(duration);
+    pub(crate) fn stop_field(&mut self) -> Result<(), TransactionError<T::Error>> {
+        let recovering = match self.state {
+            StreamState::Ready => false,
+            StreamState::CardReplyPending => true,
+            StreamState::ReconnectRequired => return Err(not_sent(Failure::ReconnectRequired)),
+        };
+        if recovering {
+            self.transport
+                .recover()
+                .map_err(|e| not_sent(Failure::Io(e)))?;
+        }
+        let frame = wire::encode(FIELD_OFF, &[]).map_err(|e| not_sent(Failure::Frame(e)))?;
+        let deadline = Deadline::after(self.transport.monotonic_time(), FIELD_OFF_WAIT)
+            .ok_or(not_sent(Failure::Deadline))?;
+        let data = self.transact(
+            &frame,
+            FIELD_OFF + 1,
+            deadline,
+            recovering.then_some(CARD_EXCHANGE + 1),
+        )?;
+        if data != [0] {
+            if !recovering {
+                self.state = StreamState::Ready;
+            }
+            return Err(TransactionError {
+                progress: Progress::Completed,
+                failure: Failure::FieldOffResponse(data),
+            });
+        }
+        self.transport.wait(FIELD_OFF_SETTLE);
+        if recovering {
+            self.transport.recover().map_err(|e| TransactionError {
+                progress: Progress::Completed,
+                failure: Failure::Io(e),
+            })?;
+        }
+        self.state = StreamState::Ready;
+        Ok(())
     }
 }
 

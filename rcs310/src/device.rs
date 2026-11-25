@@ -35,6 +35,12 @@ pub enum Product {
     Rcs600,
 }
 
+impl Product {
+    pub(crate) const fn supports_bit_rate_control(self) -> bool {
+        matches!(self, Self::Rcs310 | Self::Rcs320)
+    }
+}
+
 /// Reader family selected from the descriptor before any command is sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Family {

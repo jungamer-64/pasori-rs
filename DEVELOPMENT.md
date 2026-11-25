@@ -41,11 +41,11 @@ cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p port4
 
 どの操作も自動で再送しない。例外は FALP の再送で、protocol 自体が順序番号で重複を排除する欠落 block の再要求と、応答のない送信切替 block の再送だけを行う。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みの progress を error に残す。transport 失敗後には RF readiness が失効する。reader への `initialize` は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 
-`rcs956` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。`port100` の回復では受信済み bytes を捨て、host ACK で未完了 command を中断し、もう一度受信済み bytes を捨ててから command を許可する。`rcs310` には command を中断する手段がなく、回復は受信済み bytes を捨てるだけである。この 2 つのリーダーは CLEAR_FEATURE(ENDPOINT_HALT) で data toggle を戻さないため、`Transport` の実装は stall していない endpoint を回復で reset しない。いずれでも、中断前のカード操作の結果不明は caller に残る。
+`rcs956` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。`port100` の回復では受信済み bytes を捨て、host ACK で未完了 command を中断し、もう一度受信済み bytes を捨ててから command を許可する。`port100` と `rcs310` の `Transport` は stall していない endpoint を回復で reset しない。該当機器は CLEAR_FEATURE(ENDPOINT_HALT) で data toggle を戻さないためである。中断前のカード操作の結果不明は caller に残る。
 
 `port400` は CCID の最終応答を照合できなければ接続を失効させる。呼出側は同期が確立した接続から reader を作り直す。照合済みの機器応答が Transparent Session の順序エラーを示した場合は、`finish` または `initialize` でセッションを明示的に整理できる。
 
-`rcs310` のリーダーは ACK の後に応答を返さないことがある。その取引は失敗として返すが stream は使える状態に残し、遅れて届く応答に備えて、次の取引は受信済み bytes を捨ててから送り、ACK より前の frame を拒否する。
+`rcs310` は ACK 後に `5C` が待ち切れた場合、カード選択を失効させる。次の選択は `54` の応答 `55 00` で RF 停止を確認し、受信済み bytes を破棄してから始める。応答を照合できず再同期できない場合は、同期を確立した接続から reader を作り直す。
 
 `rf_off` や `finish` の失敗は caller が観測する。Drop は OS resource の解放だけを担当する。
 

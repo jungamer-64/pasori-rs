@@ -5,7 +5,7 @@
 use felica_packet::{Idm, PacketError, PollRequest, Selection};
 use rcs310::{
     device::{Descriptor, Product, Variant},
-    reader::{Error, MAX_PACKET_BYTES, Reader},
+    reader::{BitRate, Error, MAX_PACKET_BYTES, Reader},
     transport::{Failure, Progress},
 };
 use reader_script::rcs310::{
@@ -102,6 +102,7 @@ fn initializes_an_rcs310_by_release_without_5a() -> TestResult {
         command(0x62, &[1, 0x82], &[0, 0x28]),
         command(0x62, &[&[0x29][..], &RCS310_0121].concat(), &[0]),
         command(0x54, &[], &[0]),
+        command(0x5e, &[0x01], &[0]),
     ];
     let (transport, journal) = Script::new(rcs310(0x0121, 0), steps);
     let mut reader = Reader::new(transport);
@@ -188,38 +189,113 @@ fn polls_and_exchanges_packets_at_the_polling_wait() -> TestResult {
 
 #[test]
 fn an_unanswered_polling_selects_nothing_and_discards_a_late_reply() -> TestResult {
+    let mut stale = polling_reply();
+    stale[2] = 0xab;
     let (mut reader, journal) = initialized(vec![
         Step {
             command: 0x5c,
             args: WILDCARD_POLLING.to_vec(),
-            answer: Answer::UnansweredThenLate(polling_reply()),
+            answer: Answer::UnansweredThenLate(stale),
         },
+        command(0x54, &[], &[0]),
         command(0x5c, &WILDCARD_POLLING, &polling_reply()),
     ])?;
     let wait = wait().ok_or("wait")?;
     assert!(reader.poll_felica(wildcard()?, wait)?.is_none());
     let recoveries = journal.borrow().recoveries;
-    assert!(reader.poll_felica(wildcard()?, wait)?.is_some());
-    assert_eq!(journal.borrow().recoveries, recoveries + 1);
+    let card = reader
+        .poll_felica(wildcard()?, wait)?
+        .ok_or("card absent")?;
+    assert_eq!(card.poll_response().idm, Idm::new(IDENTITY));
+    assert_eq!(journal.borrow().recoveries, recoveries + 2);
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
 
 #[test]
-fn a_missing_card_reply_keeps_the_reader_usable() -> TestResult {
+fn a_missing_card_reply_revokes_the_selection_until_polling() -> TestResult {
     let (mut reader, journal) = initialized(vec![
         command(0x5c, &WILDCARD_POLLING, &polling_reply()),
         unanswered(0x5c, &read_request()),
+        command(0x54, &[], &[0]),
+        command(0x5c, &WILDCARD_POLLING, &polling_reply()),
         command(0x5c, &read_request(), &read_reply()),
     ])?;
+    let wait = wait().ok_or("wait")?;
+    {
+        let mut card = reader
+            .poll_felica(wildcard()?, wait)?
+            .ok_or("card absent")?;
+        assert!(matches!(
+            card.exchange_packet(&read_request()),
+            Err(Error::NoResponse)
+        ));
+        assert!(matches!(
+            card.exchange_packet(&read_request()),
+            Err(Error::Transaction(error))
+                if error.progress == Progress::NotSent
+                    && matches!(error.failure, Failure::RecoveryRequired)
+        ));
+    }
     let mut card = reader
-        .poll_felica(wildcard()?, wait().ok_or("wait")?)?
+        .poll_felica(wildcard()?, wait)?
         .ok_or("card absent")?;
-    assert!(matches!(
-        card.exchange_packet(&read_request()),
-        Err(Error::NoResponse)
-    ));
     assert_eq!(card.exchange_packet(&read_request())?, read_reply());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_missing_rf_off_reply_blocks_reuse_of_the_connection() -> TestResult {
+    let (mut reader, journal) = initialized(vec![
+        unanswered(0x5c, &WILDCARD_POLLING),
+        unanswered(0x54, &[]),
+    ])?;
+    let wait = wait().ok_or("wait")?;
+    assert!(reader.poll_felica(wildcard()?, wait)?.is_none());
+    assert!(matches!(
+        reader.poll_felica(wildcard()?, wait),
+        Err(Error::Transaction(error))
+            if error.progress == Progress::Acknowledged
+                && matches!(error.failure, Failure::Deadline)
+    ));
+    assert!(matches!(
+        reader.initialize(),
+        Err(Error::Transaction(error))
+            if error.progress == Progress::NotSent
+                && matches!(error.failure, Failure::ReconnectRequired)
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn changes_to_424_kbps_with_the_field_off() -> TestResult {
+    let (mut reader, journal) = initialized(vec![
+        command(0x5c, &WILDCARD_POLLING, &polling_reply()),
+        command(0x54, &[], &[0]),
+        command(0x5e, &[0x03], &[0]),
+        command(0x5c, &WILDCARD_POLLING, &polling_reply()),
+    ])?;
+    let wait = wait().ok_or("wait")?;
+    assert!(reader.poll_felica(wildcard()?, wait)?.is_some());
+    reader.set_bit_rate(BitRate::Kbps424)?;
+    assert!(reader.poll_felica(wildcard()?, wait)?.is_some());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn rejected_rf_setting_revokes_reader_readiness() -> TestResult {
+    let (mut reader, journal) = initialized(vec![command(0x5e, &[0x03], &[0xff])])?;
+    assert!(matches!(
+        reader.set_bit_rate(BitRate::Kbps424),
+        Err(Error::RfModeStatus(0xff))
+    ));
+    assert!(matches!(
+        reader.poll_felica(wildcard()?, wait().ok_or("wait")?),
+        Err(Error::NotInitialized)
+    ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -279,7 +355,7 @@ fn a_reader_error_requires_initialization() -> TestResult {
     let Err(Error::Transaction(error)) = reader.poll_felica(wildcard()?, wait) else {
         return Err("reader error frame accepted".into());
     };
-    assert_eq!(error.progress, Progress::Acknowledged);
+    assert_eq!(error.progress, Progress::Completed);
     assert!(matches!(error.failure, Failure::<io::Error>::ReaderError));
     assert!(error.source().is_none());
     assert!(matches!(
