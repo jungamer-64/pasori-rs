@@ -5,6 +5,7 @@
 //! scripts model command and response contracts, not physical device timing.
 
 pub mod port100;
+pub mod port110;
 pub mod port400;
 pub mod rcs310;
 pub mod rcs956;

@@ -2,7 +2,8 @@
 //!
 //! The reader layers activate targets and transfer frames. [`rcs956`] serves
 //! RC-S956 readers, [`rcs310`] serves the FeliCa-only RC-S310 and RC-S320,
-//! and [`port100`] and [`port400`] serve their respective reader families.
+//! [`port100`] and [`port400`] serve their respective USB reader families,
+//! and [`port110`] serves Port-110 readers over Bluetooth LE.
 //! This crate runs the card command protocols over those transfers. Its
 //! FeliCa protocols accept any [`felica_packet::Selection`].
 #![no_std]
@@ -16,6 +17,7 @@ extern crate std;
 pub use felica_packet;
 pub use iso14443;
 pub use port100;
+pub use port110;
 pub use port400;
 pub use rcs310;
 pub use rcs956;
