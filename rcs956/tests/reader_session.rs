@@ -717,7 +717,7 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
         command(0x92, &[0x46, 0x66, 0x6d], &[0]),
         command(0x86, &[], &[0xc0, 0x12, 0x11]),
         command(0x86, &[], &[0, 0x22]),
-        command(0x94, &[0x12; 60], &[0]),
+        command(0x94, &[0x12; 252], &[0]),
         command(0x8e, &[0x12; 2], &[0]),
         command(0x86, &[], &[0x40, 0x44]),
         command(0x86, &[], &[0x01]),
@@ -736,7 +736,7 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
             request.respond(&[0; MAX_DEP_MESSAGE_BYTES + 1]),
             Err(DepError::MessageLength(_))
         ));
-        request.respond(&[0x12; 61])?;
+        request.respond(&[0x12; 253])?;
         assert!(matches!(
             request.respond(&[0x33]),
             Err(DepError::SessionUnavailable)
@@ -940,7 +940,7 @@ fn dep_initiator_uses_meta_chaining_and_retains_partial_failure() -> Result<(), 
     let configuration = ab_config_image();
     let mut steps = initialization(&configuration);
     let mut first = vec![0x41, 0x31];
-    first.extend([0xa5; 59]);
+    first.extend([0xa5; 251]);
     steps.extend([
         command(0x12, &[0x1d], &[]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
@@ -970,7 +970,7 @@ fn dep_initiator_uses_meta_chaining_and_retains_partial_failure() -> Result<(), 
         timeout()?,
     )?;
     assert_eq!(link.peer().general_bytes, b"F");
-    let reply = link.exchange(&[0xa5; 61])?;
+    let reply = link.exchange(&[0xa5; 253])?;
     assert_eq!(reply.node_address, Some(0x31));
     assert_eq!(reply.payload, [0xab, 0xcd]);
     assert!(matches!(
@@ -984,6 +984,63 @@ fn dep_initiator_uses_meta_chaining_and_retains_partial_failure() -> Result<(), 
         link.exchange(&[]),
         Err(DepError::SessionUnavailable)
     ));
+    link.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn dep_initiator_transfers_252_byte_groups_in_both_directions() -> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    let mut steps = initialization(&configuration);
+    steps.extend([
+        command(0x12, &[0x1c], &[]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x32, &[5, 0, 0, 0], &[]),
+        command(
+            0x56,
+            &[1, 1, 0],
+            &[0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 8, 0],
+        ),
+    ]);
+    let mut outgoing = Vec::new();
+    let mut incoming = Vec::new();
+    for index in 0..8 {
+        let mut fragment = vec![0x41];
+        fragment.extend([index; 252]);
+        steps.push(command(0x40, &fragment, &[0]));
+        outgoing.extend([index; 252]);
+    }
+    let mut tail = vec![0x01];
+    tail.extend([8; 32]);
+    outgoing.extend([8; 32]);
+    for index in 0..8 {
+        let mut response = vec![0x40];
+        response.extend([0xa0 + index; 252]);
+        let command_data = if index == 0 { tail.as_slice() } else { &[1] };
+        steps.push(command(0x40, command_data, &response));
+        incoming.extend([0xa0 + index; 252]);
+    }
+    let mut response = vec![0];
+    response.extend([0xa8; 32]);
+    steps.push(command(0x40, &[1], &response));
+    steps.push(command(0x40, &[1, 0x77], &[0, 0xaa]));
+    incoming.extend([0xa8; 32]);
+    steps.extend(initialization(&configuration));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    let mut link = reader.activate_dep(
+        DepActivation {
+            mode: DepMode::Active,
+            rate: DepRate::Kbps212,
+            nfcid3: None,
+            general_bytes: &[],
+            node_address: None,
+        },
+        timeout()?,
+    )?;
+    assert_eq!(link.exchange(&outgoing)?.payload, incoming);
+    assert_eq!(link.exchange(&[0x77])?.payload, [0xaa]);
     link.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())

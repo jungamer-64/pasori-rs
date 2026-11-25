@@ -5,13 +5,15 @@ use core::{fmt, time::Duration};
 
 const SETUP_WAIT: Duration = Duration::from_secs(1);
 const RESPONSE_WAIT_INDEX: u8 = 8;
-const DEP_CHUNK_BYTES: usize = 60;
+/// Firmware data bytes per submission, including the first NAD when present.
+const DEP_CHUNK_BYTES: usize = 252;
 const MORE_INFORMATION: u8 = 0x40;
 const NAD_PRESENT: u8 = 0x80;
 const MAX_FRAGMENTS: usize = 256;
 
-/// Maximum application bytes in one chained request or response.
-pub const MAX_DEP_MESSAGE_BYTES: usize = (DEP_CHUNK_BYTES - 1) * MAX_FRAGMENTS;
+/// Maximum application bytes the library admits in one chained request or
+/// response, independent of how each direction divides it into fragments.
+pub const MAX_DEP_MESSAGE_BYTES: usize = 15_104;
 
 /// NFC-DEP activation rate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
