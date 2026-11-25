@@ -1,8 +1,10 @@
 //! FeliCa protocols over an RC-S320 reader, with independent response construction.
 
-use felica_packet::PollRequest;
+use felica_packet::{PollRequest, PollResponse, Selection};
 use pasori::{
-    felica::{self, BlockAddress, BlockWrite, Card, CardError, V2KeyVersions},
+    felica::{
+        self, BlockAddress, BlockWrite, Card, CardError, V2KeyVersions, ValueLimitedPurseProperty,
+    },
     ndef::{TYPE3_POLLING, Type3Tag},
 };
 use rcs310::reader::{Error as ReaderError, Reader};
@@ -92,8 +94,8 @@ fn standard_queries_decode_versions_and_mac_properties() -> Result<(), Box<dyn E
             0x5c,
             &[12, 0x3c, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0],
             &[
-                26, 0x3d, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0x85, 5, 0, 0x81, 0, 0, 0, 0, 0, 0,
-                0x01, 0x81,
+                26, 0x3d, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0x85, 5, 0, 0x81, 0, 0, 0, 0, 0x23,
+                0x81, 0x01, 0x81,
             ],
         ),
         command(
@@ -145,7 +147,9 @@ fn standard_queries_decode_versions_and_mac_properties() -> Result<(), Box<dyn E
     );
     let specification = card.request_specification_version()?;
     assert_eq!(specification.basic, 0x8500);
-    assert_eq!(specification.options, [0x8100, 0, 0, 0, 0x8101]);
+    assert_eq!(specification.options, [0x8100, 0, 0, 0x8123, 0x8101]);
+    assert_eq!(specification.value_limited_purse_version(), Some(0x8123));
+    assert_eq!(specification.mac_communication_version(), Some(0x8101));
     assert_eq!(card.mac_service_properties(&[0x09, 0x49])?, [false, true]);
     Ok(())
 }
@@ -203,6 +207,254 @@ fn standard_queries_reject_wrong_identity_count_status_and_length() -> Result<()
         card.request_service_v2(&[0x0a]),
         Err(felica::Error::Response(CardError::CryptoIdentifier(0x20)))
     ));
+    Ok(())
+}
+
+#[test]
+fn specification_version_preserves_unrecognized_and_missing_options() -> Result<(), Box<dyn Error>>
+{
+    let request = &[12, 0x3c, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0];
+    let mut reader = reader(vec![
+        command(0x5c, &[6, 0, 0xff, 0xff, 0, 0], &polling_reply()),
+        command(
+            0x5c,
+            request,
+            &[16, 0x3d, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0x85, 0],
+        ),
+        command(
+            0x5c,
+            request,
+            &[
+                26, 0x3d, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0x85, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0x80,
+            ],
+        ),
+        command(
+            0x5c,
+            request,
+            &[
+                26, 0x3d, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0x85, 5, 0, 0, 0, 0, 0, 0, 1, 0x91,
+                0xaf, 0x81,
+            ],
+        ),
+    ])?;
+    let mut card = Card::new(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, wait().ok_or("wait")?)?
+            .ok_or("card absent")?,
+    );
+    for options in [&[][..], &[0, 0, 0, 0, 0x8000], &[0, 0, 0, 0x9101, 0x81af]] {
+        let version = card.request_specification_version()?;
+        assert_eq!(version.options, options);
+        assert_eq!(version.value_limited_purse_version(), None);
+        assert_eq!(version.mac_communication_version(), None);
+    }
+    Ok(())
+}
+
+#[test]
+fn value_limited_purse_properties_follow_service_order() -> Result<(), Box<dyn Error>> {
+    let mut reader = reader(vec![
+        command(0x5c, &[6, 0, 0xff, 0xff, 0, 0], &polling_reply()),
+        command(
+            0x5c,
+            &[
+                18, 0x28, 1, 2, 3, 4, 5, 6, 7, 8, 0, 3, 0x11, 1, 0x15, 2, 0x17, 3,
+            ],
+            &[
+                43, 0x29, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 3, 1, 0xff, 0xff, 0xff, 0x7f, 0, 0, 0,
+                0x80, 0xff, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 0x34, 0x12,
+                0, 0, 0xd2, 0xff, 0xff, 0xff, 2,
+            ],
+        ),
+    ])?;
+    let mut card = Card::new(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, wait().ok_or("wait")?)?
+            .ok_or("card absent")?,
+    );
+    assert_eq!(
+        card.value_limited_purse_properties(&[0x0111, 0x0215, 0x0317])?,
+        [
+            ValueLimitedPurseProperty::Enabled {
+                upper_limit: i32::MAX,
+                lower_limit: i32::MIN,
+                generation: 0xff,
+            },
+            ValueLimitedPurseProperty::Disabled,
+            ValueLimitedPurseProperty::Enabled {
+                upper_limit: 0x1234,
+                lower_limit: -46,
+                generation: 2,
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn value_limited_purse_admits_at_most_sixteen_requests() -> Result<(), Box<dyn Error>> {
+    let mut request = vec![44, 0x28, 1, 2, 3, 4, 5, 6, 7, 8, 0, 16];
+    let mut reply = vec![173, 0x29, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 16];
+    for _ in 0..16 {
+        request.extend([0x11, 1]);
+        reply.extend([0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    }
+    let mut reader = reader(vec![
+        command(0x5c, &[6, 0, 0xff, 0xff, 0, 0], &polling_reply()),
+        command(0x5c, &request, &reply),
+    ])?;
+    let mut card = Card::new(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, wait().ok_or("wait")?)?
+            .ok_or("card absent")?,
+    );
+    let services = [0x0111; 17];
+    for actual in [0, 17] {
+        assert!(matches!(
+            card.value_limited_purse_properties(&services[..actual]),
+            Err(felica::Error::Request(CardError::CodeCount { maximum: 16, actual: count }))
+                if count == actual
+        ));
+    }
+    assert_eq!(
+        card.value_limited_purse_properties(&services[..16])?,
+        [ValueLimitedPurseProperty::Disabled; 16]
+    );
+    Ok(())
+}
+
+#[test]
+fn value_limited_purse_checks_reply_before_exchanging() -> Result<(), Box<dyn Error>> {
+    struct LimitedSelection {
+        request: PollRequest,
+        response: PollResponse,
+        exchanges: usize,
+    }
+
+    impl Selection for LimitedSelection {
+        type Error = &'static str;
+
+        fn poll_request(&self) -> PollRequest {
+            self.request
+        }
+
+        fn poll_response(&self) -> &PollResponse {
+            &self.response
+        }
+
+        fn max_packet_len(&self) -> usize {
+            22
+        }
+
+        fn exchange_packet(&mut self, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            self.exchanges += 1;
+            Err("unexpected exchange")
+        }
+
+        fn require_field_cycle(&mut self) {}
+    }
+
+    let mut card = Card::new(LimitedSelection {
+        request: PollRequest::new(0xffff, 0, 0)?,
+        response: PollResponse::parse(&polling_reply())?,
+        exchanges: 0,
+    });
+    assert!(matches!(
+        card.value_limited_purse_properties(&[0x0111]),
+        Err(felica::Error::Request(CardError::PacketBudget {
+            maximum: 22,
+            required: 23
+        }))
+    ));
+    assert_eq!(card.selection().exchanges, 0);
+    Ok(())
+}
+
+#[test]
+fn value_limited_purse_rejects_malformed_replies() -> Result<(), Box<dyn Error>> {
+    let request = &[14, 0x28, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 0x11, 1];
+    let mut enabled = vec![
+        23, 0x29, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let mut other_card = enabled.clone();
+    other_card[2] = 0xff;
+    let mut wrong_command = enabled.clone();
+    wrong_command[1] = 0x2b;
+    let mut truncated = enabled[..22].to_vec();
+    truncated[0] = 22;
+    let mut extra = enabled.clone();
+    extra[0] = 24;
+    extra.push(0);
+    let mut wrong_count = enabled.clone();
+    wrong_count[12] = 2;
+    let mut unknown_flag = enabled.clone();
+    unknown_flag[13] = 2;
+    enabled[13] = 0;
+    let replies = [
+        (
+            other_card,
+            CardError::IdentityMismatch {
+                expected: felica_packet::Idm::new(IDENTITY),
+                actual: felica_packet::Idm::new([0xff, 2, 3, 4, 5, 6, 7, 8]),
+            },
+        ),
+        (
+            wrong_command,
+            CardError::ResponseCode {
+                expected: 0x29,
+                actual: 0x2b,
+            },
+        ),
+        (
+            vec![12, 0x29, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0xa2],
+            CardError::Status {
+                flag1: 1,
+                flag2: 0xa2,
+            },
+        ),
+        (
+            wrong_count,
+            CardError::ResponseCount {
+                expected: 1,
+                actual: 2,
+            },
+        ),
+        (
+            truncated,
+            CardError::Length {
+                expected: 23,
+                actual: 22,
+            },
+        ),
+        (
+            extra,
+            CardError::Length {
+                expected: 23,
+                actual: 24,
+            },
+        ),
+        (unknown_flag, CardError::PursePropertyFlag(2)),
+        (enabled, CardError::PursePropertyDisabledFields),
+    ];
+    let mut steps = vec![command(0x5c, &[6, 0, 0xff, 0xff, 0, 0], &polling_reply())];
+    steps.extend(
+        replies
+            .iter()
+            .map(|(reply, _)| command(0x5c, request, reply)),
+    );
+    let mut reader = reader(steps)?;
+    let mut card = Card::new(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, wait().ok_or("wait")?)?
+            .ok_or("card absent")?,
+    );
+    for (_, expected) in replies {
+        assert!(matches!(
+            card.value_limited_purse_properties(&[0x0111]),
+            Err(felica::Error::Response(actual)) if actual == expected
+        ));
+    }
     Ok(())
 }
 

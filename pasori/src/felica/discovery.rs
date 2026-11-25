@@ -40,6 +40,65 @@ pub struct SpecificationVersion {
     pub options: Vec<u16>,
 }
 
+impl SpecificationVersion {
+    /// The advertised nonzero value-limited purse option version, including the format nibble.
+    /// `None` means no valid nonzero version was reported for this option.
+    pub fn value_limited_purse_version(&self) -> Option<u16> {
+        self.option_version(3)
+    }
+
+    /// The advertised nonzero MAC communication option version, including the format nibble.
+    /// `None` means no valid nonzero version was reported for this option. Use
+    /// [`Card::mac_service_properties`] to check whether an individual service has it enabled.
+    pub fn mac_communication_version(&self) -> Option<u16> {
+        self.option_version(4)
+    }
+
+    fn option_version(&self, index: usize) -> Option<u16> {
+        let &word = self.options.get(index)?;
+        let [low, high] = word.to_le_bytes();
+        let digits = [high & 0x0f, low >> 4, low & 0x0f];
+        (high >> 4 == 8 && word != 0x8000 && digits.into_iter().all(|digit| digit <= 9))
+            .then_some(word)
+    }
+}
+
+/// Value-limited purse properties reported by the selected card for a service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueLimitedPurseProperty {
+    /// The service has the value-limited purse option disabled.
+    Disabled,
+    /// The service has the option enabled. For an overlap service, the
+    /// effective limits come from its destination service.
+    Enabled {
+        /// Upper value reported by the card.
+        upper_limit: i32,
+        /// Lower value reported by the card.
+        lower_limit: i32,
+        /// Generation reported by the card for the limit configuration.
+        generation: u8,
+    },
+}
+
+impl ValueLimitedPurseProperty {
+    fn parse(record: &[u8; 10]) -> Result<Self, CardError> {
+        let &[flag, fields @ ..] = record;
+        match flag {
+            0 if fields == [0xff; 9] => Ok(Self::Disabled),
+            0 => Err(CardError::PursePropertyDisabledFields),
+            1 => {
+                let [u0, u1, u2, u3, l0, l1, l2, l3, generation] = fields;
+                Ok(Self::Enabled {
+                    upper_limit: i32::from_le_bytes([u0, u1, u2, u3]),
+                    lower_limit: i32::from_le_bytes([l0, l1, l2, l3]),
+                    generation,
+                })
+            }
+            other => Err(CardError::PursePropertyFlag(other)),
+        }
+    }
+}
+
 impl<S: Selection> Card<S> {
     /// Request key versions for 1 to 32 nodes in the selected system.
     /// Use `0xffff` to address the system key. A dual-capable card reports
@@ -108,24 +167,52 @@ impl<S: Selection> Card<S> {
     }
 
     /// Query the SD2 MAC communication enable flag of each requested service.
-    /// Returns flags in request order. Availability depends on the card.
+    /// Takes 1 to 16 service codes and returns flags in request order.
+    /// Availability depends on the card.
     pub fn mac_service_properties(
         &mut self,
         services: &[u16],
     ) -> Result<Vec<bool>, Error<S::Error>> {
-        let mut parameters = Vec::from([1]);
+        self.node_properties(0x01, services, |&[flag]| match flag {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(CardError::MacProperty(other)),
+        })
+    }
+
+    /// Query the value-limited purse property of each requested service.
+    /// Takes 1 to 16 service codes and returns properties in request order.
+    /// Availability depends on the card.
+    pub fn value_limited_purse_properties(
+        &mut self,
+        services: &[u16],
+    ) -> Result<Vec<ValueLimitedPurseProperty>, Error<S::Error>> {
+        self.node_properties(0x00, services, ValueLimitedPurseProperty::parse)
+    }
+
+    fn node_properties<T, const WIDTH: usize>(
+        &mut self,
+        selector: u8,
+        services: &[u16],
+        decode: impl FnMut(&[u8; WIDTH]) -> Result<T, CardError>,
+    ) -> Result<Vec<T>, Error<S::Error>> {
+        let mut parameters = Vec::from([selector]);
         append_codes(&mut parameters, services, 16).map_err(Error::Request)?;
+        // Length, response code, IDm, both status flags, and node count.
+        const HEADER_LEN: usize = 13;
+        admit_packet(self.selection(), HEADER_LEN + WIDTH * services.len())
+            .map_err(Error::Request)?;
         let body = self.exchange_command(0x28, &parameters, 0x29)?;
         let body = success_payload(&body).map_err(Error::Response)?;
-        counted_items(body, services.len(), 1, 12)
-            .map_err(Error::Response)?
+        let entries =
+            counted_items(body, services.len(), WIDTH, HEADER_LEN - 1).map_err(Error::Response)?;
+        entries
+            .as_chunks::<WIDTH>()
+            .0
             .iter()
-            .map(|flag| match *flag {
-                0 => Ok(false),
-                1 => Ok(true),
-                other => Err(Error::Response(CardError::MacProperty(other))),
-            })
-            .collect()
+            .map(decode)
+            .collect::<Result<_, _>>()
+            .map_err(Error::Response)
     }
 
     /// Request Mode0 and check the addressed card's status. An authenticated

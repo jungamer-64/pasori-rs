@@ -7,7 +7,7 @@ use core::fmt;
 use felica_packet::{Idm, Selection};
 
 mod discovery;
-pub use discovery::{KeyVersion, SpecificationVersion, V2KeyVersions};
+pub use discovery::{KeyVersion, SpecificationVersion, V2KeyVersions, ValueLimitedPurseProperty};
 
 #[cfg(feature = "felica-lite-s")]
 pub mod lite_s;
@@ -76,6 +76,10 @@ pub enum CardError {
     SpecificationFormat(u8),
     /// An enabled/disabled MAC communication flag had a different value.
     MacProperty(u8),
+    /// The value-limited purse enable flag was neither `0x00` nor `0x01`.
+    PursePropertyFlag(u8),
+    /// A disabled value-limited purse did not return all `0xff` in its remaining fields.
+    PursePropertyDisabledFields,
     /// A response belongs to a different selected identity.
     IdentityMismatch {
         /// Identity selected by the caller.
@@ -135,6 +139,10 @@ impl fmt::Display for CardError {
                 write!(f, "unsupported specification response format {value:02X}")
             }
             Self::MacProperty(value) => write!(f, "invalid MAC property {value:02X}"),
+            Self::PursePropertyFlag(value) => write!(f, "invalid purse property flag {value:02X}"),
+            Self::PursePropertyDisabledFields => {
+                f.write_str("disabled purse property fields are not all FF")
+            }
             Self::IdentityMismatch { expected, actual } => {
                 write!(f, "card identity {actual}, expected {expected}")
             }
