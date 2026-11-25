@@ -14,6 +14,8 @@ use std::error::Error as StdError;
 
 const POLL: [u8; 6] = [6, 0, 0xff, 0xff, 0, 0];
 const POLLED: [u8; 18] = [18, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2, 3, 4, 5, 6, 7];
+const SET_212: [u8; 12] = [0xff, 0x50, 0, 0, 6, 0xff, 0x6e, 3, 5, 1, 0x89, 0];
+const SET_424: [u8; 12] = [0xff, 0x50, 0, 0, 6, 0xff, 0x6e, 3, 5, 1, 0x92, 0];
 
 fn response_wait() -> Result<ResponseWait, Box<dyn StdError>> {
     ResponseWait::new(Duration::from_micros(u64::from(WAIT_US)))
@@ -313,6 +315,100 @@ fn polling_uses_the_last_icc_response_object() -> Result<(), Box<dyn StdError>> 
         card.exchange_packet(&packet),
         Err(Error::DeviceApdu(ApduError::DuplicateTag(0x97)))
     ));
+    assert!(reader.into_transport().is_exhausted());
+    Ok(())
+}
+
+#[test]
+fn negotiates_424_after_polling_and_restores_212_before_the_next_poll()
+-> Result<(), Box<dyn StdError>> {
+    let poll = [6, 0, 0xff, 0xff, 2, 0];
+    let mut capable = [0; 20];
+    capable[..18].copy_from_slice(&POLLED);
+    capable[0] = 20;
+    capable[19] = 0x82;
+    let packet = [3, 0x81, 0xaa];
+    let response = [3, 0x82, 0xbb];
+    let steps = initialization().into_iter().chain(felica()).chain([
+        exchange(WAIT_US, &poll, &capable),
+        command(&SET_424, &OK),
+        exchange(WAIT_US, &packet, &response),
+        command(&SET_212, &OK),
+        exchange(WAIT_US, &POLL, &POLLED),
+    ]);
+    let mut reader = Reader::new(Script::new(steps));
+    reader.initialize()?;
+    {
+        let mut card = reader
+            .poll_felica(PollRequest::new(0xffff, 2, 0)?, response_wait()?)?
+            .ok_or("missing capable card")?;
+        assert_eq!(card.exchange_packet(&packet)?, response);
+    }
+    assert!(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, response_wait()?)?
+            .is_some()
+    );
+    assert!(reader.into_transport().is_exhausted());
+    Ok(())
+}
+
+#[test]
+fn requires_both_speed_flags_and_excludes_ic_code_0b() -> Result<(), Box<dyn StdError>> {
+    let poll = [6, 0, 0xff, 0xff, 2, 0];
+    let mut reply = [0; 20];
+    reply[..18].copy_from_slice(&POLLED);
+    reply[0] = 20;
+    let steps =
+        [(2, 1, 0x02), (2, 1, 0x80), (2, 0x0b, 0x82), (1, 1, 0x82)].map(|(code, ic, flags)| {
+            reply[11] = ic;
+            reply[19] = flags;
+            let mut request = poll;
+            request[4] = code;
+            exchange(WAIT_US, &request, &reply)
+        });
+    let mut reader = Reader::new(Script::new(
+        initialization().into_iter().chain(felica()).chain(steps),
+    ));
+    reader.initialize()?;
+    for code in [2, 2, 2, 1] {
+        assert!(
+            reader
+                .poll_felica(PollRequest::new(0xffff, code, 0)?, response_wait()?)?
+                .is_some()
+        );
+    }
+    assert!(reader.into_transport().is_exhausted());
+    Ok(())
+}
+
+#[test]
+fn an_unconfirmed_424_switch_never_publishes_a_card() -> Result<(), Box<dyn StdError>> {
+    let poll = [6, 0, 0xff, 0xff, 2, 0];
+    let mut capable = [0; 20];
+    capable[..18].copy_from_slice(&POLLED);
+    capable[0] = 20;
+    capable[19] = 0x82;
+    let steps = initialization()
+        .into_iter()
+        .chain(felica())
+        .chain([
+            exchange(WAIT_US, &poll, &capable),
+            command(&SET_424, &[0xc0, 3, 1, 0x6a, 0x81, 0x90, 0]),
+        ])
+        .chain(felica())
+        .chain([exchange(WAIT_US, &POLL, &POLLED)]);
+    let mut reader = Reader::new(Script::new(steps));
+    reader.initialize()?;
+    assert!(matches!(
+        reader.poll_felica(PollRequest::new(0xffff, 2, 0)?, response_wait()?),
+        Err(Error::DeviceApdu(_))
+    ));
+    assert!(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, response_wait()?)?
+            .is_some()
+    );
     assert!(reader.into_transport().is_exhausted());
     Ok(())
 }

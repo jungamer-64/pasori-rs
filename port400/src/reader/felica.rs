@@ -1,6 +1,6 @@
-//! FeliCa polling and packet exchange at 212 kbps.
+//! FeliCa polling at 212 kbps and negotiated packet exchange.
 
-use super::{Error, Field, IccResponsePolicy, Profile, Reader, ResponseWait, Session, apdu};
+use super::{Error, FelicaRate, Field, IccResponsePolicy, Profile, Reader, ResponseWait, Session};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -9,7 +9,9 @@ use felica_packet::{PollRequest, PollResponse, Selection, validate_length};
 const MAX_PACKET: usize = u8::MAX as usize;
 
 impl<T: Transport> Reader<T> {
-    /// Send FeliCa Polling at 212 kbps. The selected card uses the same wait
+    /// Send FeliCa Polling at 212 kbps. With request code `02`, switch to
+    /// 424 kbps for subsequent exchanges if the card advertises automatic
+    /// switching and 424 kbps support. The selected card uses the same wait
     /// for later exchanges. Returns `None` when the reader reports an RF timeout.
     /// If the reader returns multiple ICC Response objects, the last one
     /// supplies the card reply.
@@ -23,20 +25,24 @@ impl<T: Transport> Reader<T> {
         request: PollRequest,
         wait: ResponseWait,
     ) -> Result<Option<FelicaCard<'_, T>>, Error<T::Error>> {
-        if !matches!(
-            self.field()?,
+        let initial = Profile::Felica(FelicaRate::Kbps212);
+        match self.field()? {
             Field::On {
-                profile: Profile::Felica,
-                cycle_before_poll: false
+                profile: Profile::Felica(FelicaRate::Kbps212),
+                cycle_before_poll: false,
+            } => {}
+            Field::On {
+                profile: Profile::Felica(FelicaRate::Kbps424),
+                cycle_before_poll: false,
+            } => self.apply_felica_rate(FelicaRate::Kbps212)?,
+            _ => {
+                self.session = Session::Active(Field::Uncertain);
+                self.acknowledge(&initial.switch_command())?;
+                self.rf_off()?;
+                self.acknowledge(&initial.framing_command())?;
+                self.energize()?;
+                self.apply_felica_rate(FelicaRate::Kbps212)?;
             }
-        ) {
-            self.session = Session::Active(Field::Uncertain);
-            self.acknowledge(&Profile::Felica.switch_command())?;
-            self.rf_off()?;
-            self.acknowledge(&Profile::Felica.framing_command())?;
-            self.energize()?;
-            self.acknowledge(&apdu::speed(0x89))?;
-            self.enable_profile(Profile::Felica);
         }
         let packet = request.encode();
         let response = match self.exchange_rf(&packet, wait, IccResponsePolicy::LastPollingReply) {
@@ -48,18 +54,39 @@ impl<T: Transport> Reader<T> {
         self.link
             .wait(Duration::from_millis((slots + 1) * 12 / 10 + 1));
         match PollResponse::parse(&response) {
-            Ok(observation) => Ok(Some(FelicaCard {
-                reader: self,
-                request,
-                observation,
-                wait,
-            })),
+            Ok(observation) => {
+                if request.request_code() == 2 && supports_automatic_424(observation) {
+                    self.apply_felica_rate(FelicaRate::Kbps424)?;
+                }
+                Ok(Some(FelicaCard {
+                    reader: self,
+                    request,
+                    observation,
+                    wait,
+                }))
+            }
             Err(error) => {
                 self.invalidate_field();
                 Err(Error::FelicaResponse(error))
             }
         }
     }
+
+    fn apply_felica_rate(&mut self, rate: FelicaRate) -> Result<(), Error<T::Error>> {
+        self.invalidate_field();
+        self.acknowledge(&rate.command())?;
+        self.enable_profile(Profile::Felica(rate));
+        Ok(())
+    }
+}
+
+fn supports_automatic_424(observation: PollResponse) -> bool {
+    const AUTOMATIC_AND_424: u8 = 0x82;
+    // The driver's negotiation masks out 424 kbps for IC code 0B.
+    observation.pmm[1] != 0x0b
+        && observation
+            .request_data
+            .is_some_and(|[_, flags]| flags & AUTOMATIC_AND_424 == AUTOMATIC_AND_424)
 }
 
 /// A FeliCa card selected through one exclusively borrowed Port-400 reader.

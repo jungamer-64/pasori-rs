@@ -126,6 +126,11 @@ impl PollRequest {
         self.system
     }
 
+    /// The request code that determines the meaning of optional response data.
+    pub const fn request_code(self) -> u8 {
+        self.request
+    }
+
     /// Encode the six-byte card command, without CRC or reader timeout fields.
     pub fn encode(self) -> [u8; 6] {
         let [high, low] = self.system.to_be_bytes();

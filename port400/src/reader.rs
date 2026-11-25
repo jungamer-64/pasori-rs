@@ -216,7 +216,7 @@ enum Field {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Profile {
-    Felica,
+    Felica(FelicaRate),
     TypeA,
     TypeB,
 }
@@ -224,7 +224,7 @@ enum Profile {
 impl Profile {
     const fn switch_command(self) -> [u8; 10] {
         match self {
-            Self::Felica => apdu::switch_protocol(3, 0),
+            Self::Felica(_) => apdu::switch_protocol(3, 0),
             Self::TypeA => apdu::switch_protocol(0, 3),
             Self::TypeB => apdu::switch_protocol(1, 2),
         }
@@ -235,9 +235,24 @@ impl Profile {
         const WITHOUT_PARITY: u16 = 0x000c;
         let flags = match self {
             Self::TypeA => HOST_PROLOGUE,
-            Self::TypeB | Self::Felica => HOST_PROLOGUE | WITHOUT_PARITY,
+            Self::TypeB | Self::Felica(_) => HOST_PROLOGUE | WITHOUT_PARITY,
         };
         apdu::framing(flags)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FelicaRate {
+    Kbps212,
+    Kbps424,
+}
+
+impl FelicaRate {
+    const fn command(self) -> [u8; 12] {
+        apdu::speed(match self {
+            Self::Kbps212 => 0x89,
+            Self::Kbps424 => 0x92,
+        })
     }
 }
 
