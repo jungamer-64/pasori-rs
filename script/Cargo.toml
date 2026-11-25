@@ -9,6 +9,7 @@ description = "Scripted reader transports for wire-level tests"
 [dependencies]
 felica-packet = { path = "../felica-packet" }
 port100 = { path = "../port100" }
+port400 = { path = "../port400" }
 rcs310 = { path = "../rcs310" }
 rcs956 = { path = "../rcs956" }
 

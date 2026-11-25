@@ -2,7 +2,7 @@
 
 ## crate の責務
 
-依存は `pasori` から reader crate（`rcs956`、`rcs310`、`port100`）へ、それぞれから `felica-packet` と `iso14443` への一方向で、下位の crate は上位を知らない。reader crate 同士は依存しない。いずれも `no_std` と `alloc` で動作し、`unsafe_code` を禁止する。
+依存は `pasori` から reader crate（`rcs956`、`rcs310`、`port100`、`port400`）へ、それぞれから `felica-packet` と `iso14443` への一方向で、下位の crate は上位を知らない。reader crate 同士は依存しない。いずれも `no_std` と `alloc` で動作し、`unsafe_code` を禁止する。
 
 `felica-packet` は reader によらない FeliCa カードの packet の事実を所有する。IDm、Polling の要求と応答、packet の長さ byte の検証と、Polling で選択したカードとの packet 交換の contract（`Selection`）がここに属する。各 reader crate は自分の選択 handle でこの contract を実装し、送受信可能な packet 上限、RF 転送・待機・失敗時の状態遷移を決める。
 
@@ -14,9 +14,11 @@
 
 `port100` は RC-S380 などに載る Port-100 チップの制御を所有する。フレーム、取引状態、host ACK による command の中断、command 種別の選択、firmware の版で変わる技術ごとの RF 設定とプロトコル設定、InCommRF による frame の運搬がここに属する。設定値は Sony のドライバーパッケージが既定の registry で同じ版の firmware へ送る値で、古い firmware へ送らない項目も同じ判定で省く。このチップは活性化を実行しないため、NFC-A の SENS_REQ、cascade ごとの衝突防止と選択、RATS、NFC-B の REQB と ATTRIB を crate が送り、活性化の途中で失敗した選択は次の選択の前に RF field を切る。NFC-A と NFC-B の選択は毎回 RF field を切ってから始める。複数のカードが同時に応答したときの衝突は解決せず、失敗として返す。ISO-DEP を広告する NFC-A カードと NFC-B カードは block 転送を、それ以外の NFC-A カードは command 交換を受け取る。`Transport` の実装側は bulk OUT 転送と bulk IN 転送を受け持つ。
 
-`pasori` は host が実行するカードのプロトコルを所有する。FeliCa の command と認証、FALP、ISO-DEP の block protocol、NFC Forum Type 1〜4 の NDEF、Type 2 tag の emulation がここに属する。FeliCa の command、認証、Type 3 の NDEF は任意の `felica_packet::Selection`、ISO-DEP は任意の `iso_dep::Selection`、Type 2 の NDEF は任意の `nfca::Selection` の上で動き、Type 4 の NDEF は ISO-DEP の APDU 交換を受け取る。RC-S956 の NFC-A カードの ISO-DEP は firmware が実行する。FALP は `rcs956` の packet stream を使い、Type 1 の NDEF と Type 2 の emulation は `rcs956` の選択 handle を受け取る。`pasori` は `felica-packet`、`iso14443`、`rcs956`、`rcs310`、`port100` を再公開する。
+`port400` は USB Port-400 リーダーの CCID Escape、Transparent Session と RF field の制御を所有する。対象は RC-S300/S・P と RC-S660/U。呼出側の `Transport` が USB descriptor から bulk endpoint を選び、デバイスを排他的に使う。FeliCa は 212 kbps で Polling と packet を交換する。NFC-A はリーダーの Layer 3 選択に続いて RATS を送り、NFC-B は Layer 2 framing で REQB と ATTRIB を送る。活性化後の ISO-DEP block protocol は `pasori` が実行する。
 
-`reader-script` は各 crate の wire-level test が共有する RC-S956、RC-S310、Port-100 の scripted transport で、公開しない dev dependency である。
+`pasori` は host が実行するカードのプロトコルを所有する。FeliCa の command と認証、FALP、ISO-DEP の block protocol、NFC Forum Type 1〜4 の NDEF、Type 2 tag の emulation がここに属する。FeliCa の command、認証、Type 3 の NDEF は任意の `felica_packet::Selection`、ISO-DEP は任意の `iso_dep::Selection`、Type 2 の NDEF は任意の `nfca::Selection` の上で動き、Type 4 の NDEF は ISO-DEP の APDU 交換を受け取る。RC-S956 の NFC-A カードの ISO-DEP は firmware が実行する。FALP は `rcs956` の packet stream を使い、Type 1 の NDEF と Type 2 の emulation は `rcs956` の選択 handle を受け取る。`pasori` は `felica-packet`、`iso14443`、`rcs956`、`rcs310`、`port100`、`port400` を再公開する。
+
+`reader-script` は各 crate の wire-level test が共有する RC-S956、RC-S310、Port-100、Port-400 の scripted transport で、公開しない dev dependency である。
 
 ## ビルドと検証
 
@@ -28,7 +30,7 @@ cargo fmt --all --check
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features --config "build.rustdocflags=['-Dwarnings']"
-cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p pasori --lib --all-features --target x86_64-unknown-none
+cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p port400 -p pasori --lib --all-features --target x86_64-unknown-none
 ```
 
 ## 状態と失敗の契約
@@ -40,6 +42,8 @@ cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p pasor
 どの操作も自動で再送しない。例外は FALP の再送で、protocol 自体が順序番号で重複を排除する欠落 block の再要求と、応答のない送信切替 block の再送だけを行う。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みの progress を error に残す。transport 失敗後には RF readiness が失効する。reader への `initialize` は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 
 `rcs956` の回復では pipe の状態整理と host ACK による未完了 command の中断を行い、その後は reset だけを許可する。USB pipe reset だけを firmware command の中断として扱わない。`port100` の回復では受信済み bytes を捨て、host ACK で未完了 command を中断し、もう一度受信済み bytes を捨ててから command を許可する。`rcs310` には command を中断する手段がなく、回復は受信済み bytes を捨てるだけである。この 2 つのリーダーは CLEAR_FEATURE(ENDPOINT_HALT) で data toggle を戻さないため、`Transport` の実装は stall していない endpoint を回復で reset しない。いずれでも、中断前のカード操作の結果不明は caller に残る。
+
+`port400` は CCID の最終応答を照合できなければ接続を失効させる。呼出側は同期が確立した接続から reader を作り直す。照合済みの機器応答が Transparent Session の順序エラーを示した場合は、`finish` または `initialize` でセッションを明示的に整理できる。
 
 `rcs310` のリーダーは ACK の後に応答を返さないことがある。その取引は失敗として返すが stream は使える状態に残し、遅れて届く応答に備えて、次の取引は受信済み bytes を捨ててから送り、ACK より前の frame を拒否する。
 
