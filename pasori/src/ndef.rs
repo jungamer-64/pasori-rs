@@ -14,7 +14,10 @@ pub use type3::{
     MAX_TYPE3_EMULATED_NDEF_BYTES, TYPE3_POLLING, Type3EmulationError, Type3Event, Type3Tag,
     Type3Target,
 };
-pub use type4::{read_type4, write_type4};
+pub use type4::{
+    MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4Target, read_type4,
+    write_type4,
+};
 
 use core::fmt;
 

@@ -7,6 +7,8 @@
 //! block within the same APDU exchange. Between APDUs, an R(NAK) probe
 //! confirms that the card is still in the field. The RC-S956 firmware runs
 //! ISO-DEP for its NFC-A cards itself, and [`ApduExchange`] covers both.
+pub(crate) mod target;
+
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
 use iso14443::iso_dep;

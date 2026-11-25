@@ -37,7 +37,14 @@ impl TargetWait {
 pub struct TypeATarget<'r, T: Transport> {
     link: TargetLink<'r, T>,
     uid: [u8; 4],
-    first: Option<Vec<u8>>,
+}
+
+/// Passive NFC-A target that advertises ISO-DEP. The host handles RATS
+/// and the subsequent block protocol.
+#[derive(Debug)]
+pub struct IsoDepATarget<'r, T: Transport> {
+    link: TargetLink<'r, T>,
+    uid: [u8; 4],
 }
 
 /// Passive FeliCa target. The reader answers the activation Polling with
@@ -52,10 +59,10 @@ pub struct TargetCommand<'a, 'r, T: Transport> {
     data: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum TargetState {
     WaitingForActivation,
-    Activated,
+    Activated { pending: Option<Vec<u8>> },
     Revoked,
 }
 
@@ -95,19 +102,32 @@ impl<T: Transport> Reader<T> {
         wait: TargetWait,
     ) -> Result<TypeATarget<'_, T>, Error<T::Error>> {
         let [a, b, c] = suffix;
-        let mut activation = [0; 24];
-        activation[..6].copy_from_slice(&[4, 0, a, b, c, 0]);
-        let mut link = self.prepare_target(Radio::TypeA, activation)?;
+        let mut link = self.prepare_type_a(suffix, 0)?;
         let first = match link.receive(wait) {
             // The chip can report a previous field loss immediately on
             // entry. Rearm before waiting for the first initiator.
             Err(Error::TargetFieldOff) => link.receive(wait)?,
             result => result?,
         };
+        link.state = TargetState::Activated {
+            pending: Some(first),
+        };
         Ok(TypeATarget {
             link,
             uid: [8, a, b, c],
-            first: Some(first),
+        })
+    }
+
+    /// Configure passive NFC-A at 106 kbps with ISO-DEP advertised. Call
+    /// [IsoDepATarget::receive] to start listening for RATS.
+    pub fn listen_iso_dep_a(
+        &mut self,
+        suffix: [u8; 3],
+    ) -> Result<IsoDepATarget<'_, T>, Error<T::Error>> {
+        let [a, b, c] = suffix;
+        Ok(IsoDepATarget {
+            link: self.prepare_type_a(suffix, 0x20)?,
+            uid: [8, a, b, c],
         })
     }
 
@@ -126,6 +146,16 @@ impl<T: Transport> Reader<T> {
         activation[22..].copy_from_slice(&system.to_be_bytes());
         self.prepare_target(Radio::Felica(rate), activation)
             .map(FelicaTarget)
+    }
+
+    fn prepare_type_a(
+        &mut self,
+        [a, b, c]: [u8; 3],
+        sel_res: u8,
+    ) -> Result<TargetLink<'_, T>, Error<T::Error>> {
+        let mut activation = [0; 24];
+        activation[..6].copy_from_slice(&[4, 0, a, b, c, sel_res]);
+        self.prepare_target(Radio::TypeA, activation)
     }
 
     fn prepare_target(
@@ -162,10 +192,32 @@ impl<'r, T: Transport> TypeATarget<'r, T> {
         &mut self,
         wait: TargetWait,
     ) -> Result<TargetCommand<'_, 'r, T>, Error<T::Error>> {
-        let data = match self.first.take() {
-            Some(data) => data,
-            None => self.link.receive(wait)?,
-        };
+        let data = self.link.receive(wait)?;
+        Ok(TargetCommand {
+            link: &mut self.link,
+            data,
+        })
+    }
+
+    /// Stop target operation and reinitialize the reader.
+    pub fn finish(self) -> Result<(), Error<T::Error>> {
+        self.link.finish()
+    }
+}
+
+impl<'r, T: Transport> IsoDepATarget<'r, T> {
+    /// The four-byte UID advertised to the initiator.
+    pub fn uid(&self) -> [u8; 4] {
+        self.uid
+    }
+
+    /// Receive an NFC-A frame without CRC. Returns any frame already
+    /// collected by [TargetCommand::respond_and_wait] before issuing I/O.
+    pub fn receive(
+        &mut self,
+        wait: TargetWait,
+    ) -> Result<TargetCommand<'_, 'r, T>, Error<T::Error>> {
+        let data = self.link.receive(wait)?;
         Ok(TargetCommand {
             link: &mut self.link,
             data,
@@ -207,6 +259,24 @@ impl<T: Transport> TargetCommand<'_, '_, T> {
     /// Send the response without waiting for another command. The reader
     /// appends CRC. An uncertain send revokes this target.
     pub fn respond(self, response: &[u8]) -> Result<(), Error<T::Error>> {
+        self.send(response, None)
+    }
+
+    /// Send the response and immediately arm reception of the next frame
+    /// in the same device command. A receive timeout after transmission
+    /// is success. A received frame is saved for the next receive.
+    ///
+    /// Field loss leaves delivery unknown and allows fresh activation.
+    /// Other device failures revoke the target.
+    pub fn respond_and_wait(
+        self,
+        response: &[u8],
+        wait: TargetWait,
+    ) -> Result<(), Error<T::Error>> {
+        self.send(response, Some(wait))
+    }
+
+    fn send(self, response: &[u8], wait: Option<TargetWait>) -> Result<(), Error<T::Error>> {
         if response.is_empty() || response.len() > MAX_RESPONSE_BYTES {
             return Err(Error::InputLength {
                 maximum: MAX_RESPONSE_BYTES,
@@ -216,7 +286,7 @@ impl<T: Transport> TargetCommand<'_, '_, T> {
         if matches!(self.link.radio, Radio::Felica(_)) {
             validate_length(response, 2).map_err(Error::FelicaRequest)?;
         }
-        self.link.respond(response)
+        self.link.respond(response, wait)
     }
 }
 
@@ -261,10 +331,15 @@ impl<T: Transport> TargetLink<'_, T> {
     }
 
     fn receive(&mut self, wait: TargetWait) -> Result<Vec<u8>, Error<T::Error>> {
+        if let TargetState::Activated { pending } = &mut self.state
+            && let Some(data) = pending.take()
+        {
+            return Ok(data);
+        }
         let prior = mem::replace(&mut self.state, TargetState::Revoked);
         let activate = match prior {
             TargetState::WaitingForActivation => true,
-            TargetState::Activated => false,
+            TargetState::Activated { .. } => false,
             TargetState::Revoked => return Err(Error::NotInitialized),
         };
         let TargetReply {
@@ -286,10 +361,8 @@ impl<T: Transport> TargetLink<'_, T> {
                 && (!activate || activated != Some(false))
                 && !data.is_empty() =>
             {
-                if matches!(self.radio, Radio::Felica(_)) {
-                    validate_length(&data, 2).map_err(Error::FelicaResponse)?;
-                }
-                self.state = TargetState::Activated;
+                self.validate_data(&data)?;
+                self.state = TargetState::Activated { pending: None };
                 Ok(data)
             }
             0 => Err(Error::Response("TgCommRF receive format")),
@@ -297,17 +370,35 @@ impl<T: Transport> TargetLink<'_, T> {
         }
     }
 
-    fn respond(&mut self, response: &[u8]) -> Result<(), Error<T::Error>> {
-        self.state = TargetState::Revoked;
-        let reply = self.exchange(false, 0, response)?;
-        match reply.status {
-            0 if reply.data.is_empty() => {
-                self.state = TargetState::Activated;
-                Ok(())
-            }
-            0 => Err(Error::Response("TgCommRF send-only response")),
-            status => Err(Error::RfStatus(status)),
+    fn validate_data(&self, data: &[u8]) -> Result<(), Error<T::Error>> {
+        if matches!(self.radio, Radio::Felica(_)) {
+            validate_length(data, 2).map_err(Error::FelicaResponse)?;
         }
+        Ok(())
+    }
+
+    fn respond(
+        &mut self,
+        response: &[u8],
+        wait: Option<TargetWait>,
+    ) -> Result<(), Error<T::Error>> {
+        self.state = TargetState::Revoked;
+        let reply = self.exchange(false, wait.map_or(0, |wait| wait.0), response)?;
+        let pending = match (wait, reply.status) {
+            (None, 0) | (Some(_), RECEIVE_TIMEOUT) if reply.data.is_empty() => None,
+            (Some(_), 0) if reply.rate == self.radio.code() && !reply.data.is_empty() => {
+                self.validate_data(&reply.data)?;
+                Some(reply.data)
+            }
+            (Some(_), FIELD_OFF) if reply.data.is_empty() => {
+                self.state = TargetState::WaitingForActivation;
+                return Err(Error::TargetFieldOff);
+            }
+            (_, 0) => return Err(Error::Response("TgCommRF response format")),
+            (_, status) => return Err(Error::RfStatus(status)),
+        };
+        self.state = TargetState::Activated { pending };
+        Ok(())
     }
 
     fn finish(self) -> Result<(), Error<T::Error>> {

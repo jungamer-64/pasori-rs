@@ -56,6 +56,38 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// A Request for Answer to Select, without RF CRC bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rats {
+    frame_size: FrameSize,
+    cid: u8,
+}
+
+impl Rats {
+    /// Decode the initiator's frame-size limit and card identifier.
+    /// Returns `None` for a different command, wrong length or reserved CID.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let &[0xe0, parameter] = bytes else {
+            return None;
+        };
+        let cid = parameter & 0x0f;
+        (cid != 0x0f).then_some(Self {
+            frame_size: FrameSize::from_index(parameter >> 4),
+            cid,
+        })
+    }
+
+    /// Maximum frame size the initiator accepts, including overhead and CRC.
+    pub fn frame_size(self) -> u16 {
+        self.frame_size.bytes()
+    }
+
+    /// The proposed card identifier. Its use depends on the ATS capabilities.
+    pub fn cid(self) -> u8 {
+        self.cid
+    }
+}
+
 /// A complete ATS with checked interface-byte boundaries and timing fields.
 ///
 /// The raw bytes are immutable after construction; cached offsets and decoded
@@ -329,6 +361,17 @@ pub trait PassiveTargetReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rats_distinguishes_frame_size_and_card_identifier() {
+        let rats = Rats::parse(&[0xe0, 0x5e]);
+        assert_eq!(rats.map(Rats::frame_size), Some(64));
+        assert_eq!(rats.map(Rats::cid), Some(14));
+        assert_eq!(Rats::parse(&[0xe0, 0xf0]).map(Rats::frame_size), Some(4096));
+        assert_eq!(Rats::parse(&[0xe0, 0x5f]), None);
+        assert_eq!(Rats::parse(&[0xe0, 0x50, 0]), None);
+        assert_eq!(Rats::parse(&[0xc2]), None);
+    }
 
     #[test]
     fn ats_parameters_and_omitted_interface_defaults() -> Result<(), Error> {

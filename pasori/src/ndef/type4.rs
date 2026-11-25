@@ -3,7 +3,12 @@ use crate::isodep::ApduExchange;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+mod target;
+
+pub use target::{MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4Target};
+
 const UPDATE_BINARY_HEADER_BYTES: usize = 5;
+const NDEF_APP_ID: [u8; 7] = [0xd2, 0x76, 0, 0, 0x85, 1, 1];
 const CAPABILITY_CONTAINER_ID: u16 = 0xe103;
 const SHORT_FILE_END: usize = 0x8000;
 const MAX_EXTENDED_FILE_BYTES: usize = 1 << 20;
@@ -205,10 +210,9 @@ enum BinaryAddress {
 fn select_ndef_file<E>(
     exchange: &mut impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
 ) -> Result<Type4File, Error<E>> {
-    checked_apdu(
-        exchange,
-        &[0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0],
-    )?;
+    let mut select_application = [0, 0xa4, 4, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+    select_application[5..12].copy_from_slice(&NDEF_APP_ID);
+    checked_apdu(exchange, &select_application)?;
     select_file(exchange, CAPABILITY_CONTAINER_ID.to_be_bytes())?;
     let header = read_binary(exchange, BinaryAddress::Short(0), 7)?;
     let length = usize::from(u16::from_be_bytes([header[0], header[1]]));

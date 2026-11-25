@@ -2,7 +2,9 @@
 
 use pasori::{
     felica_packet::Idm,
-    ndef::{Type3EmulationError, Type3Event, Type3Target},
+    ndef::{
+        Type3EmulationError, Type3Event, Type3Target, Type4EmulationError, Type4Event, Type4Target,
+    },
     port100::reader::{BitRate, Error, Reader, TargetWait},
     type2::{Type2EmulationError, Type2Event, Type2Target},
 };
@@ -194,4 +196,124 @@ fn type3_validates_ndef_before_configuring_the_reader() {
         Err(Type3EmulationError::Message(_))
     ));
     assert!(journal.borrow().commands.is_empty());
+}
+
+fn type4_exchange(mdaa: u8, send: &[u8], receive_ms: u16, status: u32, frame: &[u8]) -> Step {
+    let mut args = vec![0, 0, 0xff, 0xff, mdaa, 4, 0, 1, 2, 3, 0x20];
+    args.extend([0; 20]);
+    args.extend(receive_ms.to_le_bytes());
+    args.extend_from_slice(send);
+    let mut reply = vec![0x0b, 0, if mdaa != 0 && status == 0 { 3 } else { 0 }];
+    reply.extend(status.to_le_bytes());
+    reply.extend_from_slice(frame);
+    command(0x48, &args, &reply)
+}
+
+#[test]
+fn type4a_reads_ndef_over_chained_blocks_and_deselects() -> Result<(), Box<dyn StdError>> {
+    use Type4Event::{Activated, Block, Deselected, Exchange, FieldOff, Ignored};
+    let initial = type4_exchange(1, &[], WAIT_MS, 0x400, &[]);
+    let receive_rats = type4_exchange(1, &[], WAIT_MS, 0, &[0xe0, 0]);
+    let transfer = |send: &[u8], receive: &[u8]| type4_exchange(0, send, WAIT_MS, 0, receive);
+    let first = [0x12, 0, 0xa4, 4, 0, 7, 0xd2, 0x76];
+    let middle = [0x13, 0, 0, 0x85];
+    let last = [0x02, 1, 1, 0];
+    let cc_part = [0x12, 0, 15, 0x20, 0, 0xff, 0, 0xff, 4, 6, 0xe1, 4, 0, 5];
+    let mut steps = initialization();
+    steps.extend(configure(0x0b));
+    steps.extend([
+        initial,
+        receive_rats,
+        transfer(&[4, 0x68, 0x80, 0], &first),
+        transfer(&[0xa2], &first),
+        transfer(&[0xa2], &[0xa3]),
+        transfer(&[], &middle),
+        transfer(&[0xa3], &last),
+        transfer(&[0x02, 0x90, 0], &[0x03, 0, 0xa4, 0, 0x0c, 2, 0xe1, 3]),
+        transfer(&[0x03, 0x90, 0], &[0x02, 0, 0xb0, 0, 0, 15]),
+        transfer(&cc_part, &[0xa2]),
+        transfer(&cc_part, &[0xa3]),
+        transfer(
+            &[0x03, 0, 0xff, 0x90, 0],
+            &[0x02, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4],
+        ),
+        transfer(&[0x02, 0x90, 0], &[0x03, 0, 0xb0, 0, 0, 2]),
+        transfer(&[0x03, 0, 3, 0x90, 0], &[0x02, 0, 0xb0, 0, 2, 3]),
+        transfer(&[0x02, 0xd0, 0, 0, 0x90, 0], &[0x03, 0, 0xd6, 0, 0, 1, 42]),
+        transfer(&[0x03, 0x69, 0x82], &[0x02, 0, 0xb0, 0, 5, 1]),
+        transfer(&[0x02, 0x6b, 0], &[0xc2]),
+        type4_exchange(0, &[0xc2], 0, 0, &[]),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut target = Type4Target::listen(&mut reader, [1, 2, 3], &MESSAGE)?;
+    let wait = wait()?;
+    for expected in [
+        FieldOff, Activated, Block, Block, Ignored, Block, Exchange, Exchange, Block, Block,
+        Exchange, Exchange, Exchange, Exchange, Exchange, Exchange, Deselected,
+    ] {
+        assert_eq!(target.serve_next(wait)?, expected);
+    }
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::Inactive)
+    ));
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type4a_field_loss_clears_selection_and_transmit_failure_revokes() -> Result<(), Box<dyn StdError>>
+{
+    let mut steps = initialization();
+    steps.extend(configure(0x0b));
+    steps.extend([
+        type4_exchange(1, &[], WAIT_MS, 0x80, &[]),
+        type4_exchange(1, &[], WAIT_MS, 0, &[0xe0, 0x50]),
+        type4_exchange(0, &[4, 0x68, 0x80, 0], WAIT_MS, 0x80, &[]),
+        type4_exchange(
+            0,
+            &[],
+            WAIT_MS,
+            0,
+            &[2, 0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0],
+        ),
+        type4_exchange(0, &[2, 0x90, 0], WAIT_MS, 0x400, &[]),
+        type4_exchange(1, &[], WAIT_MS, 0, &[0xe0, 0x50]),
+        type4_exchange(
+            0,
+            &[4, 0x68, 0x80, 0],
+            WAIT_MS,
+            0,
+            &[2, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4],
+        ),
+        type4_exchange(0, &[2, 0x6a, 0x82], WAIT_MS, 0x880, &[]),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut target = Type4Target::listen(&mut reader, [1, 2, 3], &[])?;
+    let wait = wait()?;
+    assert_eq!(target.serve_next(wait)?, Type4Event::TimedOut);
+    assert_eq!(target.serve_next(wait)?, Type4Event::Activated);
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::ResponseFieldOff)
+    ));
+    assert_eq!(target.serve_next(wait)?, Type4Event::Activated);
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::Reader(Error::RfStatus(0x880)))
+    ));
+    assert!(matches!(
+        target.serve_next(wait),
+        Err(Type4EmulationError::Inactive)
+    ));
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
 }
