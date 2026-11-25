@@ -220,6 +220,9 @@ pub trait Selection {
     /// The card's validated polling response.
     fn poll_response(&self) -> &PollResponse;
 
+    /// Maximum packet length in either direction, including the length byte.
+    fn max_packet_len(&self) -> usize;
+
     /// Send one packet and return the card's reply, whose length byte has
     /// been checked. The reader never replays a packet automatically; after a
     /// failure that follows sending, the packet may have taken effect.

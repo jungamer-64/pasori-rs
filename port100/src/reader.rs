@@ -529,6 +529,10 @@ pub struct FelicaCard<'a, T: Transport> {
 impl<T: Transport> Selection for FelicaCard<'_, T> {
     type Error = Error<T::Error>;
 
+    fn max_packet_len(&self) -> usize {
+        MAX_FRAME_BYTES.min(usize::from(u8::MAX))
+    }
+
     fn poll_request(&self) -> PollRequest {
         self.request
     }

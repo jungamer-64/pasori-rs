@@ -8,7 +8,7 @@ use pasori::{
         self, FalpAccepted, FalpConnect, FalpError, FalpLink, FalpListen, FalpTurn, Profile,
         Reason, TransferCause,
     },
-    felica::{self, BlockWrite, Card, CardError, ServiceEntry},
+    felica::{self, BlockAddress, BlockWrite, Card, CardError, ServiceEntry},
     isodep::{self, IsoDepCard},
     ndef::{self, Type3Tag},
     type1::Type1Tag,
@@ -180,7 +180,7 @@ mod lite_s {
 #[cfg(feature = "felica-standard-aes")]
 #[test]
 fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dyn Error>> {
-    use pasori::felica::standard_aes::{Block, Error as AesError, NodeKey};
+    use pasori::felica::{StandardError as AesError, standard_aes::NodeKey};
 
     fn encrypted_command(packet: &[u8], response: &[u8]) -> Step {
         let mut args = vec![0xc8, 0];
@@ -270,19 +270,16 @@ fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dy
         session.issue().parameters,
         0x8899aabbccddeeffu64.to_be_bytes()
     );
-    let block = Block {
-        service_index: 0,
-        number: 0x0102,
-    };
+    let block = BlockAddress::first(0x0102);
     assert!(matches!(
-        session.read_blocks(&[Block {
-            service_index: 1,
-            ..block
-        }]),
-        Err(AesError::ServiceIndex(1))
+        session.read_blocks(&[BlockAddress::new(1, 0x0102)?]),
+        Err(AesError::Request(CardError::ServiceIndex(1)))
     ));
     assert_eq!(session.read_blocks(&[block])?, [[0xa5; 16]]);
-    session.write_blocks(&[(block, [0x5a; 16])])?;
+    session.write_blocks(&[BlockWrite {
+        address: block,
+        data: [0x5a; 16],
+    }])?;
     assert!(matches!(
         session.read_blocks(&[block]),
         Err(AesError::TransactionNumber {
@@ -468,21 +465,21 @@ fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result
     );
     assert_eq!(card.search_service_code(0x1235)?, None);
     let write = BlockWrite {
-        block: 257,
+        address: BlockAddress::first(257),
         data: [0x5a; 16],
     };
     assert!(matches!(
-        card.write_without_encryption(9, &[write; 13]),
-        Err(felica::Error::Request(CardError::Length { .. }))
+        card.write_without_encryption(&[9], &[write; 13]),
+        Err(felica::Error::Request(CardError::PacketBudget { .. }))
     ));
     assert!(matches!(
-        card.write_without_encryption(9, &[write]),
+        card.write_without_encryption(&[9], &[write]),
         Err(felica::Error::Response(CardError::Status {
             flag1: 1,
             flag2: 0xa2
         }))
     ));
-    card.write_without_encryption(9, &[write])?;
+    card.write_without_encryption(&[9], &[write])?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -514,20 +511,23 @@ fn felica_write_length_errors_distinguish_request_rejection_from_sent_command()
         .map(Card::new)
         .ok_or("expected FeliCa card")?;
     let block = BlockWrite {
-        block: 256,
+        address: BlockAddress::first(256),
         data: [0x5a; 16],
     };
     assert!(matches!(
-        card.write_without_encryption(9, &[block; 13]),
-        Err(felica::Error::Request(CardError::Length {
-            expected: 255,
-            actual: 261
+        card.write_without_encryption(&[9], &[block; 13]),
+        Err(felica::Error::Request(CardError::PacketBudget {
+            maximum: 255,
+            required: 261
         }))
     ));
     assert_eq!(journal.borrow().remaining, 1);
-    let block = BlockWrite { block: 1, ..block };
+    let block = BlockWrite {
+        address: BlockAddress::first(1),
+        ..block
+    };
     assert!(matches!(
-        card.write_without_encryption(9, &[block]),
+        card.write_without_encryption(&[9], &[block]),
         Err(felica::Error::Reader(ReaderError::FelicaResponse(
             PacketError::Length {
                 expected: 255,
@@ -679,7 +679,8 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
         assert_eq!(card.selection().poll_response().pmm, PARAMETERS);
         assert_eq!(card.selection().poll_response().request_data, None);
         assert_eq!(
-            card.read_without_encryption(0x1a8b, &[0])?.blocks(),
+            card.read_without_encryption(&[0x1a8b], &[BlockAddress::first(0)])?
+                .blocks(),
             &[[0x5a; 16]]
         );
     }
@@ -718,12 +719,12 @@ fn recovery_rf_status_revokes_the_selected_cards_operation_authority() -> Result
             .map(Card::new)
             .ok_or("expected selected FeliCa card")?;
         assert!(matches!(
-            card.read_without_encryption(0x1a8b, &[0]),
+            card.read_without_encryption(&[0x1a8b], &[BlockAddress::first(0)]),
             Err(felica::Error::Reader(ReaderError::RfStatus(0xcd)))
         ));
         let sent = journal.borrow().requests.len();
         assert!(matches!(
-            card.read_without_encryption(0x1a8b, &[0]),
+            card.read_without_encryption(&[0x1a8b], &[BlockAddress::first(0)]),
             Err(felica::Error::Reader(ReaderError::NotInitialized))
         ));
         assert_eq!(journal.borrow().requests.len(), sent);
@@ -775,7 +776,8 @@ fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(),
             .map(Card::new)
             .ok_or("expected card")?;
         assert_eq!(
-            card.read_without_encryption(0x1a8b, &[0])?.blocks(),
+            card.read_without_encryption(&[0x1a8b], &[BlockAddress::first(0)])?
+                .blocks(),
             &[[0x5a; 16]]
         );
     }
@@ -815,7 +817,7 @@ fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error
         .map(Card::new)
         .ok_or("expected card")?;
     assert!(matches!(
-        card.read_without_encryption(0x1a8b, &[0]),
+        card.read_without_encryption(&[0x1a8b], &[BlockAddress::first(0)]),
         Err(felica::Error::Reader(ReaderError::RfStatus(0x4b)))
     ));
     let reply_completed = journal
@@ -823,7 +825,8 @@ fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error
         .last_read_completed
         .ok_or("missing error response time")?;
     assert_eq!(
-        card.read_without_encryption(0x1a8b, &[0])?.blocks(),
+        card.read_without_encryption(&[0x1a8b], &[BlockAddress::first(0)])?
+            .blocks(),
         &[[0x5a; 16]]
     );
     let next_request = journal

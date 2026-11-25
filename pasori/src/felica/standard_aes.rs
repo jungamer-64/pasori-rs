@@ -5,12 +5,15 @@
 //! authentication. After sending a command the session can advance only
 //! from an authenticated response with a strictly newer transaction number.
 
-use super::{Card, Error as CommandError};
+use super::{
+    Card, IssueInformation, StandardError as Error, StandardSession, admit_packet, code_count,
+    standard_session::Cipher,
+};
 use aes::{
     Aes128,
     cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit},
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use cmac::{Cmac, Mac};
 use core::fmt;
 use felica_packet::Selection;
@@ -18,9 +21,6 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const SECURE_OVERHEAD: usize = 12;
-const MAX_PAYLOAD: usize = u8::MAX as usize - SECURE_OVERHEAD;
-const MAX_READ_BLOCKS: usize = (MAX_PAYLOAD - 3) / 16;
-const MAX_WRITE_BLOCKS: usize = (MAX_PAYLOAD - 1) / 18;
 
 /// An entry in the authentication node list, paired with its AES key.
 pub struct NodeKey<'a> {
@@ -38,134 +38,20 @@ impl fmt::Debug for NodeKey<'_> {
     }
 }
 
-/// A block in a service included in the authenticated node list.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Block {
-    /// Zero-based position of the service in the authentication node list.
-    pub service_index: u8,
-    /// Block number within the service.
-    pub number: u16,
-}
-
-/// Issue information authenticated by the card's second proof.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Issue {
-    /// Issue ID in card byte order.
-    pub id: [u8; 8],
-    /// Issue parameters in card byte order.
-    pub parameters: [u8; 8],
-}
-
-/// Failure to authenticate or use a FeliCa Standard AES session.
-#[derive(Debug)]
-pub enum Error<E> {
-    /// The authentication needs one to sixteen nodes.
-    Nodes(usize),
-    /// A read or write request exceeds the secure packet budget.
-    BlockCount(usize),
-    /// The block refers outside the authenticated node list.
-    ServiceIndex(u8),
-    /// Authentication, read or write failed at the exchange boundary.
-    Exchange {
-        /// Card command code identifying the failed step.
-        command: u8,
-        /// Underlying failure with the reader transaction's progress.
-        cause: CommandError<E>,
-    },
-    /// The first authentication response did not prove the shared key.
-    CardProof,
-    /// The response failed layout validation.
-    Layout,
-    /// The second authentication response or secure message failed its MAC.
-    Mac,
-    /// The authenticated response did not advance past the sent counter.
-    TransactionNumber {
-        /// Counter in the command.
-        sent: u16,
-        /// Counter authenticated in the response.
-        received: u16,
-    },
-    /// The remaining counter space cannot accommodate a command and response.
-    CounterExhausted,
-    /// The card reported both status flags in an authenticated response.
-    Status {
-        /// First status flag.
-        first: u8,
-        /// Second status flag.
-        second: u8,
-    },
-    /// A secure payload exceeds one FeliCa packet. Nothing was sent and the
-    /// session remains usable.
-    PayloadLength(usize),
-    /// The previous secure exchange failed, revoking the session.
-    SessionUnavailable,
-}
-
-impl<E: fmt::Debug> fmt::Display for Error<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Nodes(count) => write!(f, "{count} authentication nodes, expected 1..=16"),
-            Self::BlockCount(count) => write!(f, "{count} blocks exceed the secure packet budget"),
-            Self::ServiceIndex(index) => {
-                write!(f, "service index {index} is outside the node list")
-            }
-            Self::PayloadLength(length) => {
-                write!(f, "secure payload of {length} bytes exceeds one packet")
-            }
-            Self::Exchange { command, .. } => {
-                write!(f, "FeliCa AES command {command:02X} exchange failed")
-            }
-            Self::CardProof => f.write_str("card did not prove the shared key"),
-            Self::Layout => f.write_str("malformed secure response"),
-            Self::Mac => f.write_str("secure response MAC mismatch"),
-            Self::TransactionNumber { sent, received } => write!(
-                f,
-                "response transaction number {received} does not follow {sent}"
-            ),
-            Self::CounterExhausted => f.write_str("transaction counter exhausted"),
-            Self::Status { first, second } => {
-                write!(f, "card status flags {first:02X} {second:02X}")
-            }
-            Self::SessionUnavailable => f.write_str("AES session was revoked"),
-        }
-    }
-}
-
-impl<E: core::error::Error + 'static> core::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Exchange { cause, .. } => Some(cause),
-            _ => None,
-        }
-    }
-}
-
-/// Exclusive FeliCa Standard AES session. Releasing it requires a new card
-/// selection before further operations, which clears the card's RF state.
-#[derive(Debug)]
-pub struct Session<S: Selection> {
-    card: S,
-    secure: Option<Secure>,
-    issue: Issue,
-    nodes: usize,
-}
-
 impl<S: Selection> Card<S> {
     /// Consume the ordinary card selection and authenticate using AES-128.
-    /// Nodes appear in the same order in the key derivation and authentication
-    /// command. Supply the system's individualization code, its operation
-    /// parameter, and a fresh 16-byte CSPRNG challenge.
+    /// The ordered node list also defines the indices used by the encrypted
+    /// block commands. Supply the system's individualization code, its
+    /// operation parameter, and a fresh 16-byte CSPRNG challenge.
     pub fn authenticate_standard_aes(
         mut self,
         nodes: &[NodeKey<'_>],
         individualization: &[u8; 16],
         operation_parameter: u8,
         challenge: [u8; 16],
-    ) -> Result<Session<S>, Error<S::Error>> {
-        let node_count = u8::try_from(nodes.len())
-            .ok()
-            .filter(|count| (1..=16).contains(count))
-            .ok_or(Error::Nodes(nodes.len()))?;
+    ) -> Result<StandardSession<S>, Error<S::Error>> {
+        let node_count = code_count(nodes.len(), 16).map_err(Error::Request)?;
+        admit_packet(self.selection(), (28 + 2 * nodes.len()).max(46)).map_err(Error::Request)?;
         let mut group = Zeroizing::new([0; 16]);
         group[..2].copy_from_slice(&[1, 1]);
         group[15] = 0x80;
@@ -183,14 +69,14 @@ impl<S: Selection> Card<S> {
         let alpha = Aes128::new((&*alpha).into());
 
         let challenge = Zeroizing::new(challenge);
-        let mut proof = *challenge;
-        alpha.encrypt_block((&mut proof).into());
+        let mut proof = Zeroizing::new(*challenge);
+        alpha.encrypt_block((&mut *proof).into());
         let mut parameters = Vec::with_capacity(18 + 2 * nodes.len());
         parameters.extend([operation_parameter, node_count]);
         for node in nodes {
             parameters.extend(node.code.to_le_bytes());
         }
-        parameters.extend(proof);
+        parameters.extend(*proof);
         self.begin_authentication();
         let first = self
             .exchange_command(0x40, &parameters, 0x41)
@@ -216,170 +102,50 @@ impl<S: Selection> Card<S> {
         }
         let mut random = Zeroizing::new(*encrypted_random);
         beta.decrypt_block((&mut *random).into());
-        let mut host_proof = *random;
-        alpha.encrypt_block((&mut host_proof).into());
-        let mut request = [0; 26];
-        request[..2].copy_from_slice(&[26, 0x42]);
-        request[2..10].copy_from_slice(self.selection().poll_response().idm.as_bytes());
-        request[10..].copy_from_slice(&host_proof);
-        let mut card = self.into_raw();
-        let reply = exchange(&mut card, &request)?;
-
+        let mut host_proof = Zeroizing::new(*random);
+        alpha.encrypt_block((&mut *host_proof).into());
         let mut key_block = [0; 16];
         key_block[1] = 3;
         key_block[14] = 1;
         let derivation = Aes128::new((&*random).into());
         let encryption = Zeroizing::new(derive(&derivation, key_block, 1));
         let authentication = Zeroizing::new(derive(&derivation, key_block, 2));
-        let mut secure = Secure {
+        let cipher = Box::new(AesCipher {
             encryption: Aes128::new((&*encryption).into()),
             authentication,
             identifier: core::array::from_fn(|index| challenge[index + 2]),
             salt: [*a, *b, *c],
-            counter: 0,
-        };
-        let (counter, issue) = secure.open(0x43, reply)?;
-        let Some((id, parameters)) = issue.split_first_chunk::<8>() else {
-            return Err(Error::Layout);
-        };
-        let parameters = parameters.try_into().map_err(|_| Error::Layout)?;
-        secure.counter = counter;
-        Ok(Session {
-            card,
-            secure: Some(secure),
-            issue: Issue {
-                id: *id,
-                parameters,
-            },
-            nodes: nodes.len(),
-        })
+        });
+        let reply = self
+            .exchange_addressed(0x42, &*host_proof)
+            .map_err(|cause| Error::Exchange {
+                command: 0x42,
+                cause,
+            })?;
+        let (counter, issue) = cipher.open(0x43, reply)?;
+        let issue = IssueInformation::parse(&issue)?;
+        Ok(StandardSession::new(
+            self,
+            Cipher::Aes(cipher),
+            counter,
+            issue,
+            nodes.len(),
+        ))
     }
 }
 
-impl<S: Selection> Session<S> {
-    /// Authenticated issue data returned when establishing this session.
-    pub fn issue(&self) -> Issue {
-        self.issue
-    }
-
-    /// Read blocks in request order and verify the response before releasing data.
-    pub fn read_blocks(&mut self, blocks: &[Block]) -> Result<Vec<[u8; 16]>, Error<S::Error>> {
-        let request = self.block_list(blocks.len(), MAX_READ_BLOCKS, blocks.iter().copied())?;
-        self.transact(0x44, request, |reply| {
-            let [0, 0, count, data @ ..] = status(reply)? else {
-                return Err(Error::Layout);
-            };
-            if usize::from(*count) != blocks.len() || data.len() != blocks.len() * 16 {
-                return Err(Error::Layout);
-            }
-            Ok(data.as_chunks::<16>().0.to_vec())
-        })
-    }
-
-    /// Write blocks through the authenticated session. A failure after command
-    /// submission may leave the write applied. Reauthenticate to reconcile it.
-    pub fn write_blocks(&mut self, blocks: &[(Block, [u8; 16])]) -> Result<(), Error<S::Error>> {
-        let mut request = self.block_list(
-            blocks.len(),
-            MAX_WRITE_BLOCKS,
-            blocks.iter().map(|(block, _)| *block),
-        )?;
-        if request.len() + blocks.len() * 16 > MAX_PAYLOAD {
-            return Err(Error::BlockCount(blocks.len()));
-        }
-        for (_, data) in blocks {
-            request.extend(data);
-        }
-        self.transact(0x46, request, |reply| {
-            if status(reply)? != [0, 0] {
-                return Err(Error::Layout);
-            }
-            Ok(())
-        })
-    }
-
-    fn block_list(
-        &self,
-        count: usize,
-        maximum: usize,
-        blocks: impl Iterator<Item = Block>,
-    ) -> Result<Zeroizing<Vec<u8>>, Error<S::Error>> {
-        if !(1..=maximum).contains(&count) {
-            return Err(Error::BlockCount(count));
-        }
-        let mut request = Zeroizing::new(Vec::with_capacity(1 + count * 19));
-        request.push(u8::try_from(count).map_err(|_| Error::BlockCount(count))?);
-        for block in blocks {
-            if usize::from(block.service_index) >= self.nodes {
-                return Err(Error::ServiceIndex(block.service_index));
-            }
-            let [low, high] = block.number.to_le_bytes();
-            if high == 0 {
-                request.extend([0x80 | block.service_index, low]);
-            } else {
-                request.extend([block.service_index, low, high]);
-            }
-        }
-        Ok(request)
-    }
-
-    fn transact<U>(
-        &mut self,
-        command: u8,
-        mut payload: Zeroizing<Vec<u8>>,
-        decode: impl FnOnce(&[u8]) -> Result<U, Error<S::Error>>,
-    ) -> Result<U, Error<S::Error>> {
-        let secure = self.secure.as_ref().ok_or(Error::SessionUnavailable)?;
-        let sent = secure
-            .counter
-            .checked_add(1)
-            .filter(|counter| *counter < u16::MAX)
-            .ok_or(Error::CounterExhausted)?;
-        let request = secure
-            .seal(command, sent, &mut payload)
-            .ok_or(Error::PayloadLength(payload.len()))?;
-        let mut secure = self.secure.take().ok_or(Error::SessionUnavailable)?;
-        let reply = exchange(&mut self.card, &request)?;
-        let (received, plaintext) = secure.open(command + 1, reply)?;
-        if received <= sent {
-            return Err(Error::TransactionNumber { sent, received });
-        }
-        let result = decode(&plaintext)?;
-        secure.counter = received;
-        self.secure = Some(secure);
-        Ok(result)
-    }
+pub(super) fn packet_len(payload_len: usize) -> usize {
+    SECURE_OVERHEAD + payload_len
 }
 
-fn exchange<S: Selection>(card: &mut S, packet: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
-    card.exchange_packet(packet)
-        .map_err(|cause| Error::Exchange {
-            command: packet[1],
-            cause: CommandError::Reader(cause),
-        })
-}
-
-fn status<E>(payload: &[u8]) -> Result<&[u8], Error<E>> {
-    match payload {
-        [0, 0, ..] => Ok(payload),
-        [first, second, ..] => Err(Error::Status {
-            first: *first,
-            second: *second,
-        }),
-        _ => Err(Error::Layout),
-    }
-}
-
-#[derive(Debug)]
-struct Secure {
+pub(super) struct AesCipher {
     encryption: Aes128,
     authentication: Zeroizing<[u8; 16]>,
     identifier: [u8; 6],
     salt: [u8; 3],
-    counter: u16,
 }
 
-impl Secure {
+impl AesCipher {
     fn iv(&self, length: u8, code: u8, counter: [u8; 2]) -> [u8; 16] {
         let mut iv = [0; 16];
         iv[..5].copy_from_slice(&[1, length, code, counter[0], counter[1]]);
@@ -389,8 +155,8 @@ impl Secure {
     }
 
     /// Encrypt and authenticate a payload; `None` if it exceeds one packet.
-    fn seal(&self, code: u8, counter: u16, payload: &mut [u8]) -> Option<Vec<u8>> {
-        let length = u8::try_from(SECURE_OVERHEAD + payload.len()).ok()?;
+    pub(super) fn seal(&self, code: u8, counter: u16, payload: &mut [u8]) -> Option<Vec<u8>> {
+        let length = u8::try_from(packet_len(payload.len())).ok()?;
         let counter = counter.to_le_bytes();
         let iv = self.iv(length, code, counter);
         let mut mac = self.mac(iv, payload)?;
@@ -402,7 +168,11 @@ impl Secure {
         Some(packet)
     }
 
-    fn open<E>(&self, code: u8, packet: Vec<u8>) -> Result<(u16, Zeroizing<Vec<u8>>), Error<E>> {
+    pub(super) fn open<E>(
+        &self,
+        code: u8,
+        packet: Vec<u8>,
+    ) -> Result<(u16, Zeroizing<Vec<u8>>), Error<E>> {
         let [length, response_code, low, high, tail @ ..] = packet.as_slice() else {
             return Err(Error::Layout);
         };

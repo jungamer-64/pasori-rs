@@ -4,7 +4,7 @@
 
 依存は `pasori` から reader crate（`rcs956`、`rcs310`、`port100`）へ、それぞれから `felica-packet` と `iso14443` への一方向で、下位の crate は上位を知らない。reader crate 同士は依存しない。いずれも `no_std` と `alloc` で動作し、`unsafe_code` を禁止する。
 
-`felica-packet` は reader によらない FeliCa カードの packet の事実を所有する。IDm、Polling の要求と応答、packet の長さ byte の検証と、Polling で選択したカードとの packet 交換の contract（`Selection`）がここに属する。各 reader crate は自分の選択 handle でこの contract を実装し、RF 転送・待機・失敗時の状態遷移は reader crate が決める。
+`felica-packet` は reader によらない FeliCa カードの packet の事実を所有する。IDm、Polling の要求と応答、packet の長さ byte の検証と、Polling で選択したカードとの packet 交換の contract（`Selection`）がここに属する。各 reader crate は自分の選択 handle でこの contract を実装し、送受信可能な packet 上限、RF 転送・待機・失敗時の状態遷移を決める。
 
 `iso14443` は reader によらない NFC-A と NFC-B の活性化の事実と、選択したカードとの交換の contract を所有する。SENS_RES・SEL_RES・UID・ATS、ATQB と ATTRIB 応答の検証、そこから決まる ISO-DEP の block parameter がここに属する。交換の contract は、reader が CRC を付けて NFC-A の command frame を運ぶ `nfca::Selection` と、host が block protocol を実行する ISO-DEP の block 転送 `iso_dep::Selection` の 2 つである。`felica-packet` と同じく、reader crate が選択 handle で実装する。
 
@@ -35,7 +35,7 @@ cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p pasor
 
 各操作の詳細な条件は定義側の rustdoc が正本であり、ここでは workspace 全体に共通する契約だけを示す。
 
-失敗した初期化を成功状態として公開しない。カード handle は reader の排他的 borrow を保持し、選択・raw 交換・認証の権限はその borrow と RF 状態より長く残らない。raw 交換や認証へ移ると typed handle は消費され、その前提は回復しない。次の選択要求で消えないカード状態を残す操作は、送る前に選択 handle へ field cycle の必要を宣言する。次の選択はその宣言を受けて RF field を切ってから要求を送る。
+失敗した初期化を成功状態として公開しない。カード handle は reader の排他的 borrow を保持し、選択・raw 交換・認証の権限はその borrow と RF 状態より長く残らない。raw 交換や認証へ移ると typed handle は消費される。FeliCa Standard の有効な認証 session は Reset Mode の成功を検証して Mode0 の typed handle へ移れる。次の選択要求で消えないカード状態を残す操作は、送る前に選択 handle へ field cycle の必要を宣言する。次の選択はその宣言を受けて RF field を切ってから要求を送る。
 
 どの操作も自動で再送しない。例外は FALP の再送で、protocol 自体が順序番号で重複を排除する欠落 block の再要求と、応答のない送信切替 block の再送だけを行う。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みの progress を error に残す。transport 失敗後には RF readiness が失効する。reader への `initialize` は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 
@@ -55,6 +55,6 @@ NFC-A／B の固定 vector はカード実機の成功証拠ではない。`rcs3
 
 ## 外部実装へ委譲する責務
 
-`pasori` の `felica-lite-s` feature は 2-key TDES を `des`、MAC の比較を `subtle`、鍵用バッファの消去を `zeroize` に委譲し、Lite-S のプロトコル、MAC の入力構成、session 状態は crate が所有する。`felica-standard-aes` feature は AES と CMAC を RustCrypto へ委譲し、暗号フレームと取引番号は crate が所有する。フレーム形式の参照は [FeliCa Card User's Manual (Unofficial Edition)](https://soltia48.github.io/felica-users-manual-unofficial/en/) の Mutual Authentication and Secure Messaging Algorithms。どちらもカード鍵と認証ごとの CSPRNG challenge は呼出側が供給する。
+`pasori` の `felica-lite-s`、`felica-standard-aes`、`felica-standard-des` は、ブロック暗号、AES-CMAC、DES-CBC を RustCrypto、MAC の比較を `subtle`、鍵用バッファの消去を `zeroize` に委譲する。カードごとの暗号フレーム、MAC の入力構成、認証状態は `pasori` が所有する。FeliCa Standard の公開コマンドは [Sony のカードユーザーズマニュアル抜粋版](https://www.sony.co.jp/Products/felica/business/tech-support/)、AES と DES の暗号化通信は [非公式版の相互認証・セキュアメッセージングの章](https://soltia48.github.io/felica-users-manual-unofficial/ja/) を参照する。カード鍵と認証ごとの CSPRNG challenge は呼出側が供給する。
 
 `serde_json` は `rcs956` の固定 fixture の読取にだけ使う dev dependency で、通常の library へ入れない。JSON parser とその formatter／string 処理の依存、および Cargo target に基づく build script は test build の trust surface として扱う。

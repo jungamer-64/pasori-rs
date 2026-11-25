@@ -6,10 +6,19 @@ use alloc::vec::Vec;
 use core::fmt;
 use felica_packet::{Idm, Selection};
 
+mod discovery;
+pub use discovery::{KeyVersion, SpecificationVersion, V2KeyVersions};
+
 #[cfg(feature = "felica-lite-s")]
 pub mod lite_s;
 #[cfg(feature = "felica-standard-aes")]
 pub mod standard_aes;
+#[cfg(feature = "felica-standard-des")]
+pub mod standard_des;
+#[cfg(any(feature = "felica-standard-aes", feature = "felica-standard-des"))]
+mod standard_session;
+#[cfg(any(feature = "felica-standard-aes", feature = "felica-standard-des"))]
+pub use standard_session::{IssueInformation, StandardError, StandardSession};
 
 /// Maximum blocks in one supported Read Without Encryption command.
 pub const MAX_READ_BLOCKS: usize = 12;
@@ -34,10 +43,39 @@ pub enum CardError {
         /// Actual response command.
         actual: u8,
     },
-    /// Read block count is outside the supported baseline range `1..=12`.
+    /// The read block count is outside the command's supported range.
     BlockCount(usize),
     /// Write block count is outside `1..=13`.
     WriteBlockCount(usize),
+    /// A service or node list is outside the command's supported count range.
+    CodeCount {
+        /// Maximum number of codes in the list.
+        maximum: usize,
+        /// Number of supplied codes.
+        actual: usize,
+    },
+    /// A block's service index cannot address an entry in the command's list.
+    ServiceIndex(u8),
+    /// A request or its successful reply exceeds the selected reader's limit.
+    PacketBudget {
+        /// Maximum bytes the exchange can carry in either direction.
+        maximum: usize,
+        /// Required bytes, including the FeliCa length byte.
+        required: usize,
+    },
+    /// A successful reply's item count differs from the request.
+    ResponseCount {
+        /// Requested item count.
+        expected: usize,
+        /// Item count declared in the reply.
+        actual: usize,
+    },
+    /// Request Service v2 returned an unrecognized cryptographic identifier.
+    CryptoIdentifier(u8),
+    /// Request Specification Version returned an unsupported reply format.
+    SpecificationFormat(u8),
+    /// An enabled/disabled MAC communication flag had a different value.
+    MacProperty(u8),
     /// A response belongs to a different selected identity.
     IdentityMismatch {
         /// Identity selected by the caller.
@@ -71,7 +109,7 @@ impl fmt::Display for CardError {
                 write!(f, "card response {actual:02X}, expected {expected:02X}")
             }
             Self::BlockCount(count) => {
-                write!(f, "block count {count} is outside 1..={MAX_READ_BLOCKS}")
+                write!(f, "unsupported read block count {count}")
             }
             Self::WriteBlockCount(count) => {
                 write!(
@@ -79,6 +117,24 @@ impl fmt::Display for CardError {
                     "write block count {count} is outside 1..={MAX_WRITE_BLOCKS}"
                 )
             }
+            Self::CodeCount { maximum, actual } => {
+                write!(f, "code count {actual} is outside 1..={maximum}")
+            }
+            Self::ServiceIndex(index) => write!(f, "invalid service index {index}"),
+            Self::PacketBudget { maximum, required } => {
+                write!(
+                    f,
+                    "packet needs {required} bytes but the limit is {maximum}"
+                )
+            }
+            Self::ResponseCount { expected, actual } => {
+                write!(f, "response declares {actual} entries, expected {expected}")
+            }
+            Self::CryptoIdentifier(value) => write!(f, "unknown crypto identifier {value:02X}"),
+            Self::SpecificationFormat(value) => {
+                write!(f, "unsupported specification response format {value:02X}")
+            }
+            Self::MacProperty(value) => write!(f, "invalid MAC property {value:02X}"),
             Self::IdentityMismatch { expected, actual } => {
                 write!(f, "card identity {actual}, expected {expected}")
             }
@@ -91,6 +147,105 @@ impl fmt::Display for CardError {
 }
 
 impl core::error::Error for CardError {}
+
+/// Direct access to a block in the command or session's ordered service list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockAddress {
+    service_index: u8,
+    number: u16,
+}
+
+impl BlockAddress {
+    /// Specify a block by its service's zero-based index and its block number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CardError::ServiceIndex`] for an index above 15. An exchange
+    /// also checks that the index exists in its service list.
+    pub const fn new(service_index: u8, number: u16) -> Result<Self, CardError> {
+        if service_index > 15 {
+            return Err(CardError::ServiceIndex(service_index));
+        }
+        Ok(Self {
+            service_index,
+            number,
+        })
+    }
+
+    /// Address a block in the first service.
+    pub const fn first(number: u16) -> Self {
+        Self {
+            service_index: 0,
+            number,
+        }
+    }
+}
+
+/// A block and its 16 replacement bytes in card byte order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockWrite {
+    /// Block to update.
+    pub address: BlockAddress,
+    /// Replacement data.
+    pub data: [u8; 16],
+}
+
+fn code_count(actual: usize, maximum: u8) -> Result<u8, CardError> {
+    u8::try_from(actual)
+        .ok()
+        .filter(|count| (1..=maximum).contains(count))
+        .ok_or(CardError::CodeCount {
+            maximum: usize::from(maximum),
+            actual,
+        })
+}
+
+fn append_codes(data: &mut Vec<u8>, codes: &[u16], maximum: u8) -> Result<(), CardError> {
+    data.push(code_count(codes.len(), maximum)?);
+    data.extend(codes.iter().flat_map(|code| code.to_le_bytes()));
+    Ok(())
+}
+
+fn append_blocks(
+    data: &mut Vec<u8>,
+    service_count: usize,
+    blocks: impl ExactSizeIterator<Item = BlockAddress>,
+) -> Result<(), CardError> {
+    data.push(u8::try_from(blocks.len()).map_err(|_| CardError::BlockCount(blocks.len()))?);
+    for block in blocks {
+        if usize::from(block.service_index) >= service_count {
+            return Err(CardError::ServiceIndex(block.service_index));
+        }
+        let [low, high] = block.number.to_le_bytes();
+        if high == 0 {
+            data.extend([0x80 | block.service_index, low]);
+        } else {
+            data.extend([block.service_index, low, high]);
+        }
+    }
+    Ok(())
+}
+
+fn admit_packet(selection: &impl Selection, required: usize) -> Result<(), CardError> {
+    let maximum = selection.max_packet_len().min(usize::from(u8::MAX));
+    if required > maximum {
+        return Err(CardError::PacketBudget { maximum, required });
+    }
+    Ok(())
+}
+
+fn unencrypted_read_parameters(
+    services: &[u16],
+    blocks: &[BlockAddress],
+) -> Result<Vec<u8>, CardError> {
+    if !(1..=MAX_READ_BLOCKS).contains(&blocks.len()) {
+        return Err(CardError::BlockCount(blocks.len()));
+    }
+    let mut data = Vec::new();
+    append_codes(&mut data, services, 16)?;
+    append_blocks(&mut data, services.len(), blocks.iter().copied())?;
+    Ok(data)
+}
 
 fn set_length(packet: &mut [u8]) -> Result<(), CardError> {
     packet[0] = u8::try_from(packet.len()).map_err(|_| CardError::Length {
@@ -348,6 +503,45 @@ impl<S: Selection> Card<S> {
         self.selection.poll_response().idm
     }
 
+    /// Read up to twelve blocks from up to sixteen unencrypted services.
+    /// Blocks are returned in request order. Card-specific limits also apply.
+    pub fn read_without_encryption(
+        &mut self,
+        services: &[u16],
+        blocks: &[BlockAddress],
+    ) -> Result<ReadResponse, Error<S::Error>> {
+        let data = unencrypted_read_parameters(services, blocks).map_err(Error::Request)?;
+        admit_packet(&self.selection, 13 + blocks.len() * 16).map_err(Error::Request)?;
+        let response = self.exchange_addressed(0x06, &data)?;
+        ReadResponse::parse(&response, self.idm(), blocks.len()).map_err(Error::Response)
+    }
+
+    /// Write blocks in one command to up to sixteen unencrypted services.
+    /// Card-specific limits also apply. After sending, an exchange failure
+    /// can leave the write applied. The reader error carries transfer progress.
+    pub fn write_without_encryption(
+        &mut self,
+        services: &[u16],
+        blocks: &[BlockWrite],
+    ) -> Result<(), Error<S::Error>> {
+        if !(1..=MAX_WRITE_BLOCKS).contains(&blocks.len()) {
+            return Err(Error::Request(CardError::WriteBlockCount(blocks.len())));
+        }
+        let mut data = Vec::new();
+        append_codes(&mut data, services, 16).map_err(Error::Request)?;
+        append_blocks(
+            &mut data,
+            services.len(),
+            blocks.iter().map(|block| block.address),
+        )
+        .map_err(Error::Request)?;
+        for block in blocks {
+            data.extend(block.data);
+        }
+        let reply = self.exchange_addressed(0x08, &data)?;
+        write_response(&reply, self.idm()).map_err(Error::Response)
+    }
+
     /// Confirm that the selected card still answers at its IDm, using Request
     /// Response. Returns the card's current mode byte; the command changes no
     /// card state. An absent card surfaces as the reader's failure to receive
@@ -398,6 +592,7 @@ impl<S: Selection> Card<S> {
     }
 
     fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
+        admit_packet(&self.selection, 10 + data.len()).map_err(Error::Request)?;
         let request = addressed_command(self.idm(), command, data).map_err(Error::Request)?;
         self.exchange_packet(&request)
     }
@@ -409,7 +604,11 @@ impl<S: Selection> Card<S> {
     }
 
     /// Authentication changes card state that a new Polling does not clear.
-    #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
+    #[cfg(any(
+        feature = "felica-lite-s",
+        feature = "felica-standard-aes",
+        feature = "felica-standard-des"
+    ))]
     pub(crate) fn begin_authentication(&mut self) {
         self.selection.require_field_cycle();
     }
@@ -436,18 +635,25 @@ mod tests {
     #[test]
     fn service_and_large_block_byte_order() -> Result<(), CardError> {
         let idm = Idm::new([1, 2, 3, 4, 5, 6, 7, 8]);
+        let services = [0x000b, 0x1234];
+        let blocks = [
+            BlockAddress::first(0),
+            BlockAddress::new(1, 255)?,
+            BlockAddress::new(1, 256)?,
+        ];
         assert_eq!(
-            read_without_encryption(idm, 0x000b, &[0, 255, 256])?,
+            addressed_command(idm, 0x06, &unencrypted_read_parameters(&services, &blocks)?)?,
             [
-                21, 6, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0x0b, 0, 3, 0x80, 0, 0x80, 0xff, 0, 0, 1
+                23, 6, 1, 2, 3, 4, 5, 6, 7, 8, 2, 0x0b, 0, 0x34, 0x12, 3, 0x80, 0, 0x81, 0xff, 1,
+                0, 1
             ]
         );
         assert!(matches!(
-            read_without_encryption(idm, 0x000b, &[]),
+            unencrypted_read_parameters(&services, &[]),
             Err(CardError::BlockCount(0))
         ));
         assert!(matches!(
-            read_without_encryption(idm, 0x000b, &[0; 13]),
+            unencrypted_read_parameters(&services, &[BlockAddress::first(0); 13]),
             Err(CardError::BlockCount(13))
         ));
         Ok(())

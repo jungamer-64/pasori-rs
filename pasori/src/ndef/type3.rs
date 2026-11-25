@@ -1,5 +1,5 @@
 use super::{Error, UpdateStage, WriteError};
-use crate::felica::{self, BlockWrite, Card, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS};
+use crate::felica::{self, BlockAddress, BlockWrite, Card, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS};
 use alloc::vec::Vec;
 use felica_packet::{PollRequest, Selection};
 
@@ -41,10 +41,10 @@ impl<S: Selection> Type3Tag<S> {
         let mut blocks = BlockRange::for_bytes(length)?;
         let limit = usize::from(attribute.0[1]).min(MAX_READ_BLOCKS);
         while !blocks.is_empty() {
-            let batch: Vec<_> = blocks.take(limit).collect();
+            let batch: Vec<_> = blocks.take(limit).map(BlockAddress::first).collect();
             let response = self
                 .0
-                .read_without_encryption(READ_SERVICE, &batch)
+                .read_without_encryption(&[READ_SERVICE], &batch)
                 .map_err(Error::Exchange)?;
             for block in response.blocks() {
                 data.extend_from_slice(&block[..(length - data.len()).min(BLOCK_BYTES)]);
@@ -98,11 +98,14 @@ impl<S: Selection> Type3Tag<S> {
                     let len = (message.len() - end).min(BLOCK_BYTES);
                     data[..len].copy_from_slice(&message[end..end + len]);
                     end += len;
-                    BlockWrite { block, data }
+                    BlockWrite {
+                        address: BlockAddress::first(block),
+                        data,
+                    }
                 })
                 .collect();
             self.0
-                .write_without_encryption(WRITE_SERVICE, &batch)
+                .write_without_encryption(&[WRITE_SERVICE], &batch)
                 .map_err(|error| {
                     WriteError::update(UpdateStage::Data, written, Error::Exchange(error))
                 })?;
@@ -115,7 +118,7 @@ impl<S: Selection> Type3Tag<S> {
     fn attribute(&mut self) -> Result<Attribute, Error<felica::Error<S::Error>>> {
         let response = self
             .0
-            .read_without_encryption(READ_SERVICE, &[0])
+            .read_without_encryption(&[READ_SERVICE], &[BlockAddress::first(0)])
             .map_err(Error::Exchange)?;
         let [block] = response.blocks() else {
             return Err(Error::Layout("Type 3 attribute block count"));
@@ -125,7 +128,13 @@ impl<S: Selection> Type3Tag<S> {
 
     fn write_attribute(&mut self, data: [u8; 16]) -> Result<(), Error<felica::Error<S::Error>>> {
         self.0
-            .write_without_encryption(WRITE_SERVICE, &[BlockWrite { block: 0, data }])
+            .write_without_encryption(
+                &[WRITE_SERVICE],
+                &[BlockWrite {
+                    address: BlockAddress::first(0),
+                    data,
+                }],
+            )
             .map_err(Error::Exchange)
     }
 }

@@ -6,7 +6,7 @@
 //! The TDES backend is intended for this legacy card protocol and may have
 //! key-dependent memory access.
 
-use super::{BlockWrite, Card, Error as CommandError};
+use super::{BlockAddress, BlockWrite, Card, Error as CommandError};
 use core::fmt;
 use des::{
     TdesEde2,
@@ -143,7 +143,7 @@ impl<S: Selection> Card<S> {
             &mut self,
             Stage::Challenge,
             &[BlockWrite {
-                block: CHALLENGE,
+                address: BlockAddress::first(CHALLENGE),
                 data: challenge,
             }],
         )?;
@@ -221,7 +221,7 @@ fn write<S: Selection>(
     stage: Stage,
     blocks: &[BlockWrite],
 ) -> Result<(), Error<S::Error>> {
-    card.write_without_encryption(WRITE_SERVICE, blocks)
+    card.write_without_encryption(&[WRITE_SERVICE], blocks)
         .map_err(|cause| Error::Exchange { stage, cause })
 }
 
@@ -264,9 +264,10 @@ impl SessionKeys {
         const { assert!(N >= 1 && N <= 3) };
         let mut request = [MAC_A; 4];
         request[..N].copy_from_slice(&blocks);
+        let addresses = request.map(BlockAddress::first);
         let request = &request[..=N];
         let response = card
-            .read_without_encryption(READ_SERVICE, request)
+            .read_without_encryption(&[READ_SERVICE], &addresses[..=N])
             .map_err(|cause| Error::Exchange { stage, cause })?;
         // read_without_encryption checks the exact requested block count.
         let data = &response.blocks()[..N];
@@ -297,9 +298,12 @@ impl SessionKeys {
             card,
             stage,
             &[
-                BlockWrite { block, data },
                 BlockWrite {
-                    block: MAC_A,
+                    address: BlockAddress::first(block),
+                    data,
+                },
+                BlockWrite {
+                    address: BlockAddress::first(MAC_A),
                     data: self.write_proof(block, &data, counter),
                 },
             ],
