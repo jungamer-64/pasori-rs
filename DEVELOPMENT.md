@@ -59,7 +59,7 @@ NDEF の書込みはメッセージを非公開にしてから本文を更新し
 
 固定 packet vector はデバイスに送るフレームと応答の解釈を検証する。実機 capture は USB と RF の観測範囲を別途記録する。
 
-NFC-A／B の固定 vector はカード実機の成功証拠ではない。`rcs310` の固定 vector は Sony のドライバーの静的解析と第三者実装の挙動から組み立てたもので、RC-S310 と RC-S320 の実機では FeliCa の Polling と packet 交換を確認している。`port100` の固定 vector は Sony のドライバーの静的解析と ISO/IEC 14443 の frame から組み立てたもので、RC-S380 の実機では FeliCa の Polling と packet 交換、NFC-A と NFC-B の活性化、ISO-DEP の block 交換を確認している。NFC-A の command 交換は CRC を host で検査し、InCommRF 応答の第 5 byte が 4 を示す 1 byte を 4-bit の ACK／NAK として受け取る。この byte をドライバーが 8 と比べることから最終 byte の有効 bit 数と推定したもので、実機の値は確認していない。`port110` の固定 vector は Sony のドライバーの静的解析から組み立てたもので、Port-110 リーダーの実機では、初期化（RF 設定表の調整を含む）、212 kbps と 424 kbps の FeliCa の Polling と packet 交換を確認している。全 firmware、全カード command／APDU の意味と副作用の成立は、固定 vector の検証対象に含めない。
+NFC-A／B の固定 vector はカード実機の成功証拠ではない。`rcs310` の固定 vector は Sony のドライバーの静的解析と第三者実装の挙動から組み立てたもので、RC-S310 と RC-S320 の実機では FeliCa の Polling と packet 交換を確認している。`port100` の固定 vector は Sony のドライバーの静的解析と ISO/IEC 14443 の frame から組み立てたもので、RC-S380 の実機では FeliCa の Polling と packet 交換、NFC-A と NFC-B の活性化、ISO-DEP の block 交換を確認している。NFC-A の command 交換は CRC を host で検査し、InCommRF 応答の第 5 byte が 4 を示す 1 byte を 4-bit の ACK／NAK として受け取る。この byte をドライバーが 8 と比べることから最終 byte の有効 bit 数と推定したもので、実機の値は確認していない。`port110` の固定 vector は Sony のドライバーの静的解析から組み立てたもので、Port-110 リーダーの実機では、初期化（RF 設定表の調整を含む）、212 kbps と 424 kbps の FeliCa の Polling と packet 交換、RC-S380 の passive target からの Type 3 NDEF の読取り、host の期限切れ後の再同期を確認している。全 firmware、全カード command／APDU の意味と副作用の成立は、固定 vector の検証対象に含めない。
 
 ## 外部実装へ委譲する責務
 
