@@ -7,10 +7,12 @@
 
 mod iso_dep;
 mod settings;
+mod target;
 mod type_a;
 mod type_b;
 
 pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard, MAX_BLOCK_BYTES};
+pub use target::{FelicaTarget, TargetCommand, TargetWait, TypeATarget};
 pub use type_a::{TypeACard, TypeASelection};
 
 use crate::transport::{Failure, Link, Progress, TransactionError, Transport};
@@ -64,6 +66,10 @@ pub enum Error<E> {
     /// No card reply arrived within the wait. The card may have received the
     /// frame and taken effect; the reader remains usable.
     NoResponse,
+    /// A passive target received no frame during its wait. It may wait again.
+    TargetTimeout,
+    /// The initiator's field went away. The next receive awaits a new activation.
+    TargetFieldOff,
     /// NFC-A activation data failed validation.
     TypeA(nfca::Error),
     /// NFC-B activation data failed validation.
@@ -109,6 +115,8 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
                 f.write_str("FeliCa response failed; the command may have taken effect")
             }
             Self::NoResponse => f.write_str("no card reply; the command may have taken effect"),
+            Self::TargetTimeout => f.write_str("no initiator command received within the wait"),
+            Self::TargetFieldOff => f.write_str("the initiator's RF field is off"),
             Self::TypeA(_) => f.write_str("invalid NFC-A activation"),
             Self::TypeB(_) => f.write_str("invalid NFC-B activation"),
             Self::CardReply(reason) => write!(f, "malformed card reply: {reason}"),

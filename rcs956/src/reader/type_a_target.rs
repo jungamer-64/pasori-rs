@@ -2,6 +2,7 @@ use super::{Error, Reader, RfTimeout, State};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 use core::{mem, time::Duration};
+use iso14443::nfca::{PassiveTarget, PassiveTargetReader, TargetCommand};
 
 const CONTROL_WAIT: Duration = Duration::from_secs(1);
 /// First NFCID1 byte that the firmware assigns to a target UID.
@@ -129,5 +130,55 @@ impl<T: Transport> TypeACommand<'_, '_, T> {
         }
         target.state = TargetState::Waiting;
         Ok(())
+    }
+}
+
+impl<T: Transport> PassiveTargetReader for Reader<T> {
+    type Error = Error<T::Error>;
+    type Wait = RfTimeout;
+    type Target<'a>
+        = TypeATarget<'a, T>
+    where
+        T: 'a;
+
+    fn listen_type_a(
+        &mut self,
+        suffix: [u8; 3],
+        wait: RfTimeout,
+    ) -> Result<Self::Target<'_>, Self::Error> {
+        Reader::listen_type_a(self, suffix, wait)
+    }
+}
+
+impl<'r, T: Transport> PassiveTarget for TypeATarget<'r, T> {
+    type Error = Error<T::Error>;
+    type Wait = RfTimeout;
+    type Command<'a>
+        = TypeACommand<'a, 'r, T>
+    where
+        Self: 'a;
+
+    fn uid(&self) -> [u8; 4] {
+        self.uid()
+    }
+
+    fn receive(&mut self, wait: RfTimeout) -> Result<Self::Command<'_>, Self::Error> {
+        self.receive(wait)
+    }
+
+    fn finish(self) -> Result<(), Self::Error> {
+        self.finish()
+    }
+}
+
+impl<T: Transport> TargetCommand for TypeACommand<'_, '_, T> {
+    type Error = Error<T::Error>;
+
+    fn data(&self) -> &[u8] {
+        self.data()
+    }
+
+    fn respond(self, data: &[u8]) -> Result<(), Self::Error> {
+        self.respond(data)
     }
 }

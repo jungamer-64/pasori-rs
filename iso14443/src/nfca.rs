@@ -276,6 +276,56 @@ pub trait Selection {
     fn require_field_cycle(&mut self);
 }
 
+/// A passive NFC-A target with a single-size UID and no ISO-DEP.
+pub trait PassiveTarget {
+    /// Reader failure at the target boundary.
+    type Error: fmt::Debug;
+    /// Reader-specific wait for an initiator.
+    type Wait;
+    /// One received command and the exclusive right to answer it.
+    type Command<'a>: TargetCommand<Error = Self::Error>
+    where
+        Self: 'a;
+
+    /// The UID advertised during anticollision.
+    fn uid(&self) -> [u8; 4];
+    /// Receive the next initiator command, without CRC.
+    fn receive(&mut self, wait: Self::Wait) -> Result<Self::Command<'_>, Self::Error>;
+    /// Stop target operation and restore the reader to RF-off readiness.
+    fn finish(self) -> Result<(), Self::Error>;
+}
+
+/// A command received by a passive target. Dropping it leaves it unanswered.
+pub trait TargetCommand {
+    /// Reader failure while transmitting a response.
+    type Error: fmt::Debug;
+
+    /// Received command bytes, without CRC.
+    fn data(&self) -> &[u8];
+    /// Answer this command once. On failure, delivery can be uncertain.
+    fn respond(self, data: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Reader able to advertise a passive NFC-A target without ISO-DEP.
+pub trait PassiveTargetReader {
+    /// Reader failure while entering target mode.
+    type Error: fmt::Debug;
+    /// Reader-specific wait for an initiator.
+    type Wait;
+    /// Passive target holding the exclusive reader borrow.
+    type Target<'a>: PassiveTarget<Error = Self::Error, Wait = Self::Wait>
+    where
+        Self: 'a;
+
+    /// Prepare the target with UID `08` followed by `suffix`. A reader may
+    /// wait for the first command during setup or on the first receive.
+    fn listen_type_a(
+        &mut self,
+        suffix: [u8; 3],
+        wait: Self::Wait,
+    ) -> Result<Self::Target<'_>, Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

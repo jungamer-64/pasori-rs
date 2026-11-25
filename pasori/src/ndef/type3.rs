@@ -1,7 +1,12 @@
-use super::{Error, UpdateStage, WriteError};
+use super::{Error, Message, MessageError, UpdateStage, WriteError};
 use crate::felica::{self, BlockAddress, BlockWrite, Card, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS};
 use alloc::vec::Vec;
-use felica_packet::{PollRequest, Selection};
+use core::fmt;
+use felica_packet::{Idm, PollRequest, Selection};
+use port100::{
+    reader::{self, BitRate, FelicaTarget, TargetWait},
+    transport::Transport,
+};
 
 /// NFC Forum Type 3 system code.
 const SYSTEM: u16 = 0x12fc;
@@ -15,6 +20,185 @@ pub const TYPE3_POLLING: PollRequest = match PollRequest::new(SYSTEM, 0, 0) {
 const READ_SERVICE: u16 = 0x000b;
 const WRITE_SERVICE: u16 = 0x0009;
 const BLOCK_BYTES: usize = 16;
+const READ_LIMIT: u8 = 12;
+
+/// Maximum message length of the read-only Type 3 mapping.
+pub const MAX_TYPE3_EMULATED_NDEF_BYTES: usize = u16::MAX as usize * BLOCK_BYTES;
+
+/// Failure preparing or operating a read-only Type 3 target.
+#[derive(Debug)]
+pub enum Type3EmulationError<E> {
+    /// The proposed bytes exceed the mapping's capacity.
+    MessageLength(usize),
+    /// The bytes do not encode a complete NDEF message.
+    Message(MessageError),
+    /// Target setup, reception or response failed at the reader.
+    Reader(reader::Error<E>),
+}
+
+impl<E: fmt::Debug> fmt::Display for Type3EmulationError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MessageLength(length) => write!(
+                f,
+                "NDEF message of {length} bytes exceeds {MAX_TYPE3_EMULATED_NDEF_BYTES}"
+            ),
+            Self::Message(error) => write!(f, "invalid NDEF message: {error}"),
+            Self::Reader(error) => write!(f, "Type 3 target: {error}"),
+        }
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for Type3EmulationError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::MessageLength(_) => None,
+            Self::Message(error) => Some(error),
+            Self::Reader(error) => Some(error),
+        }
+    }
+}
+
+/// The disposition of one frame received by a read-only Type 3 target.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Type3Event {
+    /// Sent the requested NDEF blocks, in the requested order.
+    Read,
+    /// An unsupported command, address or packet was left unanswered.
+    Ignored,
+}
+
+/// Passive Type 3 target serving a fixed NDEF message on Port-100.
+/// The reader answers the activation Polling. The host serves the read-only
+/// NDEF service.
+#[derive(Debug)]
+pub struct Type3Target<'r, 'm, T: Transport> {
+    target: FelicaTarget<'r, T>,
+    idm: Idm,
+    attribute: [u8; BLOCK_BYTES],
+    message: &'m [u8],
+}
+
+impl<'r, 'm, T: Transport> Type3Target<'r, 'm, T> {
+    /// Configure a read-only Type 3 target with the supplied identity and PMm.
+    /// The message is validated before configuring the reader. An empty
+    /// message exposes an empty mapping.
+    pub fn listen(
+        reader: &'r mut reader::Reader<T>,
+        rate: BitRate,
+        idm: Idm,
+        pmm: [u8; 8],
+        message: &'m [u8],
+    ) -> Result<Self, Type3EmulationError<T::Error>> {
+        let blocks = u16::try_from(message.len().div_ceil(BLOCK_BYTES).max(1))
+            .map_err(|_| Type3EmulationError::MessageLength(message.len()))?;
+        let length = Attribute::encode_length(message.len())
+            .ok_or(Type3EmulationError::MessageLength(message.len()))?;
+        if !message.is_empty() {
+            Message::parse(message).map_err(Type3EmulationError::Message)?;
+        }
+        let mut attribute = [0; BLOCK_BYTES];
+        attribute[0] = 0x10;
+        attribute[1] = READ_LIMIT;
+        attribute[3..5].copy_from_slice(&blocks.to_be_bytes());
+        let target = reader
+            .listen_felica(rate, idm, pmm, SYSTEM)
+            .map_err(Type3EmulationError::Reader)?;
+        Ok(Self {
+            target,
+            idm,
+            attribute: Attribute(attribute).published(length),
+            message,
+        })
+    }
+
+    /// Receive one command and serve a valid Read Without Encryption request
+    /// addressed to this tag's read-only NDEF service.
+    pub fn serve_next(
+        &mut self,
+        wait: TargetWait,
+    ) -> Result<Type3Event, Type3EmulationError<T::Error>> {
+        let command = self
+            .target
+            .receive(wait)
+            .map_err(Type3EmulationError::Reader)?;
+        let Some(reply) = type3_read_reply(self.idm, &self.attribute, self.message, command.data())
+        else {
+            return Ok(Type3Event::Ignored);
+        };
+        command
+            .respond(&reply)
+            .map_err(Type3EmulationError::Reader)?;
+        Ok(Type3Event::Read)
+    }
+
+    /// Stop target operation and reinitialize the reader.
+    pub fn finish(self) -> Result<(), reader::Error<T::Error>> {
+        self.target.finish()
+    }
+}
+
+fn type3_read_reply(
+    idm: Idm,
+    attribute: &[u8; BLOCK_BYTES],
+    message: &[u8],
+    packet: &[u8],
+) -> Option<Vec<u8>> {
+    let (
+        &[
+            _,
+            0x06,
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+            g,
+            h,
+            1,
+            service_low,
+            service_high,
+            count @ 1..=READ_LIMIT,
+        ],
+        mut blocks,
+    ) = packet.split_first_chunk::<14>()?
+    else {
+        return None;
+    };
+    if &[a, b, c, d, e, f, g, h] != idm.as_bytes()
+        || u16::from_le_bytes([service_low, service_high]) != READ_SERVICE
+    {
+        return None;
+    }
+    let length = 13 + usize::from(count) * BLOCK_BYTES;
+    let mut reply = Vec::with_capacity(length);
+    reply.extend([u8::try_from(length).ok()?, 0x07]);
+    reply.extend_from_slice(idm.as_bytes());
+    reply.extend([0, 0, count]);
+    for _ in 0..count {
+        let (block, tail) = match blocks {
+            [0x80, low, tail @ ..] => (u16::from(*low), tail),
+            [0x00, low, high, tail @ ..] => (u16::from_le_bytes([*low, *high]), tail),
+            _ => return None,
+        };
+        blocks = tail;
+        if block == 0 {
+            reply.extend_from_slice(attribute);
+        } else {
+            let start = usize::from(block - 1) * BLOCK_BYTES;
+            let available_blocks = u16::from_be_bytes([attribute[3], attribute[4]]);
+            if block > available_blocks {
+                return None;
+            }
+            let end = (start + BLOCK_BYTES).min(message.len());
+            let bytes = &message[start..end];
+            reply.extend_from_slice(bytes);
+            reply.resize(reply.len() + BLOCK_BYTES - bytes.len(), 0);
+        }
+    }
+    blocks.is_empty().then_some(reply)
+}
 
 /// A selected NFC Forum Type 3 system. Its IDm comes from polling system 12FC.
 #[derive(Debug)]
