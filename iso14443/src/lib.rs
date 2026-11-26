@@ -25,7 +25,7 @@ impl FrameSize {
     /// FSCI D–F are RFU; ISO/IEC 14443-4 directs a PCD to read them as C.
     fn from_index(index: u8) -> Self {
         Self(match index {
-            0 => 16,
+            0 => iso_dep::MIN_FRAME_BYTES,
             1 => 24,
             2 => 32,
             3 => 40,

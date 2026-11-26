@@ -6,6 +6,10 @@ use crate::WaitIndex;
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
+/// Smallest frame of the block protocol, including CRC: the frame size that
+/// FSCI and FSDI 0 grant.
+pub const MIN_FRAME_BYTES: u16 = 16;
+
 /// Block protocol parameters that a card's activation granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parameters {
@@ -73,7 +77,8 @@ pub trait Selection {
     fn parameters(&self) -> Parameters;
 
     /// Largest block, including its two CRC bytes, that the reader carries in
-    /// each direction.
+    /// each direction. A reader that carries the block protocol carries
+    /// blocks of at least [`MIN_FRAME_BYTES`].
     fn maximum_block_bytes(&self) -> usize;
 
     /// Apply the reader setup of block transfers. Failure sends no block.

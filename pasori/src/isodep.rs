@@ -37,6 +37,9 @@ pub enum ParameterError {
     Nad(u8),
     /// The selected card did not advertise NAD support.
     NadUnsupported,
+    /// The reader's block limit is below the smallest ISO-DEP frame,
+    /// [`iso_dep::MIN_FRAME_BYTES`].
+    ReaderBlockBytes(usize),
 }
 impl fmt::Display for ParameterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -44,6 +47,11 @@ impl fmt::Display for ParameterError {
             Self::Cid(cid) => write!(f, "CID {cid} is outside 1..=14"),
             Self::Nad(nad) => write!(f, "reserved node address {nad:02X}"),
             Self::NadUnsupported => f.write_str("card does not support node addressing"),
+            Self::ReaderBlockBytes(bytes) => write!(
+                f,
+                "reader block limit {bytes} is below the {} byte ISO-DEP frame",
+                iso_dep::MIN_FRAME_BYTES
+            ),
         }
     }
 }
@@ -262,6 +270,10 @@ impl Session {
             && !(1..=14).contains(&cid)
         {
             return Err(ParameterError::Cid(cid));
+        }
+        // Activation data never grants a card frame below the minimum.
+        if channel_frame_bytes < usize::from(iso_dep::MIN_FRAME_BYTES) {
+            return Err(ParameterError::ReaderBlockBytes(channel_frame_bytes));
         }
         Ok(Self {
             state: State::Active(0),
@@ -691,8 +703,8 @@ impl<S: iso_dep::Selection> IsoDepCard<S> {
     ///
     /// # Errors
     ///
-    /// Rejects a node address the card does not advertise and a CID outside
-    /// 1..=14.
+    /// Rejects a node address the card does not advertise, a CID outside
+    /// 1..=14, and a reader block limit below [`iso_dep::MIN_FRAME_BYTES`].
     pub fn new(mut card: S, node_address: Option<NodeAddress>) -> Result<Self, ParameterError> {
         match session(&card, node_address) {
             Ok(session) => Ok(Self { card, session }),
@@ -795,6 +807,36 @@ mod tests {
 
     fn session(fsc: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
         Session::new(fsc, 64, cid, FWI4, None, None)
+    }
+
+    #[test]
+    fn reader_blocks_must_hold_the_smallest_frame() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            Session::new(16, 15, Some(1), FWI4, None, None).err(),
+            Some(ParameterError::ReaderBlockBytes(15))
+        );
+        // A 16-byte block with CID holds 12 application bytes.
+        let mut link = Session::new(4096, 16, Some(1), FWI4, None, None)?;
+        let mut first = vec![0x1a, 1];
+        first.extend_from_slice(&[0x55; 12]);
+        let mut steps = VecDeque::from([
+            (first, vec![0xaa, 1]),
+            (vec![0x0b, 1, 0x55], vec![0x0b, 1, 0x90, 0]),
+        ]);
+        let reply = link.prepare::<io::Error>(&[0x55; 13])?.exchange(
+            Ok(()),
+            |_| false,
+            |_, frame, _| {
+                let (expected, reply) = steps
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("extra transfer"))?;
+                assert_eq!(frame, expected);
+                Ok::<_, io::Error>(reply)
+            },
+        )?;
+        assert_eq!(reply, [0x90, 0]);
+        assert!(steps.is_empty());
+        Ok(())
     }
 
     #[test]
