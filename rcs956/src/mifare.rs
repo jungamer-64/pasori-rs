@@ -78,7 +78,7 @@ impl<'reader, T: Transport> TypeACard<'reader, T> {
         key: &[u8; 6],
     ) -> Result<Sector<'_, 'reader, T>, Error<T::Error>> {
         let observation = self.observation();
-        let maximum = match observation.sel_res() {
+        let maximum = match observation.sel_res().byte() {
             0x09 => 19,
             0x08 => 63,
             0x18 => 255,

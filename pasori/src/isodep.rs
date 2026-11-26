@@ -3,15 +3,18 @@
 //! The host runs the block protocol of every [`iso_dep::Selection`]; the
 //! reader transfers each block and owns its CRC. The block engine owns
 //! sequencing, CID, chaining and WTX; the transfer channel owns each
-//! synchronous RF transfer and classifies RF timeouts. RF recovery requests a
-//! block within the same APDU exchange. Between APDUs, an R(NAK) probe
+//! synchronous RF transfer and reports a missing reply as silence. RF
+//! recovery requests a block within the same APDU exchange. Between APDUs, an R(NAK) probe
 //! confirms that the card is still in the field. The RC-S956 firmware runs
 //! ISO-DEP for its NFC-A cards itself, and [`ApduExchange`] covers both.
 pub(crate) mod target;
 
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
-use iso14443::{WaitIndex, iso_dep};
+use iso14443::{
+    FrameSize, WaitIndex,
+    iso_dep::{self, Cid, Reply},
+};
 use rcs956::{
     reader::{self, TypeACard},
     transport::Transport,
@@ -31,27 +34,16 @@ const MAX_BLOCK_WAIT: Duration = WaitIndex::MAX.scaled(BLOCK_WAIT_UNIT);
 /// Activation parameters cannot establish the supported block profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterError {
-    /// CID must be absent or lie in 1..=14.
-    Cid(u8),
     /// Reserved node address encoding.
     Nad(u8),
     /// The selected card did not advertise NAD support.
     NadUnsupported,
-    /// The reader's block limit is below the smallest ISO-DEP frame,
-    /// [`iso_dep::MIN_FRAME_BYTES`].
-    ReaderBlockBytes(usize),
 }
 impl fmt::Display for ParameterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cid(cid) => write!(f, "CID {cid} is outside 1..=14"),
             Self::Nad(nad) => write!(f, "reserved node address {nad:02X}"),
             Self::NadUnsupported => f.write_str("card does not support node addressing"),
-            Self::ReaderBlockBytes(bytes) => write!(
-                f,
-                "reader block limit {bytes} is below the {} byte ISO-DEP frame",
-                iso_dep::MIN_FRAME_BYTES
-            ),
         }
     }
 }
@@ -107,8 +99,8 @@ pub enum Cause<E> {
     Preparation(E),
     /// A transfer failed; its application effect can be uncertain.
     Transport(E),
-    /// The RF timeout recovery budget is exhausted. The last failure is preserved.
-    RecoveryExhausted(E),
+    /// Recovery from missing replies exhausted its budget.
+    RecoveryExhausted,
     /// A block violates the selected profile or current protocol phase.
     InvalidBlock(&'static str),
     /// The target requested deselection.
@@ -152,7 +144,7 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
                 return f.write_str("reader setup failed before the APDU was sent");
             }
             Cause::Transport(_) => f.write_str("ISO-DEP transfer failed")?,
-            Cause::RecoveryExhausted(_) => f.write_str("ISO-DEP RF timeout recovery exhausted")?,
+            Cause::RecoveryExhausted => f.write_str("ISO-DEP RF timeout recovery exhausted")?,
             Cause::InvalidBlock(reason) => write!(f, "invalid ISO-DEP block: {reason}")?,
             Cause::Deselected => f.write_str("card requested deselection")?,
             Cause::Budget(budget) => f.write_str(match budget {
@@ -176,9 +168,7 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
 impl<E: error::Error + 'static> error::Error for Error<E> {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.cause {
-            Cause::Preparation(error)
-            | Cause::Transport(error)
-            | Cause::RecoveryExhausted(error) => Some(error),
+            Cause::Preparation(error) | Cause::Transport(error) => Some(error),
             _ => None,
         }
     }
@@ -192,9 +182,8 @@ pub enum PresenceError<E> {
     SessionInvalid,
     /// Reader setup failed before the presence probe was sent.
     Preparation(E),
-    /// Neither the probe nor its bounded repetitions were answered. The last
-    /// RF timeout is preserved.
-    NoResponse(E),
+    /// Neither the probe nor its bounded repetitions were answered.
+    NoResponse,
     /// A transfer failed for a reason other than an RF timeout.
     Transport(E),
     /// The answer was not the R(ACK) that the block protocol requires.
@@ -205,7 +194,7 @@ impl<E: fmt::Debug> fmt::Display for PresenceError<E> {
         f.write_str(match self {
             Self::SessionInvalid => "ISO-DEP session is invalid",
             Self::Preparation(_) => "reader setup failed before the presence check",
-            Self::NoResponse(_) => "card did not answer the presence check",
+            Self::NoResponse => "card did not answer the presence check",
             Self::Transport(_) => "presence check transfer failed",
             Self::InvalidBlock(_) => "presence answer is not the required R(ACK)",
         })
@@ -214,10 +203,8 @@ impl<E: fmt::Debug> fmt::Display for PresenceError<E> {
 impl<E: error::Error + 'static> error::Error for PresenceError<E> {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Preparation(error) | Self::NoResponse(error) | Self::Transport(error) => {
-                Some(error)
-            }
-            Self::SessionInvalid | Self::InvalidBlock(_) => None,
+            Self::Preparation(error) | Self::Transport(error) => Some(error),
+            Self::SessionInvalid | Self::NoResponse | Self::InvalidBlock(_) => None,
         }
     }
 }
@@ -234,7 +221,7 @@ pub(crate) struct Session {
     maximum_frame_bytes: usize,
     maximum_receive_bytes: usize,
     maximum_application_bytes: usize,
-    cid: Option<u8>,
+    cid: Option<Cid>,
     nad: Option<NodeAddress>,
     wait: Duration,
 }
@@ -254,43 +241,35 @@ enum Outbound {
 }
 
 impl Session {
-    /// `card_frame_bytes` is the card's FSC. Received blocks are bounded by
-    /// the transfer channel's block buffer `channel_frame_bytes`, which also
-    /// bounds every transmitted frame. Both sizes include the two CRC bytes.
+    /// Transmitted blocks are bounded by the card frame size (FSC) and the
+    /// reader frame size (FSD), and received blocks by the reader frame size.
     /// Every block waits as `fwi` grants until WTX extends one.
     pub(crate) fn new(
-        card_frame_bytes: u16,
-        channel_frame_bytes: usize,
-        cid: Option<u8>,
+        card_frame_size: FrameSize,
+        reader_frame_size: FrameSize,
+        cid: Option<Cid>,
         fwi: WaitIndex,
         card_buffer: Option<usize>,
         nad: Option<NodeAddress>,
-    ) -> Result<Self, ParameterError> {
-        if let Some(cid) = cid
-            && !(1..=14).contains(&cid)
-        {
-            return Err(ParameterError::Cid(cid));
-        }
-        // Activation data never grants a card frame below the minimum.
-        if channel_frame_bytes < usize::from(iso_dep::MIN_FRAME_BYTES) {
-            return Err(ParameterError::ReaderBlockBytes(channel_frame_bytes));
-        }
-        Ok(Self {
+    ) -> Self {
+        // Both sizes are at least 16 bytes, which leaves room for the CRC,
+        // PCB, CID and NAD bytes and for application data.
+        Self {
             state: State::Active(0),
-            maximum_frame_bytes: usize::from(card_frame_bytes).min(channel_frame_bytes) - 2,
-            maximum_receive_bytes: channel_frame_bytes - 2,
+            maximum_frame_bytes: usize::from(card_frame_size.min(reader_frame_size).bytes()) - 2,
+            maximum_receive_bytes: usize::from(reader_frame_size.bytes()) - 2,
             maximum_application_bytes: card_buffer.unwrap_or(MAX_APDU_BYTES).min(MAX_APDU_BYTES),
             cid,
             nad,
             wait: fwi.scaled(BLOCK_WAIT_UNIT),
-        })
+        }
     }
 
     fn frame(&self, pcb: u8, data: &[u8]) -> Vec<u8> {
         let mut result = Vec::with_capacity(data.len() + 2);
         result.push(pcb | if self.cid.is_some() { 8 } else { 0 });
         if let Some(cid) = self.cid {
-            result.push(cid);
+            result.push(cid.get());
         }
         result.extend_from_slice(data);
         result
@@ -311,7 +290,7 @@ impl Session {
             return Err("truncated CID");
         }
         if let Some(cid) = self.cid
-            && (block[1] & 0x3f != cid)
+            && (block[1] & 0x3f != cid.get())
         {
             return Err("CID mismatch or reserved bits");
         }
@@ -414,8 +393,7 @@ impl PresenceCheck<'_> {
     pub(crate) fn run<C, E>(
         self,
         setup: Result<C, E>,
-        recoverable: impl Fn(&E) -> bool,
-        mut transmit: impl FnMut(&mut C, &[u8], Duration) -> Result<Vec<u8>, E>,
+        mut transmit: impl FnMut(&mut C, &[u8], Duration) -> Result<Reply, E>,
     ) -> Result<(), PresenceError<E>> {
         let Self { session, number } = self;
         let mut channel = setup.map_err(PresenceError::Preparation)?;
@@ -423,10 +401,10 @@ impl PresenceCheck<'_> {
         let mut repetitions = 0;
         let response = loop {
             match transmit(&mut channel, &probe, session.wait) {
-                Ok(response) => break response,
-                Err(error) if recoverable(&error) => {
+                Ok(Reply::Block(response)) => break response,
+                Ok(Reply::Silence) => {
                     if repetitions == MAX_RETRANSMISSIONS {
-                        return Err(PresenceError::NoResponse(error));
+                        return Err(PresenceError::NoResponse);
                     }
                     repetitions += 1;
                 }
@@ -464,8 +442,7 @@ impl PreparedExchange<'_, '_> {
     pub(crate) fn exchange<C, E>(
         self,
         setup: Result<C, E>,
-        recoverable: impl Fn(&E) -> bool,
-        mut transmit: impl FnMut(&mut C, &[u8], Duration) -> Result<Vec<u8>, E>,
+        mut transmit: impl FnMut(&mut C, &[u8], Duration) -> Result<Reply, E>,
     ) -> Result<Vec<u8>, Error<E>> {
         let Self {
             session,
@@ -520,10 +497,10 @@ impl PreparedExchange<'_, '_> {
                     }
                 };
                 let response = match transfer {
-                    Ok(response) => response,
-                    Err(error) if recoverable(&error) => {
+                    Ok(Reply::Block(response)) => response,
+                    Ok(Reply::Silence) => {
                         if retransmissions == MAX_RETRANSMISSIONS {
-                            return Err(Cause::RecoveryExhausted(error));
+                            return Err(Cause::RecoveryExhausted);
                         }
                         retransmissions += 1;
                         outbound = match phase {
@@ -697,22 +674,15 @@ pub struct IsoDepCard<S: iso_dep::Selection> {
 
 impl<S: iso_dep::Selection> IsoDepCard<S> {
     /// Establish the block protocol from the selection's activation
-    /// parameters, optionally addressing `node_address`. Parameters this
-    /// profile cannot run end the selection: the next selection cycles the
-    /// RF field.
+    /// parameters, optionally addressing `node_address`. A rejected node
+    /// address ends the selection.
     ///
     /// # Errors
     ///
-    /// Rejects a node address the card does not advertise, a CID outside
-    /// 1..=14, and a reader block limit below [`iso_dep::MIN_FRAME_BYTES`].
-    pub fn new(mut card: S, node_address: Option<NodeAddress>) -> Result<Self, ParameterError> {
-        match session(&card, node_address) {
-            Ok(session) => Ok(Self { card, session }),
-            Err(error) => {
-                card.require_field_cycle();
-                Err(error)
-            }
-        }
+    /// Rejects a node address the card does not advertise.
+    pub fn new(card: S, node_address: Option<NodeAddress>) -> Result<Self, ParameterError> {
+        let session = session(&card, node_address)?;
+        Ok(Self { card, session })
     }
 
     /// The reader selection, including its validated activation data.
@@ -736,7 +706,7 @@ impl<S: iso_dep::Selection> IsoDepCard<S> {
     /// Returns the failure with its progress and partial response.
     pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, Error<S::Error>> {
         let exchange = self.session.prepare(apdu)?;
-        exchange.exchange(self.card.blocks(), S::is_rf_timeout, transfer)
+        exchange.exchange(self.card.blocks(), transfer)
     }
 
     /// Confirm that the card still answers between APDUs, using the same
@@ -749,7 +719,7 @@ impl<S: iso_dep::Selection> IsoDepCard<S> {
     /// Returns why the card was not confirmed.
     pub fn check_presence(&mut self) -> Result<(), PresenceError<S::Error>> {
         let check = self.session.admit_presence_check()?;
-        check.run(self.card.blocks(), S::is_rf_timeout, transfer)
+        check.run(self.card.blocks(), transfer)
     }
 }
 
@@ -774,28 +744,28 @@ fn session<S: iso_dep::Selection>(
     if node_address.is_some() && !parameters.nad_supported() {
         return Err(ParameterError::NadUnsupported);
     }
-    Session::new(
-        parameters.frame_size(),
-        card.maximum_block_bytes(),
+    Ok(Session::new(
+        parameters.card_frame_size(),
+        parameters.reader_frame_size(),
         parameters.cid(),
         parameters.fwi(),
         parameters.maximum_command_bytes(),
         node_address,
-    )
+    ))
 }
 
 fn transfer<B: iso_dep::Blocks>(
     blocks: &mut B,
     block: &[u8],
     wait: Duration,
-) -> Result<Vec<u8>, B::Error> {
+) -> Result<Reply, B::Error> {
     blocks.transfer(block, wait)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{boxed::Box, collections::VecDeque, vec};
+    use alloc::{boxed::Box, collections::VecDeque, format, vec};
     use std::io;
 
     const FWI4: WaitIndex = match WaitIndex::new(4) {
@@ -805,35 +775,58 @@ mod tests {
     /// 330 µs times 2^4.
     const FWI4_WAIT: Duration = Duration::from_micros(5280);
 
-    fn session(fsc: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
-        Session::new(fsc, 64, cid, FWI4, None, None)
+    /// The frame size of `bytes`, which must be one that FSCI encodes.
+    fn frame(bytes: u16) -> Result<FrameSize, Box<dyn std::error::Error>> {
+        (0..=12)
+            .map(FrameSize::from_index)
+            .find(|size| size.bytes() == bytes)
+            .ok_or_else(|| format!("no frame size of {bytes} bytes").into())
+    }
+
+    fn cid(value: Option<u8>) -> Result<Option<Cid>, Box<dyn std::error::Error>> {
+        value
+            .map(|value| Cid::new(value).ok_or_else(|| format!("CID {value}").into()))
+            .transpose()
+    }
+
+    fn session(fsc: u16, carried: Option<u8>) -> Result<Session, Box<dyn std::error::Error>> {
+        Ok(Session::new(
+            frame(fsc)?,
+            frame(64)?,
+            cid(carried)?,
+            FWI4,
+            None,
+            None,
+        ))
     }
 
     #[test]
-    fn reader_blocks_must_hold_the_smallest_frame() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            Session::new(16, 15, Some(1), FWI4, None, None).err(),
-            Some(ParameterError::ReaderBlockBytes(15))
-        );
+    fn smallest_reader_frame_carries_twelve_bytes_with_cid()
+    -> Result<(), Box<dyn std::error::Error>> {
         // A 16-byte block with CID holds 12 application bytes.
-        let mut link = Session::new(4096, 16, Some(1), FWI4, None, None)?;
+        let mut link = Session::new(
+            frame(4096)?,
+            FrameSize::MIN,
+            cid(Some(1))?,
+            FWI4,
+            None,
+            None,
+        );
         let mut first = vec![0x1a, 1];
         first.extend_from_slice(&[0x55; 12]);
         let mut steps = VecDeque::from([
             (first, vec![0xaa, 1]),
             (vec![0x0b, 1, 0x55], vec![0x0b, 1, 0x90, 0]),
         ]);
-        let reply = link.prepare::<io::Error>(&[0x55; 13])?.exchange(
-            Ok(()),
-            |_| false,
-            |_, frame, _| {
+        let reply = link
+            .prepare::<io::Error>(&[0x55; 13])?
+            .exchange(Ok(()), |_, frame, _| {
                 let (expected, reply) = steps
                     .pop_front()
                     .ok_or_else(|| io::Error::other("extra transfer"))?;
                 assert_eq!(frame, expected);
-                Ok::<_, io::Error>(reply)
-            },
-        )?;
+                Ok::<_, io::Error>(Reply::Block(reply))
+            })?;
         assert_eq!(reply, [0x90, 0]);
         assert!(steps.is_empty());
         Ok(())
@@ -845,17 +838,15 @@ mod tests {
         let mut first = vec![0x12];
         first.extend_from_slice(&[0x55; 61]);
         let mut steps = VecDeque::from([(first, vec![0xa2]), (vec![3, 0x55], vec![3, 0x90, 0])]);
-        let reply = link.prepare::<io::Error>(&[0x55; 62])?.exchange(
-            Ok(()),
-            |_| false,
-            |_, frame, _| {
+        let reply = link
+            .prepare::<io::Error>(&[0x55; 62])?
+            .exchange(Ok(()), |_, frame, _| {
                 let (expected, reply) = steps
                     .pop_front()
                     .ok_or_else(|| io::Error::other("extra transfer"))?;
                 assert_eq!(frame, expected);
-                Ok::<_, io::Error>(reply)
-            },
-        )?;
+                Ok::<_, io::Error>(Reply::Block(reply))
+            })?;
         assert_eq!(reply, [0x90, 0]);
         assert!(steps.is_empty());
         Ok(())
@@ -872,29 +863,24 @@ mod tests {
             (vec![3, 0x55], vec![0x13, 0xaa]),
             (vec![0xa2], vec![2, 0xbb]),
         ]);
-        let result = link.prepare::<io::Error>(&[0x55; 14])?.exchange(
-            Ok(()),
-            |_| false,
-            |_, frame, wait| {
-                let (expected, reply) = steps
-                    .pop_front()
-                    .ok_or_else(|| io::Error::other("extra transfer"))?;
-                assert_eq!(frame, expected);
-                assert_eq!(wait, FWI4_WAIT);
-                Ok::<_, io::Error>(reply)
-            },
-        )?;
+        let result =
+            link.prepare::<io::Error>(&[0x55; 14])?
+                .exchange(Ok(()), |_, frame, wait| {
+                    let (expected, reply) = steps
+                        .pop_front()
+                        .ok_or_else(|| io::Error::other("extra transfer"))?;
+                    assert_eq!(frame, expected);
+                    assert_eq!(wait, FWI4_WAIT);
+                    Ok::<_, io::Error>(Reply::Block(reply))
+                })?;
         assert_eq!(result, [0xaa, 0xbb]);
         assert!(steps.is_empty());
         assert_eq!(
-            link.prepare::<io::Error>(&[0x22])?.exchange(
-                Ok(()),
-                |_| false,
-                |_, frame, _| {
+            link.prepare::<io::Error>(&[0x22])?
+                .exchange(Ok(()), |_, frame, _| {
                     assert_eq!(frame, [3, 0x22]);
-                    Ok::<_, io::Error>(vec![3, 0x90, 0])
-                }
-            )?,
+                    Ok::<_, io::Error>(Reply::Block(vec![3, 0x90, 0]))
+                })?,
             [0x90, 0]
         );
         Ok(())
@@ -904,25 +890,23 @@ mod tests {
     fn wtx_and_cid_are_echoed_with_a_separate_wait() -> Result<(), Box<dyn std::error::Error>> {
         let mut link = session(256, Some(3))?;
         let mut calls = 0;
-        let reply = link.prepare::<io::Error>(&[0xa4])?.exchange(
-            Ok(()),
-            |_| false,
-            |_, frame, wait| {
+        let reply = link
+            .prepare::<io::Error>(&[0xa4])?
+            .exchange(Ok(()), |_, frame, wait| {
                 calls += 1;
                 match calls {
                     1 => {
                         assert_eq!(frame, [0x0a, 3, 0xa4]);
                         assert_eq!(wait, FWI4_WAIT);
-                        Ok::<_, io::Error>(vec![0xfa, 3, 3])
+                        Ok::<_, io::Error>(Reply::Block(vec![0xfa, 3, 3]))
                     }
                     _ => {
                         assert_eq!(frame, [0xfa, 3, 3]);
                         assert_eq!(wait, FWI4_WAIT * 3);
-                        Ok(vec![0x0a, 3, 0x90, 0])
+                        Ok(Reply::Block(vec![0x0a, 3, 0x90, 0]))
                     }
                 }
-            },
-        )?;
+            })?;
         assert_eq!(calls, 2);
         assert_eq!(reply, [0x90, 0]);
         Ok(())
@@ -941,17 +925,14 @@ mod tests {
             (vec![0xa2], vec![2, 0xbb]),
         ]);
         assert_eq!(
-            link.prepare::<io::Error>(&[0x55; 14])?.exchange(
-                Ok(()),
-                |_| false,
-                |_, frame, _| {
+            link.prepare::<io::Error>(&[0x55; 14])?
+                .exchange(Ok(()), |_, frame, _| {
                     let (expected, reply) = steps
                         .pop_front()
                         .ok_or_else(|| io::Error::other("extra transfer"))?;
                     assert_eq!(frame, expected);
-                    Ok::<_, io::Error>(reply)
-                }
-            )?,
+                    Ok::<_, io::Error>(Reply::Block(reply))
+                })?,
             [0xaa, 0xbb]
         );
         assert!(steps.is_empty());
@@ -983,17 +964,15 @@ mod tests {
         ] {
             let mut link = session(64, cid)?;
             let mut steps = VecDeque::from(steps);
-            let result = link.prepare::<io::Error>(&[0xa4])?.exchange(
-                Ok(()),
-                |_| false,
-                |_, frame, _| {
+            let result = link
+                .prepare::<io::Error>(&[0xa4])?
+                .exchange(Ok(()), |_, frame, _| {
                     let (expected, response) = steps
                         .pop_front()
                         .ok_or_else(|| io::Error::other("extra RF block"))?;
                     assert_eq!(frame, expected);
-                    Ok::<_, io::Error>(response)
-                },
-            )?;
+                    Ok::<_, io::Error>(Reply::Block(response))
+                })?;
             assert_eq!(result, [0x90, 0]);
             assert!(steps.is_empty());
         }
@@ -1007,18 +986,14 @@ mod tests {
         let mut calls = 0;
         let error = link
             .prepare::<io::Error>(&[0xa4])?
-            .exchange(
-                Ok(()),
-                |_| false,
-                |_, _, _| {
-                    calls += 1;
-                    if calls == 1 {
-                        Ok(vec![0x12, 0xaa])
-                    } else {
-                        Err(io::Error::new(io::ErrorKind::TimedOut, "lost response"))
-                    }
-                },
-            )
+            .exchange(Ok(()), |_, _, _| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(Reply::Block(vec![0x12, 0xaa]))
+                } else {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "lost response"))
+                }
+            })
             .err()
             .ok_or("expected error")?;
         assert!(
@@ -1057,11 +1032,8 @@ mod tests {
             })
         ));
         assert_eq!(
-            link.prepare::<io::Error>(&[0xa4])?.exchange(
-                Ok(()),
-                |_| false,
-                |_, _, _| Ok::<_, io::Error>(vec![2])
-            )?,
+            link.prepare::<io::Error>(&[0xa4])?
+                .exchange(Ok(()), |_, _, _| Ok::<_, io::Error>(Reply::Block(vec![2])))?,
             []
         );
         for reply in [
@@ -1073,11 +1045,10 @@ mod tests {
         ] {
             let mut link = session(64, None)?;
             assert!(matches!(
-                link.prepare::<io::Error>(&[1])?.exchange(
-                    Ok(()),
-                    |_| false,
-                    |_, _, _| Ok::<_, io::Error>(reply.clone())
-                ),
+                link.prepare::<io::Error>(&[1])?
+                    .exchange(Ok(()), |_, _, _| Ok::<_, io::Error>(Reply::Block(
+                        reply.clone()
+                    ))),
                 Err(Error {
                     cause: Cause::InvalidBlock(_),
                     ..
@@ -1094,11 +1065,9 @@ mod tests {
         let mut link = session(64, None)?;
         let error = link
             .prepare::<io::Error>(&[1])?
-            .exchange(
-                Ok(()),
-                |_| false,
-                |_, _, _| Ok::<_, io::Error>(vec![0xf2, 1]),
-            )
+            .exchange(Ok(()), |_, _, _| {
+                Ok::<_, io::Error>(Reply::Block(vec![0xf2, 1]))
+            })
             .err()
             .ok_or("expected exhaustion")?;
         assert!(matches!(error.cause, Cause::Budget(Budget::WaitExtensions)));
@@ -1106,7 +1075,9 @@ mod tests {
         let mut link = session(16, None)?;
         let error = link
             .prepare::<io::Error>(&[1; 14])?
-            .exchange(Ok(()), |_| false, |_, _, _| Ok::<_, io::Error>(vec![0xa3]))
+            .exchange(Ok(()), |_, _, _| {
+                Ok::<_, io::Error>(Reply::Block(vec![0xa3]))
+            })
             .err()
             .ok_or("expected exhaustion")?;
         assert!(matches!(
@@ -1129,16 +1100,12 @@ mod tests {
             let mut number = 0u8;
             let error = link
                 .prepare::<io::Error>(&[1])?
-                .exchange(
-                    Ok(()),
-                    |_| false,
-                    |_, _, _| {
-                        let mut reply = vec![0x12 | number];
-                        number ^= 1;
-                        reply.resize(body_length + 1, 0xaa);
-                        Ok::<_, io::Error>(reply)
-                    },
-                )
+                .exchange(Ok(()), |_, _, _| {
+                    let mut reply = vec![0x12 | number];
+                    number ^= 1;
+                    reply.resize(body_length + 1, 0xaa);
+                    Ok::<_, io::Error>(Reply::Block(reply))
+                })
                 .err()
                 .ok_or("expected exhaustion")?;
             assert!(matches!(error.cause, Cause::Budget(actual) if actual == expected));
@@ -1163,7 +1130,7 @@ mod tests {
     #[test]
     fn reader_receive_and_card_buffer_limits_are_distinct() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut link = Session::new(16, 64, None, FWI4, Some(128), None)?;
+        let mut link = Session::new(frame(16)?, frame(64)?, None, FWI4, Some(128), None);
         let error = link
             .prepare::<io::Error>(&[0; 129])
             .err()
@@ -1178,7 +1145,9 @@ mod tests {
         assert_eq!(error.progress.frames, 0);
         let error = link
             .prepare::<io::Error>(&[1])?
-            .exchange(Ok(()), |_| false, |_, _, _| Ok::<_, io::Error>(vec![2; 63]))
+            .exchange(Ok(()), |_, _, _| {
+                Ok::<_, io::Error>(Reply::Block(vec![2; 63]))
+            })
             .err()
             .ok_or("expected receive limit")?;
         assert!(matches!(error.cause, Cause::InvalidBlock("RF block size")));
@@ -1192,39 +1161,32 @@ mod tests {
         let mut probes = 0;
         link.admit_presence_check::<io::Error>()?.run(
             Ok::<(), io::Error>(()),
-            |error| error.kind() == io::ErrorKind::TimedOut,
             |_, frame, wait| {
                 probes += 1;
                 assert_eq!(frame, [0xba, 3]);
                 assert_eq!(wait, FWI4_WAIT);
                 if probes == 1 {
-                    Err(io::ErrorKind::TimedOut.into())
+                    Ok(Reply::Silence)
                 } else {
-                    Ok(vec![0xab, 3])
+                    Ok(Reply::Block(vec![0xab, 3]))
                 }
             },
         )?;
         assert_eq!(probes, 2);
         // The probe neither toggles the block number nor consumes the session.
         assert_eq!(
-            link.prepare::<io::Error>(&[0xa4])?.exchange(
-                Ok(()),
-                |_| false,
-                |_, frame, _| {
+            link.prepare::<io::Error>(&[0xa4])?
+                .exchange(Ok(()), |_, frame, _| {
                     assert_eq!(frame, [0x0a, 3, 0xa4]);
-                    Ok::<_, io::Error>(vec![0x0a, 3, 0x90, 0])
-                }
-            )?,
+                    Ok::<_, io::Error>(Reply::Block(vec![0x0a, 3, 0x90, 0]))
+                })?,
             [0x90, 0]
         );
-        link.admit_presence_check::<io::Error>()?.run(
-            Ok(()),
-            |_| false,
-            |_, frame, _| {
+        link.admit_presence_check::<io::Error>()?
+            .run(Ok(()), |_, frame, _| {
                 assert_eq!(frame, [0xbb, 3]);
-                Ok::<_, io::Error>(vec![0xaa, 3])
-            },
-        )?;
+                Ok::<_, io::Error>(Reply::Block(vec![0xaa, 3]))
+            })?;
         Ok(())
     }
 
@@ -1234,11 +1196,9 @@ mod tests {
             let mut link = session(64, None)?;
             let error = link
                 .admit_presence_check::<io::Error>()?
-                .run(
-                    Ok(()),
-                    |_| false,
-                    |_, _, _| Ok::<_, io::Error>(reply.clone()),
-                )
+                .run(Ok(()), |_, _, _| {
+                    Ok::<_, io::Error>(Reply::Block(reply.clone()))
+                })
                 .err()
                 .ok_or("expected an unconfirmed probe")?;
             assert!(matches!(error, PresenceError::InvalidBlock(_)));
@@ -1251,27 +1211,21 @@ mod tests {
         let mut probes = 0;
         let error = link
             .admit_presence_check::<io::Error>()?
-            .run(
-                Ok(()),
-                |_| true,
-                |_, _, _| {
-                    probes += 1;
-                    Err::<Vec<u8>, _>(io::Error::from(io::ErrorKind::TimedOut))
-                },
-            )
+            .run(Ok(()), |_, _, _| {
+                probes += 1;
+                Ok::<_, io::Error>(Reply::Silence)
+            })
             .err()
             .ok_or("expected no response")?;
-        assert!(matches!(error, PresenceError::NoResponse(_)));
+        assert!(matches!(error, PresenceError::NoResponse));
         assert_eq!(probes, MAX_RETRANSMISSIONS + 1);
         assert!(matches!(link.state, State::Invalid));
         let mut link = session(64, None)?;
         let error = link
             .admit_presence_check::<io::Error>()?
-            .run(
-                Err::<(), _>(io::Error::other("setup")),
-                |_| false,
-                |_, _, _| Err::<Vec<u8>, _>(io::Error::other("unexpected transfer")),
-            )
+            .run(Err::<(), _>(io::Error::other("setup")), |_, _, _| {
+                Err::<Reply, _>(io::Error::other("unexpected transfer"))
+            })
             .err()
             .ok_or("expected setup failure")?;
         assert!(matches!(error, PresenceError::Preparation(_)));

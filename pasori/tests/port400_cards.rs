@@ -92,7 +92,7 @@ fn reads_type_four_over_port400_nfc_a() -> Result<(), Box<dyn Error>> {
     {
         let selection = reader.poll_type_a(wait()?)?.ok_or("Type A tag absent")?;
         assert!(
-            matches!(selection.activation(), Activation::TypeA { sak: 0x20, ats: reply } if reply.bytes() == ats)
+            matches!(selection.activation(), Activation::TypeA { sak, ats: reply } if sak.byte() == 0x20 && reply.bytes() == ats)
         );
         let mut card = IsoDepCard::new(selection, None)?;
         assert_eq!(ndef::read_type4(&mut card)?, [0xd0, 0, 0]);

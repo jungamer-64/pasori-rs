@@ -2,6 +2,7 @@
 
 use core::time::Duration;
 use felica_packet::{PollRequest, Selection};
+use iso14443::nfcb;
 use port400::{
     reader::{ApduError, Error, FinishError, Reader, ResponseWait},
     transport::{Failure, Progress, TransactionError},
@@ -519,7 +520,10 @@ fn activation_timeout_and_cid_mismatch_have_different_outcomes() -> Result<(), B
     assert!(reader.poll_type_a(response_wait()?)?.is_none());
     assert!(matches!(
         reader.poll_type_b(0x42, response_wait()?),
-        Err(Error::AttribCid(1))
+        Err(Error::TypeB(nfcb::Error::CidMismatch {
+            assigned: 0,
+            returned: 1
+        }))
     ));
     assert!(reader.into_transport().is_exhausted());
     Ok(())

@@ -4,11 +4,11 @@
 //! These model command/response contracts, not physical device operation.
 
 use iso14443::{
-    iso_dep::{Blocks, Selection as _},
-    nfca::{self, Reply, Selection as _},
+    iso_dep::{self, Blocks, Selection as _},
+    nfca::{self, Nibble, Reply, Selection as _},
     nfcb,
 };
-use port100::reader::{Activation, Error, MAX_BLOCK_BYTES, Reader, TypeASelection};
+use port100::reader::{Activation, Error, READER_FRAME_SIZE, Reader, TypeASelection};
 use reader_script::port100::{
     Journal, Script, Step, WAIT_UNITS, command, field_off, in_comm_rf, in_comm_rf_bits,
     initialization, type_a_activation, type_a_configuration, type_b_configuration, wait,
@@ -61,12 +61,12 @@ fn a_type_two_card_exchanges_commands_with_host_checked_crc() -> TestResult {
     let observation = card.observation();
     assert_eq!(observation.uid(), UID);
     assert_eq!(observation.sens_res(), [0x44, 0x00]);
-    assert_eq!(observation.sel_res(), 0);
+    assert_eq!(observation.sel_res().byte(), 0);
     assert!(observation.ats().is_none());
-    assert_eq!(card.exchange(&[0x30, 0x04])?, Reply::Data(page.to_vec()));
+    assert_eq!(card.exchange(&[0x30, 0x04])?, Reply::Frame(page.to_vec()));
     assert_eq!(
-        card.exchange(&[0xa2, 0x04, 1, 2, 3, 4])?,
-        Reply::Data(vec![0x0a])
+        Some(card.exchange(&[0xa2, 0x04, 1, 2, 3, 4])?),
+        Nibble::new(0x0a).map(Reply::Nibble)
     );
     assert_eq!(card.exchange(&[0x01, 0, 0, 0])?, Reply::Silence);
     assert!(matches!(card.exchange(&[0x30, 0x04]), Err(Error::CardCrc)));
@@ -113,24 +113,23 @@ fn an_iso_dep_card_is_activated_with_rats_and_carries_blocks() -> TestResult {
         };
         assert_eq!(observation.ats().map(nfca::Ats::bytes), Some(&ATS[..]));
         let parameters = card.parameters();
-        assert_eq!(parameters.frame_size(), 256);
+        assert_eq!(parameters.card_frame_size().bytes(), 256);
+        assert_eq!(parameters.reader_frame_size(), READER_FRAME_SIZE);
         assert_eq!(parameters.fwi().get(), 7);
         assert_eq!(parameters.cid(), None);
-        assert_eq!(card.maximum_block_bytes(), MAX_BLOCK_BYTES);
         let mut blocks = card.blocks()?;
         let wait = Duration::from_millis(10);
         assert_eq!(
             blocks.transfer(&[0x02, 0x00, 0xa4], wait)?,
-            [0x02, 0x90, 0x00]
+            iso_dep::Reply::Block(vec![0x02, 0x90, 0x00])
         );
-        let missing = blocks.transfer(&[0xb2], wait);
-        assert!(matches!(missing, Err(Error::NoResponse)));
+        assert_eq!(blocks.transfer(&[0xb2], wait)?, iso_dep::Reply::Silence);
         assert!(matches!(
             blocks.transfer(&[0xb2], wait),
             Err(Error::CardReplyBitCount(4))
         ));
         assert!(matches!(
-            blocks.transfer(&[0; MAX_BLOCK_BYTES - 1], wait),
+            blocks.transfer(&[0; READER_FRAME_SIZE.bytes() as usize - 1], wait),
             Err(Error::InputLength { .. })
         ));
         assert!(matches!(
@@ -211,13 +210,14 @@ fn an_iso_dep_type_b_card_is_activated_with_attrib() -> TestResult {
     };
     assert_eq!(observation.atqb().pupi(), [1, 2, 3, 4]);
     let parameters = card.parameters();
-    assert_eq!(parameters.frame_size(), 256);
+    assert_eq!(parameters.card_frame_size().bytes(), 256);
+    assert_eq!(parameters.reader_frame_size(), READER_FRAME_SIZE);
     assert_eq!(parameters.maximum_command_bytes(), Some(256));
     assert_eq!(parameters.cid(), None);
     assert_eq!(
         card.blocks()?
             .transfer(&[0x02, 0x90], Duration::from_millis(10))?,
-        [0x02, 0x6a, 0x82]
+        iso_dep::Reply::Block(vec![0x02, 0x6a, 0x82])
     );
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -241,7 +241,7 @@ fn a_type_b_card_without_iso_dep_is_rejected_before_attrib() -> TestResult {
     ])?;
     assert!(matches!(
         reader.poll_type_b(0, card_wait()?),
-        Err(Error::NotIsoDep)
+        Err(Error::TypeB(nfcb::Error::NotIsoDep))
     ));
     assert!(reader.poll_type_b(0, card_wait()?)?.is_none());
     let mut damaged = ATQB;

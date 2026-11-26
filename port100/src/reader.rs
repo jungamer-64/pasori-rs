@@ -11,7 +11,7 @@ mod target;
 mod type_a;
 mod type_b;
 
-pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard, MAX_BLOCK_BYTES};
+pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard, READER_FRAME_SIZE};
 pub use target::{
     FelicaTarget, IsoDepATarget, PollingResponder, TargetCommand, TargetWait, TypeATarget,
 };
@@ -68,9 +68,10 @@ pub enum Error<E> {
     /// No card reply arrived within the wait. The card may have received the
     /// frame and taken effect; the reader remains usable.
     NoResponse,
-    /// A passive target received no frame during its wait. It may wait again.
-    TargetTimeout,
-    /// The initiator's field went away. The next receive awaits a new activation.
+    /// Type A target setup received no initiator command within its wait.
+    NoInitiator,
+    /// The initiator's field went away while a target responded. Delivery is
+    /// unknown, and the next receive awaits a new activation.
     TargetFieldOff,
     /// NFC-A activation data failed validation.
     TypeA(nfca::Error),
@@ -82,9 +83,6 @@ pub enum Error<E> {
     CardReplyBitCount(u8),
     /// A card reply that the host checks failed its CRC.
     CardCrc,
-    /// The NFC-B card's ATQB does not advertise ISO-DEP, the only protocol
-    /// this reader layer runs for NFC-B.
-    NotIsoDep,
     /// The RF settings this selection exchanges under are no longer known to
     /// be in effect; the card must be selected again.
     FieldReset,
@@ -117,8 +115,8 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
                 f.write_str("FeliCa response failed; the command may have taken effect")
             }
             Self::NoResponse => f.write_str("no card reply; the command may have taken effect"),
-            Self::TargetTimeout => f.write_str("no initiator command received within the wait"),
-            Self::TargetFieldOff => f.write_str("the initiator's RF field is off"),
+            Self::NoInitiator => f.write_str("no initiator command received within the wait"),
+            Self::TargetFieldOff => f.write_str("the initiator's RF field went off"),
             Self::TypeA(_) => f.write_str("invalid NFC-A activation"),
             Self::TypeB(_) => f.write_str("invalid NFC-B activation"),
             Self::CardReply(reason) => write!(f, "malformed card reply: {reason}"),
@@ -129,7 +127,6 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
                 )
             }
             Self::CardCrc => f.write_str("card reply failed its CRC"),
-            Self::NotIsoDep => f.write_str("NFC-B card does not advertise ISO-DEP"),
             Self::FieldReset => f.write_str("RF settings of the selection were lost"),
             Self::InputLength { maximum, actual } => {
                 write!(f, "input of {actual} bytes exceeds {maximum}")

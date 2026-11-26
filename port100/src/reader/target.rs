@@ -3,7 +3,7 @@ use crate::{transport::Transport, wire};
 use alloc::vec::Vec;
 use core::{mem, time::Duration};
 use felica_packet::{Idm, PollRequest, PollResponse, validate_length};
-use iso14443::nfca::{self, PassiveTarget, PassiveTargetReader};
+use iso14443::nfca::{self, PassiveTarget, PassiveTargetReader, TargetEvent};
 
 const EXCHANGE: u8 = 0x48;
 const RECEIVE_TIMEOUT: u32 = 0x80;
@@ -161,6 +161,11 @@ impl<T: Transport> Reader<T> {
     /// command. The UID is `08` followed by the supplied suffix.
     /// If the reader first reports a prior field loss, rearming uses a
     /// second receive with the same per-command wait.
+    ///
+    /// # Errors
+    ///
+    /// No initiator command within the wait is [`Error::NoInitiator`], and a
+    /// field loss after rearming is [`Error::TargetFieldOff`].
     pub fn listen_type_a(
         &mut self,
         suffix: [u8; 3],
@@ -168,11 +173,16 @@ impl<T: Transport> Reader<T> {
     ) -> Result<TypeATarget<'_, T>, Error<T::Error>> {
         let [a, b, c] = suffix;
         let mut link = self.prepare_type_a(suffix, 0)?;
-        let first = match link.receive(wait) {
+        let mut event = link.receive(wait)?;
+        if matches!(event, TargetEvent::FieldOff) {
             // The chip can report a previous field loss immediately on
             // entry. Rearm before waiting for the first initiator.
-            Err(Error::TargetFieldOff) => link.receive(wait)?,
-            result => result?,
+            event = link.receive(wait)?;
+        }
+        let first = match event {
+            TargetEvent::Command(first) => first,
+            TargetEvent::Silence => return Err(Error::NoInitiator),
+            TargetEvent::FieldOff => return Err(Error::TargetFieldOff),
         };
         link.state = TargetState::Activated {
             pending: Some(first),
@@ -271,12 +281,8 @@ impl<'r, T: Transport> TypeATarget<'r, T> {
     pub fn receive(
         &mut self,
         wait: TargetWait,
-    ) -> Result<TargetCommand<'_, 'r, T>, Error<T::Error>> {
-        let data = self.link.receive(wait)?;
-        Ok(TargetCommand {
-            link: &mut self.link,
-            data,
-        })
+    ) -> Result<TargetEvent<TargetCommand<'_, 'r, T>>, Error<T::Error>> {
+        self.link.receive_command(wait)
     }
 
     /// Stop target operation and reinitialize the reader.
@@ -296,12 +302,8 @@ impl<'r, T: Transport> IsoDepATarget<'r, T> {
     pub fn receive(
         &mut self,
         wait: TargetWait,
-    ) -> Result<TargetCommand<'_, 'r, T>, Error<T::Error>> {
-        let data = self.link.receive(wait)?;
-        Ok(TargetCommand {
-            link: &mut self.link,
-            data,
-        })
+    ) -> Result<TargetEvent<TargetCommand<'_, 'r, T>>, Error<T::Error>> {
+        self.link.receive_command(wait)
     }
 
     /// Stop target operation and reinitialize the reader.
@@ -314,16 +316,15 @@ impl<'r, T: Transport> FelicaTarget<'r, T> {
     /// Receive a FeliCa packet including its length byte and excluding CRC.
     /// A [`PollingResponder::Host`] target answers the Polling commands that
     /// arrive within `wait` itself and keeps listening until the wait ends.
-    /// After a timeout or field loss, call again to continue listening.
+    /// After silence or field loss, call again to continue listening.
     pub fn receive(
         &mut self,
         wait: TargetWait,
-    ) -> Result<TargetCommand<'_, 'r, T>, Error<T::Error>> {
-        let data = self.0.receive_felica(wait)?;
-        Ok(TargetCommand {
-            link: &mut self.0,
-            data,
-        })
+    ) -> Result<TargetEvent<TargetCommand<'_, 'r, T>>, Error<T::Error>> {
+        let link = &mut self.0;
+        Ok(link
+            .receive_felica(wait)?
+            .map(|data| TargetCommand { link, data }))
     }
 
     /// Stop target operation and reinitialize the reader.
@@ -372,7 +373,16 @@ impl<T: Transport> TargetCommand<'_, '_, T> {
     }
 }
 
-impl<T: Transport> TargetLink<'_, T> {
+impl<'r, T: Transport> TargetLink<'r, T> {
+    fn receive_command(
+        &mut self,
+        wait: TargetWait,
+    ) -> Result<TargetEvent<TargetCommand<'_, 'r, T>>, Error<T::Error>> {
+        Ok(self
+            .receive(wait)?
+            .map(|data| TargetCommand { link: self, data }))
+    }
+
     fn exchange(
         &mut self,
         activate: bool,
@@ -412,11 +422,11 @@ impl<T: Transport> TargetLink<'_, T> {
         })
     }
 
-    fn receive(&mut self, wait: TargetWait) -> Result<Vec<u8>, Error<T::Error>> {
+    fn receive(&mut self, wait: TargetWait) -> Result<TargetEvent<Vec<u8>>, Error<T::Error>> {
         if let TargetState::Activated { pending } = &mut self.state
             && let Some(data) = pending.take()
         {
-            return Ok(data);
+            return Ok(TargetEvent::Command(data));
         }
         let prior = mem::replace(&mut self.state, TargetState::Revoked);
         let activate = match prior {
@@ -433,11 +443,11 @@ impl<T: Transport> TargetLink<'_, T> {
         match status {
             RECEIVE_TIMEOUT if data.is_empty() => {
                 self.state = prior;
-                Err(Error::TargetTimeout)
+                Ok(TargetEvent::Silence)
             }
             FIELD_OFF if data.is_empty() => {
                 self.state = TargetState::WaitingForActivation;
-                Err(Error::TargetFieldOff)
+                Ok(TargetEvent::FieldOff)
             }
             0 if self.radio.admits(rate)
                 && (!activate || activated != Some(false))
@@ -445,7 +455,7 @@ impl<T: Transport> TargetLink<'_, T> {
             {
                 self.validate_data(&data)?;
                 self.state = TargetState::Activated { pending: None };
-                Ok(data)
+                Ok(TargetEvent::Command(data))
             }
             0 => Err(Error::Response("TgCommRF receive format")),
             status => Err(Error::RfStatus(status)),
@@ -455,7 +465,10 @@ impl<T: Transport> TargetLink<'_, T> {
     /// Receive the next packet for the host. A host-activated target first
     /// returns to 212 kbps after a field loss, and answers Polling commands
     /// for its system until another packet arrives or `wait` ends.
-    fn receive_felica(&mut self, wait: TargetWait) -> Result<Vec<u8>, Error<T::Error>> {
+    fn receive_felica(
+        &mut self,
+        wait: TargetWait,
+    ) -> Result<TargetEvent<Vec<u8>>, Error<T::Error>> {
         let Radio::FelicaHost {
             system,
             idm,
@@ -475,13 +488,18 @@ impl<T: Transport> TargetLink<'_, T> {
             .monotonic_time()
             .saturating_add(wait.duration());
         loop {
-            let remaining = deadline
+            let Some(remaining) = deadline
                 .checked_sub(self.reader.link.monotonic_time())
                 .and_then(TargetWait::new)
-                .ok_or(Error::TargetTimeout)?;
-            let data = self.receive(remaining)?;
+            else {
+                return Ok(TargetEvent::Silence);
+            };
+            let data = match self.receive(remaining)? {
+                TargetEvent::Command(data) => data,
+                event => return Ok(event),
+            };
             let Some(request) = PollRequest::parse(&data) else {
-                return Ok(data);
+                return Ok(TargetEvent::Command(data));
             };
             if !request.selects(system) {
                 continue;
@@ -587,7 +605,7 @@ impl<'r, T: Transport> PassiveTarget for TypeATarget<'r, T> {
         self.uid()
     }
 
-    fn receive(&mut self, wait: TargetWait) -> Result<Self::Command<'_>, Self::Error> {
+    fn receive(&mut self, wait: TargetWait) -> Result<TargetEvent<Self::Command<'_>>, Self::Error> {
         self.receive(wait)
     }
 

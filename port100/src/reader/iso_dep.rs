@@ -2,13 +2,12 @@
 
 use super::{Error, Field, Reader, ResponseWait, settings::Settings};
 use crate::transport::Transport;
-use alloc::vec::Vec;
 use core::time::Duration;
-use iso14443::{iso_dep, nfca, nfcb};
+use iso14443::{FrameSize, iso_dep, nfca, nfcb};
 
-/// Largest block, including its two CRC bytes, in each direction: the frame
-/// size that RATS and ATTRIB announce to the card.
-pub const MAX_BLOCK_BYTES: usize = 256;
+/// Reader frame size (FSD) that RATS and ATTRIB announce to the card: the
+/// largest block, including its two CRC bytes, carried in each direction.
+pub const READER_FRAME_SIZE: FrameSize = FrameSize::from_index(8);
 
 /// Activation data of an ISO-DEP selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +24,9 @@ pub enum Activation {
 /// [`iso_dep::Selection::blocks`] requires the RF settings of the
 /// activation to be in effect and sends nothing. Each block waits for the
 /// wait the block engine gives it, which must not exceed
-/// [`ResponseWait::MAX`]; a missing reply is [`Error::NoResponse`].
+/// [`ResponseWait::MAX`]; a missing reply is [`iso_dep::Reply::Silence`].
+/// Every selection starts by cycling the RF field, which releases a card
+/// that an earlier selection left in the protocol state.
 #[derive(Debug)]
 pub struct IsoDepCard<'a, T: Transport> {
     pub(super) reader: &'a mut Reader<T>,
@@ -52,10 +53,6 @@ impl<T: Transport> iso_dep::Selection for IsoDepCard<'_, T> {
         self.parameters
     }
 
-    fn maximum_block_bytes(&self) -> usize {
-        MAX_BLOCK_BYTES
-    }
-
     fn blocks(&mut self) -> Result<IsoDepBlocks<'_, T>, Error<T::Error>> {
         match self.reader.ready()?.1 {
             Field::On { settings, .. } if settings == self.settings => Ok(IsoDepBlocks {
@@ -64,14 +61,6 @@ impl<T: Transport> iso_dep::Selection for IsoDepCard<'_, T> {
             }),
             _ => Err(Error::FieldReset),
         }
-    }
-
-    fn is_rf_timeout(error: &Error<T::Error>) -> bool {
-        matches!(error, Error::NoResponse)
-    }
-
-    fn require_field_cycle(&mut self) {
-        self.reader.require_field_cycle();
     }
 }
 
@@ -85,8 +74,12 @@ pub struct IsoDepBlocks<'s, T: Transport> {
 impl<T: Transport> iso_dep::Blocks for IsoDepBlocks<'_, T> {
     type Error = Error<T::Error>;
 
-    fn transfer(&mut self, block: &[u8], wait: Duration) -> Result<Vec<u8>, Error<T::Error>> {
-        let maximum = MAX_BLOCK_BYTES - 2;
+    fn transfer(
+        &mut self,
+        block: &[u8],
+        wait: Duration,
+    ) -> Result<iso_dep::Reply, Error<T::Error>> {
+        let maximum = usize::from(READER_FRAME_SIZE.bytes()) - 2;
         if block.len() > maximum {
             return Err(Error::InputLength {
                 maximum,
@@ -94,16 +87,18 @@ impl<T: Transport> iso_dep::Blocks for IsoDepBlocks<'_, T> {
             });
         }
         let wait = ResponseWait::new(wait).ok_or(Error::WaitRange(wait))?;
-        let received = self
-            .reader
-            .transceive(self.settings, block, wait)?
-            .ok_or(Error::NoResponse)?;
+        let Some(received) = self.reader.transceive(self.settings, block, wait)? else {
+            return Ok(iso_dep::Reply::Silence);
+        };
         if matches!(self.settings, Settings::TypeA(_)) {
-            received.whole_bytes().inspect_err(|_| {
-                self.reader.require_field_cycle();
-            })
+            received
+                .whole_bytes()
+                .map(iso_dep::Reply::Block)
+                .inspect_err(|_| {
+                    self.reader.require_field_cycle();
+                })
         } else {
-            Ok(received.data)
+            Ok(iso_dep::Reply::Block(received.data))
         }
     }
 }

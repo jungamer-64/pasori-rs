@@ -5,7 +5,7 @@ mod iso_dep;
 
 pub use crate::apdu::ApduError;
 pub use felica::FelicaCard;
-pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard};
+pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard, READER_FRAME_SIZE};
 
 use crate::{
     apdu::{self, IccResponsePolicy, Objects},
@@ -61,8 +61,6 @@ pub enum Error<E> {
     TypeASak(u8),
     /// The NFC-B activation returned invalid data.
     TypeB(nfcb::Error),
-    /// The NFC-B ATTRIB response used a CID other than the assigned zero.
-    AttribCid(u8),
     /// A card was selected at Layer 3 but did not advertise ISO-DEP.
     NotIsoDep,
     /// The RF reply length is invalid for the current operation.
@@ -96,7 +94,6 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Self::TypeA(error) => error.fmt(f),
             Self::TypeASak(sak) => write!(f, "SAK {sak:02X} has the cascade bit set"),
             Self::TypeB(error) => error.fmt(f),
-            Self::AttribCid(cid) => write!(f, "ATTRIB returned CID {cid}, expected 0"),
             Self::NotIsoDep => f.write_str("selected card does not advertise ISO-DEP"),
             Self::ReplyLength(actual) => write!(f, "unexpected RF reply length {actual}"),
             Self::WaitRange(wait) => write!(f, "unsupported RF wait of {wait:?}"),

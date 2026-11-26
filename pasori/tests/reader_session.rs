@@ -905,10 +905,7 @@ fn type_b_rf_timeout_budget_preserves_uncertain_progress() -> Result<(), Box<dyn
         .exchange_apdu(&[0xa4])
         .err()
         .ok_or("expected RF timeout")?;
-    assert!(matches!(
-        error.cause,
-        isodep::Cause::RecoveryExhausted(ReaderError::RfStatus(1))
-    ));
+    assert!(matches!(error.cause, isodep::Cause::RecoveryExhausted));
     assert_eq!(error.progress.attempted_application_bytes, 1);
     assert_eq!(error.progress.acknowledged_application_bytes, 0);
     assert_eq!(error.progress.frames, 3);
@@ -1164,10 +1161,7 @@ fn type_b_presence_probe_keeps_numbering_and_silence_revokes_the_session()
         .check_presence()
         .err()
         .ok_or("expected an unanswered probe")?;
-    assert!(matches!(
-        error,
-        isodep::PresenceError::NoResponse(ReaderError::RfStatus(1))
-    ));
+    assert!(matches!(error, isodep::PresenceError::NoResponse));
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange_apdu(&[0xa4]),
@@ -1292,7 +1286,7 @@ fn partial_type_b_timing_setup_preserves_zero_apdu_progress_and_requires_reset()
 }
 
 #[test]
-fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
+fn type_b_timing_cache_survives_field_cycles_and_tracks_cross_protocol_changes()
 -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(true));
@@ -1302,14 +1296,17 @@ fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]));
-    // Polling restores its own timer without reapplying the unchanged RF mode.
-    // The APDU then restores 1C while retaining the successful selector.
-    steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    // An activated NFC-B card ignores the next request, so polling cycles the
+    // field and reapplies the RF mode. The APDU then restores 1C while
+    // retaining the successful selector.
+    steps.push(command(0x32, &[1, 0], &[]));
+    steps.extend(ab_mode(true));
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0xa0, &[11, 0, 2, 0xb0], &[0, 2, 0xab, 0x90, 0]));
+    steps.push(command(0x32, &[1, 0], &[]));
     steps.extend(ab_mode(false));
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
@@ -1317,6 +1314,8 @@ fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
     // so the NFC-B selector stays applied across the protocol change.
     steps.push(command(0x1c, &[0x80, 0xe7, 3], &[]));
     steps.push(command(0x40, &[7, 0xa4], &[0, 0x90, 0]));
+    // The NFC-A card that returned an ATS also requires a field cycle.
+    steps.push(command(0x32, &[1, 0], &[]));
     steps.extend(ab_mode(true));
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));

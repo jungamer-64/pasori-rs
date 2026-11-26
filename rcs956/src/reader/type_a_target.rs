@@ -2,7 +2,7 @@ use super::{Error, Reader, RfTimeout, State};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 use core::{mem, time::Duration};
-use iso14443::nfca::{PassiveTarget, PassiveTargetReader, TargetCommand};
+use iso14443::nfca::{PassiveTarget, PassiveTargetReader, TargetCommand, TargetEvent};
 
 const CONTROL_WAIT: Duration = Duration::from_secs(1);
 /// First NFCID1 byte that the firmware assigns to a target UID.
@@ -162,8 +162,10 @@ impl<'r, T: Transport> PassiveTarget for TypeATarget<'r, T> {
         self.uid()
     }
 
-    fn receive(&mut self, wait: RfTimeout) -> Result<Self::Command<'_>, Self::Error> {
-        self.receive(wait)
+    /// The firmware's target command returns a received command or a
+    /// status, so every event is a command and the rest are failures.
+    fn receive(&mut self, wait: RfTimeout) -> Result<TargetEvent<Self::Command<'_>>, Self::Error> {
+        self.receive(wait).map(TargetEvent::Command)
     }
 
     fn finish(self) -> Result<(), Self::Error> {

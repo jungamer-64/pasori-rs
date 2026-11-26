@@ -10,7 +10,7 @@ use crate::{
 };
 use core::fmt;
 use file::{Application, Files};
-use iso14443::nfca::Rats;
+use iso14443::nfca::{Rats, TargetEvent};
 use port100::{
     reader::{self, IsoDepATarget, TargetWait},
     transport::Transport,
@@ -96,7 +96,7 @@ pub enum Type4Event {
     /// Left an unrelated or invalid frame unanswered.
     Ignored,
     /// No frame arrived within the receive wait.
-    TimedOut,
+    Silence,
     /// Lost the initiator's field. The next call can await fresh activation.
     FieldOff,
     /// Acknowledged S(DESELECT) and closed the session. Call
@@ -179,9 +179,9 @@ impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
             return Err(Type4EmulationError::Inactive);
         }
         let command = match self.target.receive(wait) {
-            Ok(command) => command,
-            Err(reader::Error::TargetTimeout) => return Ok(Type4Event::TimedOut),
-            Err(reader::Error::TargetFieldOff) => {
+            Ok(TargetEvent::Command(command)) => command,
+            Ok(TargetEvent::Silence) => return Ok(Type4Event::Silence),
+            Ok(TargetEvent::FieldOff) => {
                 self.state = State::WaitingForRats;
                 return Ok(Type4Event::FieldOff);
             }
@@ -197,7 +197,7 @@ impl<'r, 'm, T: Transport> Type4Target<'r, 'm, T> {
                     return Ok(Type4Event::Ignored);
                 };
                 self.state = State::Active {
-                    session: Session::new(rats.frame_size(), FSC, OUTBOUND_FRAME_BYTES),
+                    session: Session::new(rats.frame_size().bytes(), FSC, OUTBOUND_FRAME_BYTES),
                     application: Application::default(),
                 };
                 (command.respond_and_wait(&ATS, wait), Type4Event::Activated)

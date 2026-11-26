@@ -1,5 +1,6 @@
 //! Target exchanges against independently encoded Port-100 responses.
 
+use pasori::iso14443::nfca::TargetEvent;
 use pasori::{
     felica_packet::Idm,
     ndef::{
@@ -50,7 +51,7 @@ fn exchange_receiving(
 }
 
 #[test]
-fn serves_a_type2_read_on_port100_after_a_stale_field_loss() -> Result<(), Box<dyn StdError>> {
+fn serves_type2_reads_on_port100_across_silence_and_field_loss() -> Result<(), Box<dyn StdError>> {
     let mut parameters = [0; 24];
     parameters[..6].copy_from_slice(&[4, 0, 1, 2, 3, 0]);
     let page_three = [
@@ -63,7 +64,9 @@ fn serves_a_type2_read_on_port100_after_a_stale_field_loss() -> Result<(), Box<d
         exchange(&parameters, 1, &[], &[0, 0, 0, 0, 4, 0, 0]),
         exchange(&parameters, 1, &[], &[0x0b, 0, 3, 0, 0, 0, 0, 0x30, 3]),
         exchange(&parameters, 0, &page_three, &[0x0b, 0, 0, 0, 0, 0, 0]),
-        exchange(&parameters, 0, &[], &[0x0b, 0, 0, 0, 0, 0, 0, 0x30, 15]),
+        exchange(&parameters, 0, &[], &[0x0b, 0, 0, 0x80, 0, 0, 0]),
+        exchange(&parameters, 0, &[], &[0x0b, 0, 0, 0, 4, 0, 0]),
+        exchange(&parameters, 1, &[], &[0x0b, 0, 3, 0, 0, 0, 0, 0x30, 15]),
         exchange(&parameters, 0, &page_fifteen, &[0x0b, 0, 0, 0, 0, 0, 0]),
         exchange(&parameters, 0, &[], &[0x0b, 0, 0, 0, 0, 0, 0, 0x50, 0]),
     ]);
@@ -73,6 +76,8 @@ fn serves_a_type2_read_on_port100_after_a_stale_field_loss() -> Result<(), Box<d
     reader.initialize()?;
     let mut target = Type2Target::listen(&mut reader, [1, 2, 3], &MESSAGE, wait()?)?;
     assert_eq!(target.serve_next(wait()?)?, Type2Event::Read(3));
+    assert_eq!(target.serve_next(wait()?)?, Type2Event::Silence);
+    assert_eq!(target.serve_next(wait()?)?, Type2Event::FieldOff);
     assert_eq!(target.serve_next(wait()?)?, Type2Event::Read(15));
     assert_eq!(target.serve_next(wait()?)?, Type2Event::Halted);
     assert!(matches!(
@@ -147,14 +152,11 @@ fn serves_type3_attribute_and_message_blocks_across_field_cycles() -> Result<(),
     )?;
     assert!(matches!(
         target.serve_next(wait()?),
-        Err(Type3EmulationError::Reader(Error::TargetTimeout))
+        Ok(Type3Event::Silence)
     ));
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Ignored);
-    assert!(matches!(
-        target.serve_next(wait()?),
-        Err(Type3EmulationError::Reader(Error::TargetFieldOff))
-    ));
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::FieldOff);
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
@@ -265,10 +267,14 @@ fn a_felica_target_keeps_a_frame_received_at_the_initiators_rate_with_its_respon
         PMM,
         0x12fc,
     )?;
-    let command = target.receive(wait()?)?;
+    let TargetEvent::Command(command) = target.receive(wait()?)? else {
+        return Err("expected a command".into());
+    };
     assert_eq!(command.data(), attribute_read());
     command.respond_and_wait(&attribute_reply(), wait()?)?;
-    let command = target.receive(wait()?)?;
+    let TargetEvent::Command(command) = target.receive(wait()?)? else {
+        return Err("expected a command".into());
+    };
     assert_eq!(command.data(), attribute_read());
     command.respond(&attribute_reply())?;
     target.finish()?;
@@ -348,14 +354,8 @@ fn a_host_activated_type3_target_advertises_424_and_follows_the_initiator()
         &MESSAGE,
     )?;
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
-    assert!(matches!(
-        target.serve_next(wait()?),
-        Err(Type3EmulationError::Reader(Error::TargetFieldOff))
-    ));
-    assert!(matches!(
-        target.serve_next(wait()?),
-        Err(Type3EmulationError::Reader(Error::TargetTimeout))
-    ));
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::FieldOff);
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Silence);
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -377,7 +377,9 @@ fn a_failed_send_on_older_firmware_revokes_the_target() -> Result<(), Box<dyn St
     let mut reader = Reader::new(script);
     reader.initialize()?;
     let mut target = reader.listen_type_a([1, 2, 3], wait()?)?;
-    let request = target.receive(wait()?)?;
+    let TargetEvent::Command(request) = target.receive(wait()?)? else {
+        return Err("expected a command".into());
+    };
     assert_eq!(request.data(), [0x30, 3]);
     assert!(matches!(
         request.respond(&[0xaa]),
@@ -509,7 +511,7 @@ fn type4a_field_loss_clears_selection_and_transmit_failure_revokes() -> Result<(
     reader.initialize()?;
     let mut target = Type4Target::listen(&mut reader, [1, 2, 3], &[])?;
     let wait = wait()?;
-    assert_eq!(target.serve_next(wait)?, Type4Event::TimedOut);
+    assert_eq!(target.serve_next(wait)?, Type4Event::Silence);
     assert_eq!(target.serve_next(wait)?, Type4Event::Activated);
     assert!(matches!(
         target.serve_next(wait),

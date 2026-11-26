@@ -2,12 +2,15 @@
 
 use super::{Error, IccResponsePolicy, Profile, Reader, ResponseWait, apdu};
 use crate::transport::Transport;
-use alloc::vec::Vec;
 use core::time::Duration;
-use iso14443::{iso_dep, nfca, nfcb};
+use iso14443::{FrameSize, iso_dep, nfca, nfcb};
 
-const MAX_BLOCK: usize = 256;
-const MAX_BLOCK_WITHOUT_CRC: usize = MAX_BLOCK - 2;
+/// Reader frame size (FSD) that RATS and ATTRIB announce to the card: the
+/// largest block, including its two CRC bytes, carried in each direction.
+pub const READER_FRAME_SIZE: FrameSize = FrameSize::from_index(8);
+const MAX_BLOCK_WITHOUT_CRC: usize = READER_FRAME_SIZE.bytes() as usize - 2;
+/// RATS announcing the reader frame size and assigning CID 0.
+const RATS: nfca::Rats = nfca::Rats::new(READER_FRAME_SIZE, None);
 
 /// Validated card activation data for the host ISO-DEP block protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +18,7 @@ pub enum Activation {
     /// The reader selected a Type A card and the host sent RATS.
     TypeA {
         /// Final select acknowledgment reported by the reader.
-        sak: u8,
+        sak: nfca::SelRes,
         /// The actual RF answer to RATS without its CRC.
         ats: nfca::Ats,
     },
@@ -26,7 +29,9 @@ pub enum Activation {
 impl<T: Transport> Reader<T> {
     /// Activate a 106 kbps NFC-A ISO-DEP card, returning `None` when the
     /// reader's Layer 3 selection receives no RF answer. A fresh field
-    /// precedes selection. RATS requests 256-byte frames with CID zero.
+    /// precedes selection, which releases a card that an earlier selection
+    /// left in the protocol state. RATS announces [`READER_FRAME_SIZE`] with
+    /// CID zero.
     ///
     /// # Errors
     ///
@@ -44,18 +49,18 @@ impl<T: Transport> Reader<T> {
             |objects| objects.sak(),
         ) {
             Err(Error::DeviceApdu(error)) if error.icc_timeout() => return Ok(None),
-            result => result?,
+            result => nfca::SelRes::new(result?),
         };
-        if sak & 0x04 != 0 {
-            return Err(Error::TypeASak(sak));
+        if sak.continues_cascade() {
+            return Err(Error::TypeASak(sak.byte()));
         }
-        if sak & 0x20 == 0 {
+        if !sak.supports_iso_dep() {
             return Err(Error::NotIsoDep);
         }
         self.acknowledge(&Profile::TypeA.framing_command())?;
         self.enable_profile(Profile::TypeA);
         let result = self
-            .exchange_rf(&[0xe0, 0x80], wait, IccResponsePolicy::Unique)
+            .exchange_rf(&RATS.bytes(), wait, IccResponsePolicy::Unique)
             .and_then(|ats| nfca::Ats::parse(&ats).map_err(Error::TypeA));
         let ats = match result {
             Ok(ats) => ats,
@@ -65,7 +70,7 @@ impl<T: Transport> Reader<T> {
             }
         };
         self.link.wait(ats.startup_guard());
-        let parameters = ats.iso_dep();
+        let parameters = ats.iso_dep(RATS);
         Ok(Some(IsoDepCard {
             reader: self,
             activation: Activation::TypeA { sak, ats },
@@ -74,13 +79,15 @@ impl<T: Transport> Reader<T> {
     }
 
     /// Activate a 106 kbps NFC-B ISO-DEP card using one REQB slot and
-    /// ATTRIB with CID zero. AFI zero matches all application families.
-    /// Returns `None` when no card answers REQB.
+    /// ATTRIB announcing [`READER_FRAME_SIZE`] with CID zero. AFI zero
+    /// matches all application families. Returns `None` when no card answers
+    /// REQB. A fresh field precedes REQB.
     ///
     /// # Errors
     ///
-    /// Requires initialization. A card without ISO-DEP, a malformed ATQB
-    /// or ATTRIB response, or failure after REQB answered is an error.
+    /// Requires initialization. A card without ISO-DEP
+    /// ([`nfcb::Error::NotIsoDep`]), a malformed ATQB or ATTRIB response, or
+    /// failure after REQB answered is an error.
     pub fn poll_type_b(
         &mut self,
         afi: u8,
@@ -119,22 +126,9 @@ impl<T: Transport> Reader<T> {
         let atqb =
             <[u8; 12]>::try_from(atqb.as_slice()).map_err(|_| Error::ReplyLength(atqb.len()))?;
         let atqb = nfcb::Atqb::new(atqb).map_err(Error::TypeB)?;
-        if !atqb.supports_iso_dep() {
-            return Err(Error::NotIsoDep);
-        }
-        // Default guard and framing, FSDI 8, 106 kbps, ISO-DEP, CID zero.
-        let [a, b, c, d] = atqb.pupi();
-        let attrib = self.exchange_rf(
-            &[0x1d, a, b, c, d, 0x00, 0x08, 0x01, 0x00],
-            wait,
-            IccResponsePolicy::Unique,
-        )?;
-        let observation = nfcb::Observation::new(atqb, &attrib).map_err(Error::TypeB)?;
-        if observation.cid() != 0 {
-            return Err(Error::AttribCid(observation.cid()));
-        }
-        let parameters = observation.iso_dep().ok_or(Error::NotIsoDep)?;
-        Ok(Some((observation, parameters)))
+        let attrib = nfcb::Attrib::new(atqb, READER_FRAME_SIZE, None).map_err(Error::TypeB)?;
+        let response = self.exchange_rf(&attrib.command(), wait, IccResponsePolicy::Unique)?;
+        attrib.complete(&response).map(Some).map_err(Error::TypeB)
     }
 }
 
@@ -164,28 +158,17 @@ impl<T: Transport> iso_dep::Selection for IsoDepCard<'_, T> {
         self.parameters
     }
 
-    fn maximum_block_bytes(&self) -> usize {
-        MAX_BLOCK
-    }
-
     fn blocks(&mut self) -> Result<Self::Blocks<'_>, Self::Error> {
         self.reader.require_configured_field()?;
         Ok(IsoDepBlocks {
             reader: self.reader,
         })
     }
-
-    fn is_rf_timeout(error: &Self::Error) -> bool {
-        matches!(error, Error::NoResponse)
-    }
-
-    fn require_field_cycle(&mut self) {
-        self.reader.require_cycle();
-    }
 }
 
 /// Block transfer authority borrowed from an ISO-DEP selection. The reader
 /// handles the RF CRC and carries the ISO-DEP prologue supplied by the host.
+/// A missing reply is [`iso_dep::Reply::Silence`] and keeps the field.
 #[derive(Debug)]
 pub struct IsoDepBlocks<'s, T: Transport> {
     reader: &'s mut Reader<T>,
@@ -194,18 +177,22 @@ pub struct IsoDepBlocks<'s, T: Transport> {
 impl<T: Transport> iso_dep::Blocks for IsoDepBlocks<'_, T> {
     type Error = Error<T::Error>;
 
-    fn transfer(&mut self, block: &[u8], wait: Duration) -> Result<Vec<u8>, Self::Error> {
+    fn transfer(&mut self, block: &[u8], wait: Duration) -> Result<iso_dep::Reply, Self::Error> {
         if block.is_empty() || block.len() > MAX_BLOCK_WITHOUT_CRC {
             return Err(Error::InputLength(block.len()));
         }
         let wait = ResponseWait::new(wait).ok_or(Error::WaitRange(wait))?;
-        let response = self
+        let response = match self
             .reader
-            .exchange_rf(block, wait, IccResponsePolicy::Unique)?;
+            .exchange_rf(block, wait, IccResponsePolicy::Unique)
+        {
+            Err(Error::NoResponse) => return Ok(iso_dep::Reply::Silence),
+            result => result?,
+        };
         if response.is_empty() || response.len() > MAX_BLOCK_WITHOUT_CRC {
             self.reader.invalidate_field();
             return Err(Error::ReplyLength(response.len()));
         }
-        Ok(response)
+        Ok(iso_dep::Reply::Block(response))
     }
 }

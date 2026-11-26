@@ -2,12 +2,12 @@
 
 use super::{
     Error, Field, Reader, Received, ResponseWait,
-    iso_dep::{Activation, IsoDepCard},
+    iso_dep::{Activation, IsoDepCard, READER_FRAME_SIZE},
     settings::{CrcCheck, Settings},
 };
 use crate::transport::Transport;
-use alloc::{vec, vec::Vec};
-use iso14443::nfca;
+use alloc::vec::Vec;
+use iso14443::nfca::{self, Nibble, Reply, SelRes};
 
 /// SENS_REQ, sent as a 7-bit short frame.
 const SENS_REQ: u8 = 0x26;
@@ -15,8 +15,8 @@ const SENS_REQ: u8 = 0x26;
 const SELECT: [u8; 3] = [0x93, 0x95, 0x97];
 /// First UID byte of a level whose UID continues at the next level.
 const CASCADE_TAG: u8 = 0x88;
-/// RATS with FSDI 8 (256-byte frames) and CID 0.
-const RATS: [u8; 2] = [0xe0, 0x80];
+/// RATS announcing the reader frame size and assigning CID 0.
+const RATS: nfca::Rats = nfca::Rats::new(READER_FRAME_SIZE, None);
 /// InSetProtocol pairs that leave CRC to the host and send 7-bit frames.
 const SHORT_FRAME: [u8; 6] = [0x01, 0x00, 0x02, 0x00, 0x07, 0x07];
 /// InSetProtocol pair that sends complete bytes.
@@ -66,7 +66,7 @@ impl<T: Transport> Reader<T> {
                 return Err(error);
             }
         };
-        Ok(Some(match observation.ats().map(nfca::Ats::iso_dep) {
+        Ok(Some(match observation.ats().map(|ats| ats.iso_dep(RATS)) {
             Some(parameters) => TypeASelection::IsoDep(IsoDepCard {
                 reader: self,
                 activation: Activation::TypeA(observation),
@@ -107,10 +107,10 @@ impl<T: Transport> Reader<T> {
                 .whole_bytes()?
                 .as_slice()
             {
-                [sak] => *sak,
+                [sak] => SelRes::new(*sak),
                 _ => return Err(Error::CardReply("SEL_RES length")),
             };
-            if sak & 0x04 == 0 {
+            if !sak.continues_cascade() {
                 uid.extend_from_slice(&[a, b, c, d]);
                 sel_res = Some(sak);
                 break;
@@ -127,8 +127,8 @@ impl<T: Transport> Reader<T> {
             settings: Settings::TypeA(CrcCheck::Reader),
             cycle: false,
         });
-        let ats = if sel_res & 0x24 == 0x20 {
-            let ats = nfca::Ats::parse(&self.card_reply(&RATS, wait)?.whole_bytes()?)
+        let ats = if sel_res.supports_iso_dep() {
+            let ats = nfca::Ats::parse(&self.card_reply(&RATS.bytes(), wait)?.whole_bytes()?)
                 .map_err(Error::TypeA)?;
             self.link.wait(ats.startup_guard());
             Some(ats)
@@ -163,13 +163,13 @@ impl<T: Transport> nfca::Selection for TypeACard<'_, T> {
         &self.observation
     }
 
-    fn exchange(&mut self, command: &[u8]) -> Result<nfca::Reply, Error<T::Error>> {
+    fn exchange(&mut self, command: &[u8]) -> Result<Reply, Error<T::Error>> {
         match self
             .reader
             .transceive(Settings::TypeA(CrcCheck::Host), command, self.wait)?
         {
-            None => Ok(nfca::Reply::Silence),
-            Some(received) => host_checked(received).map(nfca::Reply::Data),
+            None => Ok(Reply::Silence),
+            Some(received) => host_checked(received),
         }
     }
 
@@ -179,13 +179,15 @@ impl<T: Transport> nfca::Selection for TypeACard<'_, T> {
 }
 
 /// Interpret a reply whose CRC the reader did not check.
-fn host_checked<E>(received: Received) -> Result<Vec<u8>, Error<E>> {
+fn host_checked<E>(received: Received) -> Result<Reply, Error<E>> {
     match (received.data.as_slice(), received.last_bits) {
-        ([nibble], 4) => Ok(vec![nibble & 0x0f]),
+        ([nibble], 4) => Nibble::new(nibble & 0x0f)
+            .map(Reply::Nibble)
+            .ok_or(Error::CardReply("4-bit reply")),
         (frame, 8) => match frame.split_last_chunk::<2>() {
             Some((body, crc)) if !body.is_empty() => {
                 if crc_a(body) == *crc {
-                    Ok(body.to_vec())
+                    Ok(Reply::Frame(body.to_vec()))
                 } else {
                     Err(Error::CardCrc)
                 }
@@ -226,10 +228,19 @@ mod tests {
             data: data.to_vec(),
             last_bits,
         };
-        assert_eq!(host_checked::<()>(reply(&[0x0a], 4)).ok(), Some(vec![0x0a]));
+        assert_eq!(
+            host_checked::<()>(reply(&[0x0a], 4)).ok(),
+            Nibble::new(0x0a).map(Reply::Nibble)
+        );
         assert_eq!(
             host_checked::<()>(reply(&[0x30, 0x00, 0x02, 0xa8], 8)).ok(),
-            Some(vec![0x30, 0x00])
+            Some(Reply::Frame(alloc::vec![0x30, 0x00]))
+        );
+        // A one-byte frame keeps its CRC-checked identity apart from a nibble.
+        let ack_byte = [0x0a, crc_a(&[0x0a])[0], crc_a(&[0x0a])[1]];
+        assert_eq!(
+            host_checked::<()>(reply(&ack_byte, 8)).ok(),
+            Some(Reply::Frame(alloc::vec![0x0a]))
         );
         assert!(matches!(
             host_checked::<()>(reply(&[0x30, 0x00, 0x02, 0xa9], 8)),

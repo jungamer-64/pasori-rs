@@ -6,7 +6,7 @@
 
 `felica-packet` は reader によらない FeliCa カードの packet の事実を所有する。IDm、Polling の要求と応答、packet の長さ byte の検証と、Polling で選択したカードとの packet 交換の contract（`Selection`）がここに属する。各 reader crate は自分の選択 handle でこの contract を実装し、送受信可能な packet 上限、RF 転送・待機・失敗時の状態遷移を決める。
 
-`iso14443` は reader によらない NFC-A と NFC-B の活性化の事実と、選択したカードとの交換の contract を所有する。SENS_RES・SEL_RES・UID・ATS、ATQB と ATTRIB 応答の検証、そこから決まる ISO-DEP の block parameter がここに属する。reader crate の選択 handle は、NFC-A の command frame を運ぶ `nfca::Selection` と、host が block protocol を実行するための `iso_dep::Selection` を実装する。NFC-A の passive target は `nfca::PassiveTarget` で initiator からの command と一度だけ応答する権限を渡す。
+`iso14443` は reader によらない NFC-A と NFC-B の活性化の事実と、選択したカードとの交換の contract を所有する。SENS_RES・SEL_RES・UID・ATS、ATQB と ATTRIB 応答の検証、RATS と ATTRIB でカードに通知する frame size と CID、そこから決まる ISO-DEP の block parameter がここに属する。reader crate の選択 handle は、NFC-A の command frame を運ぶ `nfca::Selection` と、host が block protocol を実行するための `iso_dep::Selection` を実装する。NFC-A の passive target は `nfca::PassiveTarget` で initiator からの command と一度だけ応答する権限を渡す。
 
 `rcs956` は RC-S956 チップの制御を所有する。フレーム、取引状態、firmware の RF 設定と timer、target の検出と活性化（InListPassiveTarget と TgInitTarget）、その応答の検証、firmware が実行するカード操作（NFC-A の ISO-DEP、MIFARE Classic の認証と block access、NFC-DEP）がここに属する。host が実行するプロトコルには、選択した target ごとの交換手段を渡す。FeliCa の packet 交換と packet stream、NFC-B の block 転送、Type 1 と Type A の command 交換、passive Type A target の受信と応答がそれにあたる。`4A` が返す target record は `iso14443` の活性化データへ変換する。crate が定義する `Transport` へ同期転送、pipe 回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移は crate で決める。OS のデバイス列挙、USB backend、ドライバとの通信は `Transport` の実装側が所有する。
 
@@ -39,7 +39,7 @@ cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p port1
 
 各操作の詳細な条件は定義側の rustdoc が正本であり、ここでは workspace 全体に共通する契約だけを示す。
 
-失敗した初期化を成功状態として公開しない。カード handle は reader の排他的 borrow を保持し、選択・raw 交換・認証の権限はその borrow と RF 状態より長く残らない。raw 交換や認証へ移ると typed handle は消費される。FeliCa Standard の有効な認証 session は Reset Mode の成功を検証して Mode0 の typed handle へ移れる。次の選択要求で消えないカード状態を残す操作は、送る前に選択 handle へ field cycle の必要を宣言する。次の選択はその宣言を受けて RF field を切ってから要求を送る。
+失敗した初期化を成功状態として公開しない。カード handle は reader の排他的 borrow を保持し、選択・raw 交換・認証の権限はその borrow と RF 状態より長く残らない。raw 交換や認証へ移ると typed handle は消費される。FeliCa Standard の有効な認証 session は Reset Mode の成功を検証して Mode0 の typed handle へ移れる。次の選択要求で消えないカード状態を残す操作は、送る前に選択 handle へ field cycle の必要を宣言する。次の選択はその宣言を受けて RF field を切ってから要求を送る。RATS と ATTRIB による活性化そのものが残す状態は、その選択を与えた reader が次の選択の前に RF field を切って解消する。
 
 カード操作全体は自動で再実行しない。FALP は順序番号で重複を排除できる欠落 block の再要求と、応答のない送信切替 block の再送を行う。ISO-DEP は block protocol の再送要求に応答し、同じ APDU を再処理しない。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みの progress を error に残す。transport 失敗後には RF readiness が失効する。reader への `initialize` は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 

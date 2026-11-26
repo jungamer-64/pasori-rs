@@ -1,7 +1,7 @@
 use crate::ndef::{Message, MessageError};
 use alloc::vec::Vec;
 use core::fmt;
-use iso14443::nfca::{PassiveTarget, PassiveTargetReader, TargetCommand};
+use iso14443::nfca::{PassiveTarget, PassiveTargetReader, TargetCommand, TargetEvent};
 
 const MEMORY_BYTES: usize = 64;
 const DATA_START: usize = 16;
@@ -57,6 +57,10 @@ pub enum Type2Event {
     Ignored(Vec<u8>),
     /// The initiator halted the tag. Call [Type2Target::finish].
     Halted,
+    /// No command arrived within the wait.
+    Silence,
+    /// The initiator's field went off. The next call awaits a new activation.
+    FieldOff,
 }
 
 /// Exclusive passive target serving an immutable Type 2 memory image.
@@ -101,10 +105,15 @@ impl<L: PassiveTarget> Type2Target<L> {
         if self.halted {
             return Err(Type2EmulationError::Halted);
         }
-        let command = self
+        let command = match self
             .target
             .receive(timeout)
-            .map_err(Type2EmulationError::Reader)?;
+            .map_err(Type2EmulationError::Reader)?
+        {
+            TargetEvent::Command(command) => command,
+            TargetEvent::Silence => return Ok(Type2Event::Silence),
+            TargetEvent::FieldOff => return Ok(Type2Event::FieldOff),
+        };
         Ok(match command.data() {
             data if data == HALT => {
                 self.halted = true;

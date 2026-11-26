@@ -3,6 +3,7 @@ use crate::felica::{self, BlockAddress, BlockWrite, Card, MAX_READ_BLOCKS, MAX_W
 use alloc::vec::Vec;
 use core::fmt;
 use felica_packet::{Idm, PollRequest, Selection};
+use iso14443::nfca::TargetEvent;
 use port100::{
     reader::{self, FelicaTarget, PollingResponder, TargetWait},
     transport::Transport,
@@ -66,6 +67,10 @@ pub enum Type3Event {
     Read,
     /// An unsupported command, address or packet was left unanswered.
     Ignored,
+    /// No packet arrived within the wait.
+    Silence,
+    /// The initiator's field went off. The next call awaits a new activation.
+    FieldOff,
 }
 
 /// Passive Type 3 target serving a fixed NDEF message on Port-100.
@@ -118,10 +123,15 @@ impl<'r, 'm, T: Transport> Type3Target<'r, 'm, T> {
         &mut self,
         wait: TargetWait,
     ) -> Result<Type3Event, Type3EmulationError<T::Error>> {
-        let command = self
+        let command = match self
             .target
             .receive(wait)
-            .map_err(Type3EmulationError::Reader)?;
+            .map_err(Type3EmulationError::Reader)?
+        {
+            TargetEvent::Command(command) => command,
+            TargetEvent::Silence => return Ok(Type3Event::Silence),
+            TargetEvent::FieldOff => return Ok(Type3Event::FieldOff),
+        };
         let Some(reply) = type3_read_reply(self.idm, &self.attribute, self.message, command.data())
         else {
             return Ok(Type3Event::Ignored);

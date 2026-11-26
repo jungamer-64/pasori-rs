@@ -148,7 +148,7 @@ fn type_four_ndef_reads_over_host_run_iso_dep_on_nfc_a() -> Result<(), Box<dyn E
     assert_eq!(ndef::read_type4(&mut card)?, [0xd0, 0, 0]);
     assert!(matches!(
         card.check_presence(),
-        Err(isodep::PresenceError::NoResponse(ReaderError::NoResponse))
+        Err(isodep::PresenceError::NoResponse)
     ));
     Ok(())
 }

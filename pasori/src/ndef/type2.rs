@@ -2,7 +2,10 @@ use super::{Error, UpdateStage, WriteError, control_range};
 use crate::type2::Type2Tag;
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
-use iso14443::nfca;
+use iso14443::nfca::{self, Nibble, Reply};
+
+/// The 4-bit ACK of a Type 2 command.
+const ACK: u8 = 0x0a;
 
 impl<C: nfca::Selection> Type2Tag<C> {
     /// Read the NDEF message across the tag's Type 2 memory sectors.
@@ -89,7 +92,7 @@ struct Type2Write {
 
 impl<'card, C: nfca::Selection> Type2Data<'card, C> {
     fn open(card: &'card mut Type2Tag<C>) -> Result<Self, Error<C::Error>> {
-        if card.card.observation().sel_res() != 0 {
+        if card.card.observation().sel_res().byte() != 0 {
             return Err(Error::UnsupportedMapping);
         }
         let header = type2_read_window(card, Type2Page(0))?;
@@ -309,17 +312,22 @@ impl<'card, C: nfca::Selection> Type2Data<'card, C> {
         let [a, b, c, d] = data;
         let (sector, address) = page.wire_address();
         select_sector(self.card, sector)?;
-        match type2_exchange(self.card, &[0xa2, address, a, b, c, d])?.as_slice() {
-            [0x0a] => Ok(()),
-            [] => {
-                // A status-only completion carries no card ACK to inspect.
+        let answer = type2_exchange(self.card, &[0xa2, address, a, b, c, d])?;
+        match answer.four_bit() {
+            Some(ACK) => return Ok(()),
+            Some(nibble) => return Err(nak(nibble)),
+            None => {}
+        }
+        match answer {
+            Answer::Unreported => {
+                // A reader that consumes the 4-bit reply leaves no ACK to
+                // inspect, so the page itself confirms the write.
                 let window = type2_read_window(self.card, page)?;
                 if window[..4] != data {
                     return Err(Error::Layout("Type 2 WRITE readback"));
                 }
                 Ok(())
             }
-            [nak @ (0 | 1 | 4 | 5)] => Err(Error::Type2Nak(*nak)),
             _ => Err(Error::Layout("Type 2 WRITE response")),
         }
     }
@@ -331,9 +339,14 @@ fn type2_read_window<C: nfca::Selection>(
 ) -> Result<[u8; 16], Error<C::Error>> {
     let (sector, address) = page.wire_address();
     select_sector(card, sector)?;
-    type2_exchange(card, &[0x30, address])?
-        .try_into()
-        .map_err(|_| Error::Layout("Type 2 READ length"))
+    let answer = type2_exchange(card, &[0x30, address])?;
+    match (answer.four_bit(), answer) {
+        (_, Answer::Frame(data)) => data
+            .try_into()
+            .map_err(|_| Error::Layout("Type 2 READ length")),
+        (Some(nibble), _) if nibble != ACK => Err(nak(nibble)),
+        _ => Err(Error::Layout("Type 2 READ response")),
+    }
 }
 
 fn select_sector<C: nfca::Selection>(
@@ -350,17 +363,17 @@ fn select_sector<C: nfca::Selection>(
         card.card.require_field_cycle();
     }
     let selected = (|| {
-        match type2_exchange(card, &[0xc2, 0xff])?.as_slice() {
-            [0x0a] => {}
-            [nak @ (0 | 1 | 4 | 5)] => return Err(Error::Type2Nak(*nak)),
-            _ => return Err(Error::Layout("Type 2 SECTOR SELECT first response")),
+        match type2_exchange(card, &[0xc2, 0xff])?.four_bit() {
+            Some(ACK) => {}
+            Some(nibble) => return Err(nak(nibble)),
+            None => return Err(Error::Layout("Type 2 SECTOR SELECT first response")),
         }
         // The second packet succeeds with a passive ACK. Only the reader's
         // report of silence demonstrates it; a failed exchange leaves it unknown.
         match card.card.exchange(&[sector, 0, 0, 0]) {
-            Ok(nfca::Reply::Silence) => Ok(()),
-            Ok(nfca::Reply::Data(data)) => match data.as_slice() {
-                [nak @ (0 | 1 | 4 | 5)] => Err(Error::Type2Nak(*nak)),
+            Ok(Reply::Silence) => Ok(()),
+            Ok(reply) => match Answer::from_reply(reply).and_then(|answer| answer.four_bit()) {
+                Some(nibble) if nibble != ACK => Err(nak(nibble)),
                 _ => Err(Error::Layout("Type 2 SECTOR SELECT second response")),
             },
             Err(error) => Err(Error::Exchange(error)),
@@ -372,12 +385,50 @@ fn select_sector<C: nfca::Selection>(
     selected
 }
 
+/// A reply to a Type 2 command that the tag must answer.
+enum Answer {
+    Frame(Vec<u8>),
+    Nibble(Nibble),
+    Byte(u8),
+    Unreported,
+}
+
+impl Answer {
+    fn from_reply(reply: Reply) -> Option<Self> {
+        match reply {
+            Reply::Frame(data) => Some(Self::Frame(data)),
+            Reply::Nibble(nibble) => Some(Self::Nibble(nibble)),
+            Reply::Byte(byte) => Some(Self::Byte(byte)),
+            Reply::Unreported => Some(Self::Unreported),
+            Reply::Silence => None,
+        }
+    }
+
+    /// The 4-bit value of an ACK or NAK. A Type 2 tag sends no one-byte
+    /// standard frame, so a byte without a reported bit count that fits in
+    /// four bits is that reply.
+    fn four_bit(&self) -> Option<u8> {
+        match self {
+            Self::Nibble(nibble) => Some(nibble.get()),
+            Self::Byte(byte @ 0..=0x0f) => Some(*byte),
+            _ => None,
+        }
+    }
+}
+
+/// Send a command that the tag must answer; silence is [`Error::NoResponse`].
 fn type2_exchange<C: nfca::Selection>(
     card: &mut Type2Tag<C>,
     command: &[u8],
-) -> Result<Vec<u8>, Error<C::Error>> {
-    match card.card.exchange(command).map_err(Error::Exchange)? {
-        nfca::Reply::Data(data) => Ok(data),
-        nfca::Reply::Silence => Err(Error::NoResponse),
+) -> Result<Answer, Error<C::Error>> {
+    Answer::from_reply(card.card.exchange(command).map_err(Error::Exchange)?)
+        .ok_or(Error::NoResponse)
+}
+
+/// A 4-bit reply other than ACK: one of the NAK values, or an undefined one.
+fn nak<E>(nibble: u8) -> Error<E> {
+    match nibble {
+        nak @ (0 | 1 | 4 | 5) => Error::Type2Nak(nak),
+        _ => Error::Layout("Type 2 4-bit reply"),
     }
 }
