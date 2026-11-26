@@ -2,50 +2,75 @@
 //!
 //! The reader carries each block and owns its CRC; the host block engine
 //! owns sequencing, CID and NAD fields, chaining and WTX.
-use crate::WaitIndex;
+use crate::{FrameSize, WaitIndex};
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
-/// Smallest frame of the block protocol, including CRC: the frame size that
-/// FSCI and FSDI 0 grant.
-pub const MIN_FRAME_BYTES: u16 = 16;
+/// A card identifier that every block of a session carries, in `1..=14`.
+/// A session that assigned CID 0 omits the field instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cid(u8);
+
+impl Cid {
+    /// Accept the identifiers `1..=14`.
+    pub const fn new(value: u8) -> Option<Self> {
+        if value >= 1 && value <= 14 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// The 4-bit field value.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
 
 /// Block protocol parameters that a card's activation granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parameters {
-    frame_size: u16,
+    card_frame_size: FrameSize,
+    reader_frame_size: FrameSize,
     fwi: WaitIndex,
-    cid: Option<u8>,
+    cid: Option<Cid>,
     nad_supported: bool,
     maximum_command_bytes: Option<usize>,
 }
 
 impl Parameters {
     pub(crate) fn new(
-        frame_size: u16,
+        card_frame_size: FrameSize,
+        reader_frame_size: FrameSize,
         fwi: WaitIndex,
-        cid: Option<u8>,
+        cid: Option<Cid>,
         nad_supported: bool,
         maximum_command_bytes: Option<usize>,
     ) -> Self {
         Self {
-            frame_size,
+            card_frame_size,
+            reader_frame_size,
             fwi,
             cid,
             nad_supported,
             maximum_command_bytes,
         }
     }
-    /// Card frame size (FSC), including protocol overhead and CRC.
-    pub fn frame_size(&self) -> u16 {
-        self.frame_size
+    /// Card frame size (FSC): the largest block the card accepts.
+    pub fn card_frame_size(&self) -> FrameSize {
+        self.card_frame_size
+    }
+    /// Reader frame size (FSD) that activation announced: the largest block
+    /// the card may send.
+    pub fn reader_frame_size(&self) -> FrameSize {
+        self.reader_frame_size
     }
     /// Frame waiting integer.
     pub fn fwi(&self) -> WaitIndex {
         self.fwi
     }
     /// CID that every block carries, or `None` when blocks carry no CID field.
-    pub fn cid(&self) -> Option<u8> {
+    pub fn cid(&self) -> Option<Cid> {
         self.cid
     }
     /// Whether the card advertises optional node-address fields.
@@ -58,12 +83,24 @@ impl Parameters {
     }
 }
 
+/// Card reply to one block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    /// The reply block without CRC, after the reader checked the CRC.
+    Block(Vec<u8>),
+    /// No reply arrived within the transfer's wait.
+    Silence,
+}
+
 /// A card selected with ISO-DEP parameters whose blocks the reader carries.
 ///
 /// The reader layer owns RF configuration and each transfer's failure
-/// states; the host block engine owns block contents. A block exchange that
-/// leaves card state which the next selection does not clear must be
-/// declared with [`Self::require_field_cycle`].
+/// states; the host block engine owns block contents. The reader carries
+/// blocks of up to [`Parameters::reader_frame_size`] in each direction.
+///
+/// RATS and ATTRIB move the card into a protocol state that later selection
+/// requests do not reach. The reader that granted the selection therefore
+/// cycles the RF field before its next selection.
 pub trait Selection {
     /// Reader failure of setup or of one transfer. Whether a block was sent is
     /// part of the reader's error contract.
@@ -76,25 +113,12 @@ pub trait Selection {
     /// Parameters that activation granted.
     fn parameters(&self) -> Parameters;
 
-    /// Largest block, including its two CRC bytes, that the reader carries in
-    /// each direction. A reader that carries the block protocol carries
-    /// blocks of at least [`MIN_FRAME_BYTES`].
-    fn maximum_block_bytes(&self) -> usize;
-
     /// Apply the reader setup of block transfers. Failure sends no block.
     ///
     /// # Errors
     ///
     /// Returns the reader's setup failure.
     fn blocks(&mut self) -> Result<Self::Blocks<'_>, Self::Error>;
-
-    /// Whether `error` reports a transfer that received no answer within its
-    /// wait. Other failures report an invalid frame or a reader failure.
-    fn is_rf_timeout(error: &Self::Error) -> bool;
-
-    /// Make the next selection on this reader cycle the RF field before its
-    /// request.
-    fn require_field_cycle(&mut self);
 }
 
 /// Block transfers of one prepared ISO-DEP selection.
@@ -102,13 +126,27 @@ pub trait Blocks {
     /// Reader failure of one transfer.
     type Error;
 
-    /// Send one block without CRC and return the card's reply block without
-    /// CRC, waiting at most `wait` for its start. The reader never replays a
-    /// block automatically.
+    /// Send one block without CRC and return the card's reply, waiting at
+    /// most `wait` for its start. The reader never replays a block
+    /// automatically, and a reply missing within `wait` leaves the selection
+    /// usable for the block protocol's recovery.
     ///
     /// # Errors
     ///
     /// Returns the reader's failure of this transfer, including blocks above
-    /// the reader's limit before sending.
-    fn transfer(&mut self, block: &[u8], wait: Duration) -> Result<Vec<u8>, Self::Error>;
+    /// the reader frame size before sending and an invalid reply frame.
+    fn transfer(&mut self, block: &[u8], wait: Duration) -> Result<Reply, Self::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn carried_card_identifiers_exclude_zero_and_the_reserved_value() {
+        assert_eq!(Cid::new(0), None);
+        assert_eq!(Cid::new(1).map(Cid::get), Some(1));
+        assert_eq!(Cid::new(14).map(Cid::get), Some(14));
+        assert_eq!(Cid::new(15), None);
+    }
 }

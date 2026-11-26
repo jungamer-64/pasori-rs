@@ -33,6 +33,10 @@ pub enum Error {
     FrameWaitIndex(u8),
     /// SFGI contains the reserved value 15.
     GuardTimeIndex(u8),
+    /// SEL_RES announces a further cascade level, so the UID is incomplete.
+    IncompleteCascade(u8),
+    /// An ATS accompanies a SEL_RES that does not advertise ISO-DEP.
+    AtsWithoutIsoDep(u8),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +54,15 @@ impl fmt::Display for Error {
             Self::AtsFormat(format) => write!(f, "unsupported ATS format byte {format:02X}"),
             Self::FrameWaitIndex(index) => write!(f, "reserved FWI {index}"),
             Self::GuardTimeIndex(index) => write!(f, "reserved SFGI {index}"),
+            Self::IncompleteCascade(sel_res) => {
+                write!(f, "SEL_RES {sel_res:02X} announces a further cascade level")
+            }
+            Self::AtsWithoutIsoDep(sel_res) => {
+                write!(
+                    f,
+                    "ATS with SEL_RES {sel_res:02X}, which does not advertise ISO-DEP"
+                )
+            }
         }
     }
 }
@@ -64,6 +77,23 @@ pub struct Rats {
 }
 
 impl Rats {
+    /// The request announcing `frame_size` as FSD and assigning `cid`, or
+    /// CID 0 when `cid` is `None`.
+    pub const fn new(frame_size: FrameSize, cid: Option<iso_dep::Cid>) -> Self {
+        Self {
+            frame_size,
+            cid: match cid {
+                Some(cid) => cid.get(),
+                None => 0,
+            },
+        }
+    }
+
+    /// RATS command bytes without CRC.
+    pub const fn bytes(self) -> [u8; 2] {
+        [0xe0, self.frame_size.index() << 4 | self.cid]
+    }
+
     /// Decode the initiator's frame-size limit and card identifier.
     /// Returns `None` for a different command, wrong length or reserved CID.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
@@ -77,9 +107,9 @@ impl Rats {
         })
     }
 
-    /// Maximum frame size the initiator accepts, including overhead and CRC.
-    pub fn frame_size(self) -> u16 {
-        self.frame_size.bytes()
+    /// Maximum frame size (FSD) the initiator accepts.
+    pub fn frame_size(self) -> FrameSize {
+        self.frame_size
     }
 
     /// The proposed card identifier. Its use depends on the ATS capabilities.
@@ -150,13 +180,10 @@ impl Ats {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    /// Maximum frame size the card advertises, including protocol overhead.
-    pub fn frame_size(&self) -> u16 {
-        FrameSize::from_index(self.fsci()).bytes()
-    }
-    /// Standard frame-size code; 2 is the default when T0 is absent.
-    pub fn fsci(&self) -> u8 {
-        self.bytes.get(1).copied().unwrap_or(2) & 0x0f
+    /// Maximum frame size (FSC) the card advertises; FSCI 2 is the default
+    /// when T0 is absent.
+    pub fn frame_size(&self) -> FrameSize {
+        FrameSize::from_index(self.bytes.get(1).copied().unwrap_or(2) & 0x0f)
     }
     /// Frame waiting integer; 4 is the default when TB is absent.
     pub fn fwi(&self) -> WaitIndex {
@@ -187,16 +214,46 @@ impl Ats {
     pub fn historical_bytes(&self) -> &[u8] {
         &self.bytes[self.historical_start..]
     }
-    /// Block parameters of a card that RATS activated with CID 0, so that its
-    /// blocks carry no CID field.
-    pub fn iso_dep(&self) -> iso_dep::Parameters {
+    /// Block parameters of the card that answered `rats` with this ATS.
+    /// Blocks carry the assigned CID when it is nonzero and the card
+    /// advertises CID support; otherwise they carry no CID field.
+    pub fn iso_dep(&self, rats: Rats) -> iso_dep::Parameters {
+        let cid = if self.cid_supported() {
+            iso_dep::Cid::new(rats.cid)
+        } else {
+            None
+        };
         iso_dep::Parameters::new(
             self.frame_size(),
+            rats.frame_size,
             self.fwi,
-            None,
+            cid,
             self.nad_supported(),
             None,
         )
+    }
+}
+
+/// The select acknowledgment (SAK) that ends one cascade level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelRes(u8);
+
+impl SelRes {
+    /// Wrap the received byte.
+    pub const fn new(byte: u8) -> Self {
+        Self(byte)
+    }
+    /// The received byte.
+    pub const fn byte(self) -> u8 {
+        self.0
+    }
+    /// Bit 3 announces that the UID continues at the next cascade level.
+    pub const fn continues_cascade(self) -> bool {
+        self.0 & 0x04 != 0
+    }
+    /// Bit 6 advertises ISO-DEP on a SEL_RES that completes the UID.
+    pub const fn supports_iso_dep(self) -> bool {
+        self.0 & 0x24 == 0x20
     }
 }
 
@@ -204,29 +261,37 @@ impl Ats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
     sens_res: [u8; 2],
-    sel_res: u8,
+    sel_res: SelRes,
     uid: Vec<u8>,
     ats: Option<Ats>,
 }
 
 impl Observation {
-    /// Combine SENS_RES, SEL_RES, a complete 4/7/10-byte UID and the ATS that
-    /// RATS returned, if RATS was sent.
+    /// Combine SENS_RES, the SEL_RES of the last cascade level, a complete
+    /// 4/7/10-byte UID and the ATS that RATS returned, if RATS was sent.
     ///
     /// ISO-DEP support in SEL_RES is an advertised capability. An absent ATS
     /// does not establish ISO-DEP activation and remains explicit as `None`.
     ///
     /// # Errors
     ///
-    /// Rejects UID lengths other than 4, 7 and 10.
+    /// Rejects UID lengths other than 4, 7 and 10, a SEL_RES that announces
+    /// a further cascade level, and an ATS whose SEL_RES does not advertise
+    /// ISO-DEP.
     pub fn new(
         sens_res: [u8; 2],
-        sel_res: u8,
+        sel_res: SelRes,
         uid: &[u8],
         ats: Option<Ats>,
     ) -> Result<Self, Error> {
         if !matches!(uid.len(), 4 | 7 | 10) {
             return Err(Error::UidLength(uid.len()));
+        }
+        if sel_res.continues_cascade() {
+            return Err(Error::IncompleteCascade(sel_res.byte()));
+        }
+        if ats.is_some() && !sel_res.supports_iso_dep() {
+            return Err(Error::AtsWithoutIsoDep(sel_res.byte()));
         }
         Ok(Self {
             sens_res,
@@ -239,8 +304,8 @@ impl Observation {
     pub fn sens_res(&self) -> [u8; 2] {
         self.sens_res
     }
-    /// Raw select acknowledgment byte.
-    pub fn sel_res(&self) -> u8 {
+    /// Select acknowledgment of the last cascade level.
+    pub fn sel_res(&self) -> SelRes {
         self.sel_res
     }
     /// Complete UID with cascade tags removed by activation, in wire byte order.
@@ -251,20 +316,45 @@ impl Observation {
     pub fn ats(&self) -> Option<&Ats> {
         self.ats.as_ref()
     }
-    /// SEL_RES advertises ISO-DEP without an unfinished UID cascade.
-    pub fn supports_iso_dep(&self) -> bool {
-        self.sel_res & 0x24 == 0x20
+}
+
+/// The value of a 4-bit frame. Card protocols that define such frames give
+/// them their meaning, such as ACK and NAK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nibble(u8);
+
+impl Nibble {
+    /// Accept the values `0..=15`.
+    pub const fn new(value: u8) -> Option<Self> {
+        if value <= 0x0f {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+    /// The four bits, in the low nibble.
+    pub const fn get(self) -> u8 {
+        self.0
     }
 }
 
-/// Card reply to one NFC-A command.
+/// Card reply to one NFC-A command, distinguished by what the reader
+/// observed of its bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    /// Reply bytes. A standard frame is returned without its CRC once the
-    /// CRC has been checked; a 4-bit ACK or NAK is returned as one byte
-    /// holding that nibble. Empty when the reader reports completion without
-    /// passing on any card bytes.
-    Data(Vec<u8>),
+    /// A standard frame of at least one byte, without its CRC once the CRC
+    /// has been checked.
+    Frame(Vec<u8>),
+    /// A 4-bit frame.
+    Nibble(Nibble),
+    /// One byte whose bit count the reader does not report: a one-byte
+    /// standard frame whose CRC the reader checked, or a 4-bit frame. The
+    /// command's reply format decides which.
+    Byte(u8),
+    /// The reader reported that the exchange completed but passed on none of
+    /// the card's bits, as a reader that consumes 4-bit replies itself does.
+    /// The card's answer is not observable through this exchange.
+    Unreported,
     /// No reply arrived within the reader's wait.
     Silence,
 }
@@ -298,6 +388,29 @@ pub trait Selection {
     fn require_field_cycle(&mut self);
 }
 
+/// What a passive target observed while waiting for an initiator.
+#[derive(Debug)]
+pub enum TargetEvent<C> {
+    /// One received command and the exclusive right to answer it.
+    Command(C),
+    /// No command arrived within the wait; the target keeps its activation.
+    Silence,
+    /// The initiator's RF field went off; the next receive waits for a new
+    /// activation.
+    FieldOff,
+}
+
+impl<C> TargetEvent<C> {
+    /// Apply `f` to a received command, keeping the other events.
+    pub fn map<D>(self, f: impl FnOnce(C) -> D) -> TargetEvent<D> {
+        match self {
+            Self::Command(command) => TargetEvent::Command(f(command)),
+            Self::Silence => TargetEvent::Silence,
+            Self::FieldOff => TargetEvent::FieldOff,
+        }
+    }
+}
+
 /// A passive NFC-A target with a single-size UID and no ISO-DEP.
 pub trait PassiveTarget {
     /// Reader failure at the target boundary.
@@ -311,8 +424,14 @@ pub trait PassiveTarget {
 
     /// The UID advertised during anticollision.
     fn uid(&self) -> [u8; 4];
-    /// Receive the next initiator command, without CRC.
-    fn receive(&mut self, wait: Self::Wait) -> Result<Self::Command<'_>, Self::Error>;
+    /// Wait for the next initiator command, without CRC. A reader that cannot
+    /// distinguish a missing command or field loss reports it as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader failure, whose contract defines whether the target
+    /// remains usable.
+    fn receive(&mut self, wait: Self::Wait) -> Result<TargetEvent<Self::Command<'_>>, Self::Error>;
     /// Stop target operation and restore the reader to RF-off readiness.
     fn finish(self) -> Result<(), Self::Error>;
 }
@@ -355,9 +474,20 @@ mod tests {
     #[test]
     fn rats_distinguishes_frame_size_and_card_identifier() {
         let rats = Rats::parse(&[0xe0, 0x5e]);
-        assert_eq!(rats.map(Rats::frame_size), Some(64));
+        assert_eq!(rats.map(|rats| rats.frame_size().bytes()), Some(64));
         assert_eq!(rats.map(Rats::cid), Some(14));
-        assert_eq!(Rats::parse(&[0xe0, 0xf0]).map(Rats::frame_size), Some(4096));
+        assert_eq!(
+            Rats::parse(&[0xe0, 0xf0]).map(|rats| rats.frame_size().bytes()),
+            Some(4096)
+        );
+        assert_eq!(
+            Rats::new(FrameSize::from_index(8), None).bytes(),
+            [0xe0, 0x80]
+        );
+        assert_eq!(
+            Some(Rats::new(FrameSize::from_index(5), iso_dep::Cid::new(14))),
+            rats
+        );
         assert_eq!(Rats::parse(&[0xe0, 0x5f]), None);
         assert_eq!(Rats::parse(&[0xe0, 0x50, 0]), None);
         assert_eq!(Rats::parse(&[0xc2]), None);
@@ -366,35 +496,55 @@ mod tests {
     #[test]
     fn ats_parameters_and_omitted_interface_defaults() -> Result<(), Error> {
         let ats = Ats::parse(&[6, 0x75, 0x80, 0x61, 2, 0x42])?;
-        assert_eq!(ats.frame_size(), 64);
+        assert_eq!(ats.frame_size().bytes(), 64);
         assert_eq!(ats.fwi().get(), 6);
         assert_eq!(ats.sfgi().get(), 1);
         assert_eq!(ats.startup_guard(), ats.sfgi().duration());
         assert!(ats.cid_supported());
         assert!(!ats.nad_supported());
         assert_eq!(ats.historical_bytes(), [0x42]);
-        let parameters = ats.iso_dep();
-        assert_eq!(parameters.frame_size(), 64);
+        let rats = Rats::new(FrameSize::from_index(8), None);
+        let parameters = ats.iso_dep(rats);
+        assert_eq!(parameters.card_frame_size().bytes(), 64);
+        assert_eq!(parameters.reader_frame_size().bytes(), 256);
         assert_eq!(parameters.cid(), None);
+        let rats = Rats::new(FrameSize::from_index(8), iso_dep::Cid::new(3));
+        assert_eq!(ats.iso_dep(rats).cid().map(iso_dep::Cid::get), Some(3));
 
         let ats = Ats::parse(&[1])?;
-        assert_eq!(ats.fsci(), 2);
-        assert_eq!(ats.frame_size(), 32);
+        assert_eq!(ats.frame_size().index(), 2);
+        assert_eq!(ats.frame_size().bytes(), 32);
         assert_eq!(ats.fwi().get(), 4);
         assert_eq!(ats.startup_guard(), Duration::ZERO);
         assert!(!ats.cid_supported());
+        // A card without CID support ignores the assigned CID.
+        let rats = Rats::new(FrameSize::from_index(8), iso_dep::Cid::new(3));
+        assert_eq!(ats.iso_dep(rats).cid(), None);
         assert_eq!(Ats::parse(&[3, 0x25, 0x80])?.fwi().get(), 8);
         // FSCI above 8 advertises a larger card buffer; D-F read as C.
-        assert_eq!(Ats::parse(&[2, 0x09])?.frame_size(), 512);
-        assert_eq!(Ats::parse(&[2, 0x0f])?.frame_size(), 4096);
+        assert_eq!(Ats::parse(&[2, 0x09])?.frame_size().bytes(), 512);
+        assert_eq!(Ats::parse(&[2, 0x0f])?.frame_size().bytes(), 4096);
         Ok(())
     }
 
     #[test]
     fn selection_and_interface_boundaries_are_checked() {
         assert!(matches!(
-            Observation::new([0, 4], 0, &[1, 2, 3, 4, 5], None),
+            Observation::new([0, 4], SelRes::new(0), &[1, 2, 3, 4, 5], None),
             Err(Error::UidLength(5))
+        ));
+        assert!(matches!(
+            Observation::new([0, 4], SelRes::new(0x04), &[1, 2, 3, 4], None),
+            Err(Error::IncompleteCascade(0x04))
+        ));
+        assert!(matches!(
+            Ats::parse(&[1]).and_then(|ats| Observation::new(
+                [0, 4],
+                SelRes::new(0x08),
+                &[1, 2, 3, 4],
+                Some(ats)
+            )),
+            Err(Error::AtsWithoutIsoDep(0x08))
         ));
         assert!(matches!(
             Ats::parse(&[2, 0x25]),
@@ -419,11 +569,16 @@ mod tests {
     }
 
     #[test]
-    fn iso_dep_support_requires_a_complete_cascade() -> Result<(), Error> {
-        let uid = [1, 2, 3, 4, 5, 6, 7];
-        assert!(Observation::new([0, 0x44], 0x20, &uid, None)?.supports_iso_dep());
-        assert!(!Observation::new([0, 0x44], 0x24, &uid, None)?.supports_iso_dep());
-        assert!(!Observation::new([0, 0x44], 0x00, &uid, None)?.supports_iso_dep());
-        Ok(())
+    fn iso_dep_support_requires_a_complete_cascade() {
+        assert!(SelRes::new(0x20).supports_iso_dep());
+        assert!(!SelRes::new(0x24).supports_iso_dep());
+        assert!(SelRes::new(0x24).continues_cascade());
+        assert!(!SelRes::new(0x00).supports_iso_dep());
+    }
+
+    #[test]
+    fn nibbles_hold_four_bits() {
+        assert_eq!(Nibble::new(0x0a).map(Nibble::get), Some(0x0a));
+        assert_eq!(Nibble::new(0x10), None);
     }
 }

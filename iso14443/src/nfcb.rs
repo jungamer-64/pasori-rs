@@ -1,4 +1,4 @@
-//! NFC-B activation data: ATQB and the ATTRIB response.
+//! NFC-B activation data: ATQB, ATTRIB and its response.
 use crate::{FrameSize, WaitIndex, iso_dep};
 use alloc::vec::Vec;
 use core::fmt;
@@ -16,6 +16,16 @@ pub enum Error {
     ReservedCid,
     /// A nonzero CID was assigned although ATQB does not advertise CID support.
     UnsupportedCid(u8),
+    /// ISO-DEP activation was requested for a card whose ATQB does not
+    /// advertise ISO-DEP.
+    NotIsoDep,
+    /// The ATTRIB response reports a CID other than the one ATTRIB assigned.
+    CidMismatch {
+        /// CID that ATTRIB assigned.
+        assigned: u8,
+        /// CID that the response reports.
+        returned: u8,
+    },
 }
 
 impl fmt::Display for Error {
@@ -27,6 +37,13 @@ impl fmt::Display for Error {
             Self::ReservedCid => f.write_str("ATTRIB assigned reserved CID 15"),
             Self::UnsupportedCid(cid) => {
                 write!(f, "ATTRIB assigned CID {cid} to a card without CID support")
+            }
+            Self::NotIsoDep => f.write_str("ATQB does not advertise ISO-DEP"),
+            Self::CidMismatch { assigned, returned } => {
+                write!(
+                    f,
+                    "ATTRIB assigned CID {assigned}, response reports {returned}"
+                )
             }
         }
     }
@@ -76,13 +93,9 @@ impl Atqb {
     pub fn supports_iso_dep(&self) -> bool {
         self.bytes[10] & 0x09 == 0x01
     }
-    /// Maximum card frame size including protocol overhead and CRC.
-    pub fn frame_size(&self) -> u16 {
-        FrameSize::from_index(self.fsci()).bytes()
-    }
-    /// Standard maximum-card-frame-size code.
-    pub fn fsci(&self) -> u8 {
-        self.bytes[10] >> 4
+    /// Maximum frame size (FSC) the card advertises.
+    pub fn frame_size(&self) -> FrameSize {
+        FrameSize::from_index(self.bytes[10] >> 4)
     }
     /// Frame waiting integer.
     pub fn fwi(&self) -> WaitIndex {
@@ -98,6 +111,99 @@ impl Atqb {
     }
 }
 
+/// The ATTRIB that the host sends to activate an ISO-DEP card: default TR0,
+/// TR1 and SOF/EOF, 106 kbps in both directions, ISO-DEP compliance, the
+/// reader frame size (FSD) and the assigned CID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attrib {
+    atqb: Atqb,
+    reader_frame_size: FrameSize,
+    cid: Option<iso_dep::Cid>,
+}
+
+impl Attrib {
+    /// Prepare ATTRIB for the card that sent `atqb`, assigning `cid`, or
+    /// CID 0 when `cid` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a card whose ATQB does not advertise ISO-DEP and a nonzero
+    /// CID for a card without CID support.
+    pub fn new(
+        atqb: Atqb,
+        reader_frame_size: FrameSize,
+        cid: Option<iso_dep::Cid>,
+    ) -> Result<Self, Error> {
+        if !atqb.supports_iso_dep() {
+            return Err(Error::NotIsoDep);
+        }
+        if let Some(cid) = cid
+            && !atqb.cid_supported()
+        {
+            return Err(Error::UnsupportedCid(cid.get()));
+        }
+        Ok(Self {
+            atqb,
+            reader_frame_size,
+            cid,
+        })
+    }
+
+    /// ATTRIB command bytes without CRC.
+    pub fn command(&self) -> [u8; 9] {
+        let [a, b, c, d] = self.atqb.pupi();
+        [
+            0x1d,
+            a,
+            b,
+            c,
+            d,
+            0x00,
+            self.reader_frame_size.index(),
+            0x01,
+            self.assigned_cid(),
+        ]
+    }
+
+    fn assigned_cid(&self) -> u8 {
+        self.cid.map_or(0, iso_dep::Cid::get)
+    }
+
+    /// Combine this ATTRIB with the card's complete response, without CRC,
+    /// into the observation and the block parameters it grants.
+    ///
+    /// # Errors
+    ///
+    /// The response needs its MBLI/CID byte, and its CID must be the
+    /// assigned one.
+    pub fn complete(self, response: &[u8]) -> Result<(Observation, iso_dep::Parameters), Error> {
+        let returned = response_cid(&self.atqb, response)?;
+        let assigned = self.assigned_cid();
+        if returned != assigned {
+            return Err(Error::CidMismatch { assigned, returned });
+        }
+        let observation = Observation {
+            atqb: self.atqb,
+            reader_frame_size: self.reader_frame_size,
+            attrib: response.to_vec(),
+        };
+        let parameters = observation.parameters();
+        Ok((observation, parameters))
+    }
+}
+
+/// The CID of a complete ATTRIB response.
+fn response_cid(atqb: &Atqb, response: &[u8]) -> Result<u8, Error> {
+    let cid = response.first().ok_or(Error::MissingAttrib)? & 0x0f;
+    if cid == 15 {
+        return Err(Error::ReservedCid);
+    }
+    if cid != 0 && !atqb.cid_supported() {
+        return Err(Error::UnsupportedCid(cid));
+    }
+    Ok(cid)
+}
+
 /// Complete ATQB and ATTRIB data for one selected NFC-B card.
 ///
 /// The immutable ATQB is the authority for advertised capabilities. An observed
@@ -105,33 +211,39 @@ impl Atqb {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
     atqb: Atqb,
+    reader_frame_size: FrameSize,
     attrib: Vec<u8>,
 }
 
 impl Observation {
-    /// Combine ATQB with the card's complete ATTRIB response, without CRC.
+    /// Combine ATQB with the complete response, without CRC, to an ATTRIB
+    /// that reader firmware sent announcing `reader_frame_size`. The host
+    /// does not see that ATTRIB, so the response's CID is the record of the
+    /// assignment.
     ///
     /// # Errors
     ///
-    /// A completed ATTRIB needs its MBLI/CID byte; CID 15 is reserved, and a
+    /// The response needs its MBLI/CID byte; CID 15 is reserved, and a
     /// nonzero CID requires advertised CID support.
-    pub fn new(atqb: Atqb, attrib: &[u8]) -> Result<Self, Error> {
-        let first = *attrib.first().ok_or(Error::MissingAttrib)?;
-        let cid = first & 0x0f;
-        if cid == 15 {
-            return Err(Error::ReservedCid);
-        }
-        if cid != 0 && !atqb.cid_supported() {
-            return Err(Error::UnsupportedCid(cid));
-        }
+    pub fn from_reader_attrib(
+        atqb: Atqb,
+        reader_frame_size: FrameSize,
+        response: &[u8],
+    ) -> Result<Self, Error> {
+        response_cid(&atqb, response)?;
         Ok(Self {
             atqb,
-            attrib: attrib.to_vec(),
+            reader_frame_size,
+            attrib: response.to_vec(),
         })
     }
     /// The validated ATQB.
     pub fn atqb(&self) -> &Atqb {
         &self.atqb
+    }
+    /// Reader frame size (FSD) that ATTRIB announced.
+    pub fn reader_frame_size(&self) -> FrameSize {
+        self.reader_frame_size
     }
     /// ATTRIB response: the MBLI/CID byte followed by the card's optional
     /// higher-layer response, which is preserved without interpretation.
@@ -151,24 +263,24 @@ impl Observation {
     pub fn maximum_command_bytes(&self) -> Option<usize> {
         match self.mbli() {
             0 => None,
-            mbli => Some(usize::from(self.atqb.frame_size()) << (mbli - 1)),
+            mbli => Some(usize::from(self.atqb.frame_size().bytes()) << (mbli - 1)),
         }
     }
     /// Block parameters that ATQB and ATTRIB grant, or `None` when ATQB does
     /// not advertise ISO-DEP.
     pub fn iso_dep(&self) -> Option<iso_dep::Parameters> {
-        self.atqb.supports_iso_dep().then(|| {
-            iso_dep::Parameters::new(
-                self.atqb.frame_size(),
-                self.atqb.fwi(),
-                match self.cid() {
-                    0 => None,
-                    cid => Some(cid),
-                },
-                self.atqb.nad_supported(),
-                self.maximum_command_bytes(),
-            )
-        })
+        self.atqb.supports_iso_dep().then(|| self.parameters())
+    }
+
+    fn parameters(&self) -> iso_dep::Parameters {
+        iso_dep::Parameters::new(
+            self.atqb.frame_size(),
+            self.reader_frame_size,
+            self.atqb.fwi(),
+            iso_dep::Cid::new(self.cid()),
+            self.atqb.nad_supported(),
+            self.maximum_command_bytes(),
+        )
     }
 }
 
@@ -177,23 +289,66 @@ mod tests {
     use super::*;
 
     const ATQB: [u8; 12] = [0x50, 1, 2, 3, 4, 0x11, 0x22, 0x33, 0x44, 0, 0x51, 0x41];
+    const FSD_64: FrameSize = FrameSize::from_index(5);
+    const FSD_256: FrameSize = FrameSize::from_index(8);
 
     #[test]
-    fn selected_card_preserves_identity_capabilities_and_attrib() -> Result<(), Error> {
-        let observation = Observation::new(Atqb::new(ATQB)?, &[1])?;
+    fn host_attrib_encodes_fsd_and_cid_and_requires_the_echo() -> Result<(), Error> {
+        let attrib = Attrib::new(Atqb::new(ATQB)?, FSD_256, iso_dep::Cid::new(3))?;
+        assert_eq!(attrib.command(), [0x1d, 1, 2, 3, 4, 0, 0x08, 0x01, 3]);
+        assert_eq!(
+            attrib.complete(&[0x02]),
+            Err(Error::CidMismatch {
+                assigned: 3,
+                returned: 2
+            })
+        );
+        let (observation, parameters) = attrib.complete(&[0x13])?;
+        assert_eq!(observation.iso_dep(), Some(parameters));
+        assert_eq!(parameters.cid().map(iso_dep::Cid::get), Some(3));
+        assert_eq!(parameters.reader_frame_size(), FSD_256);
+        let zero = Attrib::new(Atqb::new(ATQB)?, FSD_256, None)?;
+        assert_eq!(
+            zero.complete(&[0]).map(|(_, parameters)| parameters.cid()),
+            Ok(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_attrib_rejects_assignments_the_card_cannot_take() -> Result<(), Error> {
+        let mut without_cid = ATQB;
+        without_cid[11] = 0x40;
+        assert_eq!(
+            Attrib::new(Atqb::new(without_cid)?, FSD_256, iso_dep::Cid::new(1)),
+            Err(Error::UnsupportedCid(1))
+        );
+        let mut proprietary = ATQB;
+        proprietary[10] = 0x50;
+        assert_eq!(
+            Attrib::new(Atqb::new(proprietary)?, FSD_256, None),
+            Err(Error::NotIsoDep)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reader_attrib_preserves_identity_capabilities_and_response() -> Result<(), Error> {
+        let observation = Observation::from_reader_attrib(Atqb::new(ATQB)?, FSD_64, &[1])?;
         let atqb = observation.atqb();
         assert_eq!(atqb.pupi(), [1, 2, 3, 4]);
         assert_eq!(atqb.application_data(), [0x11, 0x22, 0x33, 0x44]);
         assert_eq!(atqb.protocol_info(), [0, 0x51, 0x41]);
-        assert_eq!(atqb.frame_size(), 64);
+        assert_eq!(atqb.frame_size().bytes(), 64);
         assert_eq!(atqb.fwi().get(), 4);
         assert!(atqb.supports_iso_dep());
         assert!(atqb.cid_supported());
         assert_eq!(observation.cid(), 1);
         assert_eq!(observation.attrib_response(), [1]);
         let parameters = observation.iso_dep().ok_or(Error::MissingAttrib)?;
-        assert_eq!(parameters.cid(), Some(1));
-        assert_eq!(parameters.frame_size(), 64);
+        assert_eq!(parameters.cid().map(iso_dep::Cid::get), Some(1));
+        assert_eq!(parameters.card_frame_size().bytes(), 64);
+        assert_eq!(parameters.reader_frame_size(), FSD_64);
         Ok(())
     }
 
@@ -202,7 +357,7 @@ mod tests {
         let mut atqb = ATQB;
         atqb[10] = 0;
         atqb[11] = 0x40;
-        let observation = Observation::new(Atqb::new(atqb)?, &[0])?;
+        let observation = Observation::from_reader_attrib(Atqb::new(atqb)?, FSD_64, &[0])?;
         assert!(!observation.atqb().supports_iso_dep());
         assert!(!observation.atqb().cid_supported());
         assert_eq!(observation.cid(), 0);
@@ -215,8 +370,9 @@ mod tests {
         let mut atqb = ATQB;
         for (fsci, frame_size) in [(9, 512), (0x0c, 4096), (0x0f, 4096)] {
             atqb[10] = fsci << 4 | 1;
-            let observation = Observation::new(Atqb::new(atqb)?, &[0x21])?;
-            assert_eq!(observation.atqb().frame_size(), frame_size);
+            let (observation, _) =
+                Attrib::new(Atqb::new(atqb)?, FSD_256, None)?.complete(&[0x20])?;
+            assert_eq!(observation.atqb().frame_size().bytes(), frame_size);
             assert_eq!(
                 observation.maximum_command_bytes(),
                 Some(usize::from(frame_size) * 2)
@@ -227,7 +383,8 @@ mod tests {
 
     #[test]
     fn higher_layer_response_is_preserved_and_mbli_bounds_commands() -> Result<(), Error> {
-        let observation = Observation::new(Atqb::new(ATQB)?, &[0x21, 0x9f, 0x0f])?;
+        let observation =
+            Observation::from_reader_attrib(Atqb::new(ATQB)?, FSD_64, &[0x21, 0x9f, 0x0f])?;
         assert_eq!(observation.attrib_response(), [0x21, 0x9f, 0x0f]);
         assert_eq!(observation.maximum_command_bytes(), Some(128));
         Ok(())
@@ -244,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn attrib_and_protocol_boundaries_are_checked() -> Result<(), Error> {
+    fn response_and_protocol_boundaries_are_checked() -> Result<(), Error> {
         let mut bad = ATQB;
         bad[0] = 0x51;
         assert_eq!(Atqb::new(bad), Err(Error::AtqbResponseCode(0x51)));
@@ -252,12 +409,22 @@ mod tests {
         bad[11] = 0xf1;
         assert_eq!(Atqb::new(bad), Err(Error::FrameWaitIndex(15)));
         let atqb = Atqb::new(ATQB)?;
-        assert_eq!(Observation::new(atqb, &[]), Err(Error::MissingAttrib));
-        assert_eq!(Observation::new(atqb, &[0x1f]), Err(Error::ReservedCid));
+        assert_eq!(
+            Observation::from_reader_attrib(atqb, FSD_64, &[]),
+            Err(Error::MissingAttrib)
+        );
+        assert_eq!(
+            Observation::from_reader_attrib(atqb, FSD_64, &[0x1f]),
+            Err(Error::ReservedCid)
+        );
+        assert_eq!(
+            Attrib::new(atqb, FSD_256, None)?.complete(&[]),
+            Err(Error::MissingAttrib)
+        );
         let mut without_cid = ATQB;
         without_cid[11] = 0x40;
         assert_eq!(
-            Observation::new(Atqb::new(without_cid)?, &[1]),
+            Observation::from_reader_attrib(Atqb::new(without_cid)?, FSD_64, &[1]),
             Err(Error::UnsupportedCid(1))
         );
         Ok(())

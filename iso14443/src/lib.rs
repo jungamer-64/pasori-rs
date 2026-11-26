@@ -17,15 +17,30 @@ pub mod nfcb;
 
 use core::time::Duration;
 
-/// Card frame capacity, including CRC, decoded from a 4-bit FSCI field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FrameSize(u16);
+/// A frame size that an FSCI or FSDI field encodes: the largest frame,
+/// including protocol overhead and CRC, that the receiving side accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FrameSize(u8);
 
 impl FrameSize {
-    /// FSCI D–F are RFU; ISO/IEC 14443-4 directs a PCD to read them as C.
-    fn from_index(index: u8) -> Self {
-        Self(match index {
-            0 => iso_dep::MIN_FRAME_BYTES,
+    /// The 16-byte frame of index 0, the smallest of the block protocol.
+    pub const MIN: Self = Self(0);
+
+    /// Decode a 4-bit FSCI or FSDI field. Values D–F are RFU; ISO/IEC
+    /// 14443-4 directs a PCD to read them as C.
+    pub const fn from_index(index: u8) -> Self {
+        Self(if index > 0x0c { 0x0c } else { index })
+    }
+
+    /// The field value that encodes this size.
+    pub const fn index(self) -> u8 {
+        self.0
+    }
+
+    /// Frame bytes, including protocol overhead and CRC.
+    pub const fn bytes(self) -> u16 {
+        match self.0 {
+            0 => 16,
             1 => 24,
             2 => 32,
             3 => 40,
@@ -38,11 +53,7 @@ impl FrameSize {
             0x0a => 1024,
             0x0b => 2048,
             _ => 4096,
-        })
-    }
-
-    fn bytes(self) -> u16 {
-        self.0
+        }
     }
 }
 
@@ -91,9 +102,11 @@ mod tests {
     #[test]
     fn large_and_rfu_frame_size_indices_decode_to_4096() {
         assert_eq!(
-            [8, 9, 0x0a, 0x0b, 0x0c, 0x0d, 0x0f].map(|index| FrameSize::from_index(index).bytes()),
-            [256, 512, 1024, 2048, 4096, 4096, 4096]
+            [0, 8, 9, 0x0a, 0x0b, 0x0c, 0x0d, 0x0f]
+                .map(|index| FrameSize::from_index(index).bytes()),
+            [16, 256, 512, 1024, 2048, 4096, 4096, 4096]
         );
+        assert_eq!(FrameSize::from_index(0x0f).index(), 0x0c);
     }
 
     #[test]
