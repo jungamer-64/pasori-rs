@@ -1,7 +1,7 @@
 //! NFC-B activation data: ATQB and the ATTRIB response.
-use crate::{FrameSize, iso_dep};
+use crate::{FrameSize, WaitIndex, iso_dep};
 use alloc::vec::Vec;
-use core::{fmt, time::Duration};
+use core::fmt;
 
 /// Invalid NFC-B activation data or unsupported standard-frame parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +36,10 @@ impl core::error::Error for Error {}
 
 /// Validated 12-byte ATQB without CRC, received before ATTRIB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Atqb([u8; 12]);
+pub struct Atqb {
+    bytes: [u8; 12],
+    fwi: WaitIndex,
+}
 
 impl Atqb {
     /// Validate the response byte and FWI.
@@ -48,33 +51,30 @@ impl Atqb {
         if bytes[0] != 0x50 {
             return Err(Error::AtqbResponseCode(bytes[0]));
         }
-        let fwi = bytes[11] >> 4;
-        if fwi == 15 {
-            return Err(Error::FrameWaitIndex(fwi));
-        }
-        Ok(Self(bytes))
+        let fwi = WaitIndex::new(bytes[11] >> 4).ok_or(Error::FrameWaitIndex(bytes[11] >> 4))?;
+        Ok(Self { bytes, fwi })
     }
     /// Original 12 bytes.
     pub fn bytes(&self) -> &[u8; 12] {
-        &self.0
+        &self.bytes
     }
     /// Session PUPI in wire order; this value is not an authenticated identity.
     pub fn pupi(&self) -> [u8; 4] {
-        [self.0[1], self.0[2], self.0[3], self.0[4]]
+        [self.bytes[1], self.bytes[2], self.bytes[3], self.bytes[4]]
     }
     /// Four application bytes, whose interpretation depends on application coding.
     pub fn application_data(&self) -> [u8; 4] {
-        [self.0[5], self.0[6], self.0[7], self.0[8]]
+        [self.bytes[5], self.bytes[6], self.bytes[7], self.bytes[8]]
     }
     /// Bit-rate, frame-size/protocol-type, and timing/options bytes.
     pub fn protocol_info(&self) -> [u8; 3] {
-        [self.0[9], self.0[10], self.0[11]]
+        [self.bytes[9], self.bytes[10], self.bytes[11]]
     }
     /// Protocol_Type bit b1 advertises the ISO-DEP block protocol. Bits b3-b2
     /// carry the card's minimum TR2 and do not affect the protocol; a set b4
     /// is outside this profile and is not treated as ISO-DEP.
     pub fn supports_iso_dep(&self) -> bool {
-        self.0[10] & 0x09 == 0x01
+        self.bytes[10] & 0x09 == 0x01
     }
     /// Maximum card frame size including protocol overhead and CRC.
     pub fn frame_size(&self) -> u16 {
@@ -82,23 +82,19 @@ impl Atqb {
     }
     /// Standard maximum-card-frame-size code.
     pub fn fsci(&self) -> u8 {
-        self.0[10] >> 4
+        self.bytes[10] >> 4
     }
     /// Frame waiting integer.
-    pub fn fwi(&self) -> u8 {
-        self.0[11] >> 4
-    }
-    /// Card frame waiting time, rounded upward to whole nanoseconds.
-    pub fn frame_wait(&self) -> Duration {
-        crate::frame_wait(self.fwi())
+    pub fn fwi(&self) -> WaitIndex {
+        self.fwi
     }
     /// Whether ATQB advertises optional card-identifier fields.
     pub fn cid_supported(&self) -> bool {
-        self.0[11] & 1 != 0
+        self.bytes[11] & 1 != 0
     }
     /// Whether ATQB advertises optional node-address fields.
     pub fn nad_supported(&self) -> bool {
-        self.0[11] & 2 != 0
+        self.bytes[11] & 2 != 0
     }
 }
 
@@ -190,7 +186,7 @@ mod tests {
         assert_eq!(atqb.application_data(), [0x11, 0x22, 0x33, 0x44]);
         assert_eq!(atqb.protocol_info(), [0, 0x51, 0x41]);
         assert_eq!(atqb.frame_size(), 64);
-        assert_eq!(atqb.fwi(), 4);
+        assert_eq!(atqb.fwi().get(), 4);
         assert!(atqb.supports_iso_dep());
         assert!(atqb.cid_supported());
         assert_eq!(observation.cid(), 1);

@@ -2,7 +2,7 @@
 //!
 //! UID bytes remain in wire order, and ATS retains its own inclusive length
 //! byte without RF CRC bytes.
-use crate::{FrameSize, iso_dep};
+use crate::{FrameSize, WaitIndex, iso_dep};
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
@@ -95,8 +95,8 @@ impl Rats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ats {
     bytes: Vec<u8>,
-    fwi: u8,
-    sfgi: u8,
+    fwi: WaitIndex,
+    sfgi: WaitIndex,
     tc: Option<u8>,
     historical_start: usize,
 }
@@ -135,14 +135,8 @@ impl Ats {
             }
         }
         let timing = interfaces[1].unwrap_or(0x40);
-        let fwi = timing >> 4;
-        let sfgi = timing & 0x0f;
-        if fwi == 15 {
-            return Err(Error::FrameWaitIndex(fwi));
-        }
-        if sfgi == 15 {
-            return Err(Error::GuardTimeIndex(sfgi));
-        }
+        let fwi = WaitIndex::new(timing >> 4).ok_or(Error::FrameWaitIndex(timing >> 4))?;
+        let sfgi = WaitIndex::new(timing & 0x0f).ok_or(Error::GuardTimeIndex(timing & 0x0f))?;
         Ok(Self {
             bytes: bytes.to_vec(),
             fwi,
@@ -165,24 +159,20 @@ impl Ats {
         self.bytes.get(1).copied().unwrap_or(2) & 0x0f
     }
     /// Frame waiting integer; 4 is the default when TB is absent.
-    pub fn fwi(&self) -> u8 {
+    pub fn fwi(&self) -> WaitIndex {
         self.fwi
     }
-    /// Card frame waiting time, rounded upward to whole nanoseconds.
-    pub fn frame_wait(&self) -> Duration {
-        crate::frame_wait(self.fwi)
-    }
     /// Startup frame guard integer; 0 means no additional startup guard time.
-    pub fn sfgi(&self) -> u8 {
+    pub fn sfgi(&self) -> WaitIndex {
         self.sfgi
     }
     /// Time the card needs after sending ATS before it can receive a frame,
     /// or zero when SFGI is 0.
     pub fn startup_guard(&self) -> Duration {
-        if self.sfgi == 0 {
+        if self.sfgi.get() == 0 {
             Duration::ZERO
         } else {
-            crate::frame_wait(self.sfgi)
+            self.sfgi.duration()
         }
     }
     /// Whether TC advertises optional card-identifier fields.
@@ -377,9 +367,9 @@ mod tests {
     fn ats_parameters_and_omitted_interface_defaults() -> Result<(), Error> {
         let ats = Ats::parse(&[6, 0x75, 0x80, 0x61, 2, 0x42])?;
         assert_eq!(ats.frame_size(), 64);
-        assert_eq!(ats.fwi(), 6);
-        assert_eq!(ats.sfgi(), 1);
-        assert_eq!(ats.startup_guard(), crate::frame_wait(1));
+        assert_eq!(ats.fwi().get(), 6);
+        assert_eq!(ats.sfgi().get(), 1);
+        assert_eq!(ats.startup_guard(), ats.sfgi().duration());
         assert!(ats.cid_supported());
         assert!(!ats.nad_supported());
         assert_eq!(ats.historical_bytes(), [0x42]);
@@ -390,10 +380,10 @@ mod tests {
         let ats = Ats::parse(&[1])?;
         assert_eq!(ats.fsci(), 2);
         assert_eq!(ats.frame_size(), 32);
-        assert_eq!(ats.fwi(), 4);
+        assert_eq!(ats.fwi().get(), 4);
         assert_eq!(ats.startup_guard(), Duration::ZERO);
         assert!(!ats.cid_supported());
-        assert_eq!(Ats::parse(&[3, 0x25, 0x80])?.fwi(), 8);
+        assert_eq!(Ats::parse(&[3, 0x25, 0x80])?.fwi().get(), 8);
         // FSCI above 8 advertises a larger card buffer; D-F read as C.
         assert_eq!(Ats::parse(&[2, 0x09])?.frame_size(), 512);
         assert_eq!(Ats::parse(&[2, 0x0f])?.frame_size(), 4096);

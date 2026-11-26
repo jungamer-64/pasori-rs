@@ -2,6 +2,7 @@
 //!
 //! The reader carries each block and owns its CRC; the host block engine
 //! owns sequencing, CID and NAD fields, chaining and WTX.
+use crate::WaitIndex;
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
@@ -9,7 +10,7 @@ use core::{fmt, time::Duration};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parameters {
     frame_size: u16,
-    fwi: u8,
+    fwi: WaitIndex,
     cid: Option<u8>,
     nad_supported: bool,
     maximum_command_bytes: Option<usize>,
@@ -18,7 +19,7 @@ pub struct Parameters {
 impl Parameters {
     pub(crate) fn new(
         frame_size: u16,
-        fwi: u8,
+        fwi: WaitIndex,
         cid: Option<u8>,
         nad_supported: bool,
         maximum_command_bytes: Option<usize>,
@@ -36,12 +37,8 @@ impl Parameters {
         self.frame_size
     }
     /// Frame waiting integer.
-    pub fn fwi(&self) -> u8 {
+    pub fn fwi(&self) -> WaitIndex {
         self.fwi
-    }
-    /// Card frame waiting time, rounded upward to whole nanoseconds.
-    pub fn frame_wait(&self) -> Duration {
-        crate::frame_wait(self.fwi)
     }
     /// CID that every block carries, or `None` when blocks carry no CID field.
     pub fn cid(&self) -> Option<u8> {
