@@ -189,13 +189,16 @@ impl BlockAddress {
     }
 }
 
-/// A block and its 16 replacement bytes in card byte order.
+/// One operation in a FeliCa block write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockWrite {
-    /// Block to update.
-    pub address: BlockAddress,
-    /// Replacement data.
-    pub data: [u8; 16],
+pub enum BlockWrite {
+    /// Send a block of data in card byte order with the ordinary access mode.
+    Data {
+        /// Block to update.
+        address: BlockAddress,
+        /// Block data in card byte order.
+        data: [u8; 16],
+    },
 }
 
 fn code_count(actual: usize, maximum: u8) -> Result<u8, CardError> {
