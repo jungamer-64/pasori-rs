@@ -282,7 +282,7 @@ impl<S: Selection> Type3Tag<S> {
                     let len = (message.len() - end).min(BLOCK_BYTES);
                     data[..len].copy_from_slice(&message[end..end + len]);
                     end += len;
-                    BlockWrite {
+                    BlockWrite::Data {
                         address: BlockAddress::first(block),
                         data,
                     }
@@ -314,7 +314,7 @@ impl<S: Selection> Type3Tag<S> {
         self.0
             .write_without_encryption(
                 &[WRITE_SERVICE],
-                &[BlockWrite {
+                &[BlockWrite::Data {
                     address: BlockAddress::first(0),
                     data,
                 }],

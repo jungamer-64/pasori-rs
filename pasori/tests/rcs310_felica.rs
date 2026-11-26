@@ -459,6 +459,72 @@ fn value_limited_purse_rejects_malformed_replies() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn purse_writes_encode_each_operation_in_one_packet() -> Result<(), Box<dyn Error>> {
+    // FeliCa Card User's Manual, §4.2.1 and figures 3-16/3-17.
+    // Keep the header, lists, and each block on their own lines.
+    #[rustfmt::skip]
+    let request = [
+        71, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+        2, 0x53, 0x01, 0x95, 0x02,
+        3, 0x90, 0xff, 0x10, 0x00, 0x01, 0x81, 0x07,
+        0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xab, 0xcd,
+        0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34,
+        4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xef, 0x09,
+    ];
+    let mut another_request = request;
+    another_request[70] = 0x0a;
+    let mut reader = reader(vec![
+        command(0x5c, &[6, 0, 0xff, 0xff, 0, 0], &polling_reply()),
+        command(0x5c, &request, &[12, 9, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0]),
+        command(
+            0x5c,
+            &another_request,
+            &[12, 9, 1, 2, 3, 4, 5, 6, 7, 8, 2, 3],
+        ),
+    ])?;
+    let mut card = Card::new(
+        reader
+            .poll_felica(PollRequest::new(0xffff, 0, 0)?, wait().ok_or("wait")?)?
+            .ok_or("card absent")?,
+    );
+    let mut blocks = [
+        BlockWrite::PurseCashback {
+            address: BlockAddress::first(255),
+            amount: 0x1234_5678,
+            execution_id: [0xab, 0xcd],
+        },
+        BlockWrite::PurseCashback {
+            address: BlockAddress::first(256),
+            amount: u32::MAX,
+            execution_id: [0x12, 0x34],
+        },
+        BlockWrite::PurseDecrement {
+            address: BlockAddress::new(1, 7)?,
+            amount: 0x0102_0304,
+            execution_id: [0xef, 0x09],
+        },
+    ];
+    assert!(matches!(
+        card.write_without_encryption(&[0x0153], &blocks),
+        Err(felica::Error::Request(CardError::ServiceIndex(1)))
+    ));
+    card.write_without_encryption(&[0x0153, 0x0295], &blocks)?;
+    blocks[2] = BlockWrite::PurseDecrement {
+        address: BlockAddress::new(1, 7)?,
+        amount: 0x0102_0304,
+        execution_id: [0xef, 0x0a],
+    };
+    assert!(matches!(
+        card.write_without_encryption(&[0x0153, 0x0295], &blocks),
+        Err(felica::Error::Response(CardError::Status {
+            flag1: 2,
+            flag2: 3
+        }))
+    ));
+    Ok(())
+}
+
+#[test]
 fn multiple_services_use_the_rcs320_packet_budget() -> Result<(), Box<dyn Error>> {
     let mut read_reply = vec![45, 7, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 2];
     read_reply.extend([0x32; 16]);
@@ -498,15 +564,22 @@ fn multiple_services_use_the_rcs320_packet_budget() -> Result<(), Box<dyn Error>
         &[[0x32; 16], [0x76; 16]]
     );
     let mut blocks = (0..13)
-        .map(|n| BlockWrite {
+        .map(|n| BlockWrite::Data {
             address: BlockAddress::first(n),
             data: [0x71; 16],
         })
         .collect::<Vec<_>>();
     for (n, block) in (256..).zip(&mut blocks[..4]) {
-        block.address = BlockAddress::new(1, n)?;
+        *block = BlockWrite::Data {
+            address: BlockAddress::new(1, n)?,
+            data: [0x71; 16],
+        };
     }
-    blocks[4].address = BlockAddress::new(1, 260)?;
+    let short = blocks[4];
+    blocks[4] = BlockWrite::Data {
+        address: BlockAddress::new(1, 260)?,
+        data: [0x71; 16],
+    };
     assert!(matches!(
         card.write_without_encryption(&[0x09, 0x49], &blocks),
         Err(felica::Error::Request(CardError::PacketBudget {
@@ -514,7 +587,7 @@ fn multiple_services_use_the_rcs320_packet_budget() -> Result<(), Box<dyn Error>
             required: 255
         }))
     ));
-    blocks[4].address = BlockAddress::first(4);
+    blocks[4] = short;
     card.write_without_encryption(&[0x09, 0x49], &blocks)?;
     Ok(())
 }

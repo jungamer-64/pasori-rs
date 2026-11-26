@@ -142,7 +142,7 @@ impl<S: Selection> Card<S> {
         write(
             &mut self,
             Stage::Challenge,
-            &[BlockWrite {
+            &[BlockWrite::Data {
                 address: BlockAddress::first(CHALLENGE),
                 data: challenge,
             }],
@@ -298,11 +298,11 @@ impl SessionKeys {
             card,
             stage,
             &[
-                BlockWrite {
+                BlockWrite::Data {
                     address: BlockAddress::first(block),
                     data,
                 },
-                BlockWrite {
+                BlockWrite::Data {
                     address: BlockAddress::first(MAC_A),
                     data: self.write_proof(block, &data, counter),
                 },

@@ -1,5 +1,6 @@
 use super::{
-    BlockAddress, BlockWrite, Card, CardError, Error, MAX_WRITE_BLOCKS, admit_packet, append_blocks,
+    BlockAddress, BlockWrite, Card, CardError, Error, admit_packet, append_read_blocks,
+    append_write_blocks,
 };
 #[cfg(feature = "felica-standard-aes")]
 use alloc::boxed::Box;
@@ -68,7 +69,9 @@ pub enum StandardError<E> {
     },
     /// The session has insufficient counter space for another exchange.
     CounterExhausted,
-    /// Both status flags from an authenticated operation response.
+    /// Both status flags from an authenticated operation response. A write
+    /// status with flag 2 set to `0x71` reports a write performed with a
+    /// memory wear warning.
     Status {
         /// First status flag.
         first: u8,
@@ -245,8 +248,7 @@ impl<S: Selection> StandardSession<S> {
             return Err(StandardError::Request(CardError::BlockCount(blocks.len())));
         }
         let mut payload = Zeroizing::new(Vec::new());
-        append_blocks(&mut payload, self.services, blocks.iter().copied())
-            .map_err(StandardError::Request)?;
+        append_read_blocks(&mut payload, self.services, blocks).map_err(StandardError::Request)?;
         self.transact(Operation::Read, payload, 3 + 16 * blocks.len(), |reply| {
             let [0, 0, count, data @ ..] = reply else {
                 return Err(StandardError::Layout);
@@ -265,21 +267,8 @@ impl<S: Selection> StandardSession<S> {
     /// Write blocks in one command. If the exchange fails after sending, the
     /// write may have taken effect. Reauthenticate and read back to reconcile.
     pub fn write_blocks(&mut self, blocks: &[BlockWrite]) -> Result<(), StandardError<S::Error>> {
-        if !(1..=MAX_WRITE_BLOCKS).contains(&blocks.len()) {
-            return Err(StandardError::Request(CardError::WriteBlockCount(
-                blocks.len(),
-            )));
-        }
         let mut payload = Zeroizing::new(Vec::new());
-        append_blocks(
-            &mut payload,
-            self.services,
-            blocks.iter().map(|block| block.address),
-        )
-        .map_err(StandardError::Request)?;
-        for block in blocks {
-            payload.extend(block.data);
-        }
+        append_write_blocks(&mut payload, self.services, blocks).map_err(StandardError::Request)?;
         self.transact(Operation::Write, payload, 2, |_| Ok(()))
     }
 

@@ -203,7 +203,7 @@ fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dy
         command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &poll_response()),
         encrypted_command(
             &[
-                0x1e, 0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x01, 0x0a, 0x00,
+                0x1e, 0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x01, 0x12, 0x00,
                 0x7b, 0x5f, 0xe9, 0x6d, 0x7c, 0xed, 0x9a, 0xe9, 0xaf, 0xd3, 0x61, 0x7f, 0xca, 0x55,
                 0xc8, 0xac,
             ],
@@ -233,9 +233,9 @@ fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dy
         ),
         encrypted_command(
             &[
-                0x20, 0x46, 0x03, 0x00, 0xb1, 0x63, 0x64, 0xfa, 0x01, 0x00, 0x65, 0x8d, 0xb5, 0x6b,
-                0x5e, 0xb0, 0x36, 0x5d, 0xdf, 0x18, 0x09, 0x38, 0x32, 0x72, 0x06, 0x2a, 0x12, 0x18,
-                0xc3, 0xa8, 0x05, 0xba,
+                0x20, 0x46, 0x03, 0x00, 0xb1, 0x73, 0x64, 0xfa, 0x23, 0x0c, 0x0b, 0xc5, 0xef, 0x31,
+                0x04, 0xea, 0x6c, 0x07, 0x85, 0x42, 0x53, 0x62, 0xc3, 0xe5, 0x9f, 0x8d, 0x54, 0xb6,
+                0x19, 0x1d, 0x43, 0x10,
             ],
             &[
                 0x0e, 0x47, 0x04, 0x00, 0x7d, 0x37, 0x8f, 0x1f, 0x9f, 0xf4, 0x1f, 0x3a, 0xf5, 0x30,
@@ -258,7 +258,7 @@ fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dy
         .ok_or("card absent")?;
     let mut session = card.authenticate_standard_aes(
         &[NodeKey {
-            code: 0x000a,
+            code: 0x0012,
             key: &0x00112233445566778899aabbccddeeffu128.to_be_bytes(),
         }],
         &core::array::from_fn(|index| index as u8),
@@ -276,9 +276,10 @@ fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dy
         Err(AesError::Request(CardError::ServiceIndex(1)))
     ));
     assert_eq!(session.read_blocks(&[block])?, [[0xa5; 16]]);
-    session.write_blocks(&[BlockWrite {
+    session.write_blocks(&[BlockWrite::PurseCashback {
         address: block,
-        data: [0x5a; 16],
+        amount: 0x1234_5678,
+        execution_id: [0xab, 0xcd],
     }])?;
     assert!(matches!(
         session.read_blocks(&[block]),
@@ -464,7 +465,7 @@ fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result
         })
     );
     assert_eq!(card.search_service_code(0x1235)?, None);
-    let write = BlockWrite {
+    let write = BlockWrite::Data {
         address: BlockAddress::first(257),
         data: [0x5a; 16],
     };
@@ -510,7 +511,7 @@ fn felica_write_length_errors_distinguish_request_rejection_from_sent_command()
         .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
         .map(Card::new)
         .ok_or("expected FeliCa card")?;
-    let block = BlockWrite {
+    let block = BlockWrite::Data {
         address: BlockAddress::first(256),
         data: [0x5a; 16],
     };
@@ -522,9 +523,9 @@ fn felica_write_length_errors_distinguish_request_rejection_from_sent_command()
         }))
     ));
     assert_eq!(journal.borrow().remaining, 1);
-    let block = BlockWrite {
+    let block = BlockWrite::Data {
         address: BlockAddress::first(1),
-        ..block
+        data: [0x5a; 16],
     };
     assert!(matches!(
         card.write_without_encryption(&[9], &[block]),

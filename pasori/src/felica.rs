@@ -26,7 +26,7 @@ pub const MAX_READ_BLOCKS: usize = 12;
 /// Maximum write blocks that fit a single-service packet with short addresses.
 pub const MAX_WRITE_BLOCKS: usize = 13;
 
-/// Card packet validation or card-reported status failure.
+/// Card packet validation or a card-reported nonzero status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CardError {
     /// Actual bytes do not match the packet's declared or required length.
@@ -87,7 +87,8 @@ pub enum CardError {
         /// Identity received from the card.
         actual: Idm,
     },
-    /// Card-reported operation failure; both status flags are preserved.
+    /// A nonzero card status; both flags are preserved. A write status with
+    /// flag 2 set to `0x71` reports a write performed with a memory wear warning.
     Status {
         /// First status flag.
         flag1: u8,
@@ -156,7 +157,7 @@ impl fmt::Display for CardError {
 
 impl core::error::Error for CardError {}
 
-/// Direct access to a block in the command or session's ordered service list.
+/// A block in the command or session's ordered service list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockAddress {
     service_index: u8,
@@ -190,6 +191,10 @@ impl BlockAddress {
 }
 
 /// One operation in a FeliCa block write.
+///
+/// For purse adjustments, the caller selects the corresponding service and
+/// supplies the execution ID. The card can acknowledge an adjustment without
+/// updating the block when its stored execution ID equals the supplied one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockWrite {
     /// Send a block of data in card byte order with the ordinary access mode.
@@ -199,6 +204,64 @@ pub enum BlockWrite {
         /// Block data in card byte order.
         data: [u8; 16],
     },
+    /// Debit a service whose attributes permit purse decrement.
+    PurseDecrement {
+        /// Block to update.
+        address: BlockAddress,
+        /// Amount to debit.
+        amount: u32,
+        /// Execution ID in card byte order.
+        execution_id: [u8; 2],
+    },
+    /// Credit a service whose attributes permit purse cashback, up to the
+    /// cashback amount stored on the card.
+    PurseCashback {
+        /// Block to update.
+        address: BlockAddress,
+        /// Amount to credit.
+        amount: u32,
+        /// Execution ID in card byte order.
+        execution_id: [u8; 2],
+    },
+}
+
+impl BlockWrite {
+    fn list_element(self) -> (BlockAddress, AccessMode) {
+        match self {
+            Self::Data { address, .. } | Self::PurseDecrement { address, .. } => {
+                (address, AccessMode::Ordinary)
+            }
+            Self::PurseCashback { address, .. } => (address, AccessMode::Cashback),
+        }
+    }
+
+    fn payload(self) -> [u8; 16] {
+        match self {
+            Self::Data { data, .. } => data,
+            Self::PurseDecrement {
+                amount,
+                execution_id,
+                ..
+            }
+            | Self::PurseCashback {
+                amount,
+                execution_id,
+                ..
+            } => {
+                // Both operations put the amount at D0–D3 and execution ID at D14–D15.
+                let mut data = [0; 16];
+                data[..4].copy_from_slice(&amount.to_le_bytes());
+                data[14..].copy_from_slice(&execution_id);
+                data
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AccessMode {
+    Ordinary = 0x00,
+    Cashback = 0x10,
 }
 
 fn code_count(actual: usize, maximum: u8) -> Result<u8, CardError> {
@@ -217,22 +280,56 @@ fn append_codes(data: &mut Vec<u8>, codes: &[u16], maximum: u8) -> Result<(), Ca
     Ok(())
 }
 
-fn append_blocks(
+fn append_block_list(
     data: &mut Vec<u8>,
     service_count: usize,
-    blocks: impl ExactSizeIterator<Item = BlockAddress>,
+    blocks: impl ExactSizeIterator<Item = (BlockAddress, AccessMode)>,
 ) -> Result<(), CardError> {
     data.push(u8::try_from(blocks.len()).map_err(|_| CardError::BlockCount(blocks.len()))?);
-    for block in blocks {
+    for (block, mode) in blocks {
         if usize::from(block.service_index) >= service_count {
             return Err(CardError::ServiceIndex(block.service_index));
         }
+        let flags = mode as u8 | block.service_index;
         let [low, high] = block.number.to_le_bytes();
         if high == 0 {
-            data.extend([0x80 | block.service_index, low]);
+            data.extend([0x80 | flags, low]);
         } else {
-            data.extend([block.service_index, low, high]);
+            data.extend([flags, low, high]);
         }
+    }
+    Ok(())
+}
+
+fn append_read_blocks(
+    data: &mut Vec<u8>,
+    service_count: usize,
+    blocks: &[BlockAddress],
+) -> Result<(), CardError> {
+    append_block_list(
+        data,
+        service_count,
+        blocks
+            .iter()
+            .map(|&address| (address, AccessMode::Ordinary)),
+    )
+}
+
+fn append_write_blocks(
+    data: &mut Vec<u8>,
+    service_count: usize,
+    blocks: &[BlockWrite],
+) -> Result<(), CardError> {
+    if !(1..=MAX_WRITE_BLOCKS).contains(&blocks.len()) {
+        return Err(CardError::WriteBlockCount(blocks.len()));
+    }
+    append_block_list(
+        data,
+        service_count,
+        blocks.iter().copied().map(BlockWrite::list_element),
+    )?;
+    for block in blocks {
+        data.extend(block.payload());
     }
     Ok(())
 }
@@ -254,7 +351,7 @@ fn unencrypted_read_parameters(
     }
     let mut data = Vec::new();
     append_codes(&mut data, services, 16)?;
-    append_blocks(&mut data, services.len(), blocks.iter().copied())?;
+    append_read_blocks(&mut data, services.len(), blocks)?;
     Ok(data)
 }
 
@@ -528,27 +625,17 @@ impl<S: Selection> Card<S> {
     }
 
     /// Write blocks in one command to up to sixteen unencrypted services.
-    /// Card-specific limits also apply. After sending, an exchange failure
+    /// Card-specific limits also apply. After sending, a lost or invalid response
     /// can leave the write applied. The reader error carries transfer progress.
+    /// Reconcile with the card before attempting a new purse adjustment.
     pub fn write_without_encryption(
         &mut self,
         services: &[u16],
         blocks: &[BlockWrite],
     ) -> Result<(), Error<S::Error>> {
-        if !(1..=MAX_WRITE_BLOCKS).contains(&blocks.len()) {
-            return Err(Error::Request(CardError::WriteBlockCount(blocks.len())));
-        }
         let mut data = Vec::new();
         append_codes(&mut data, services, 16).map_err(Error::Request)?;
-        append_blocks(
-            &mut data,
-            services.len(),
-            blocks.iter().map(|block| block.address),
-        )
-        .map_err(Error::Request)?;
-        for block in blocks {
-            data.extend(block.data);
-        }
+        append_write_blocks(&mut data, services.len(), blocks).map_err(Error::Request)?;
         let reply = self.exchange_addressed(0x08, &data)?;
         write_response(&reply, self.idm()).map_err(Error::Response)
     }
