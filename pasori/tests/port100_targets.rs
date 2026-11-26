@@ -4,14 +4,15 @@ use pasori::iso14443::nfca::TargetEvent;
 use pasori::{
     felica_packet::Idm,
     ndef::{
-        MAX_TYPE4_EMULATED_NDEF_BYTES, Type3EmulationError, Type3Event, Type3Target,
-        Type4EmulationError, Type4Event, Type4NdefChange, Type4NdefFile, Type4Target,
+        MAX_TYPE4_EMULATED_NDEF_BYTES, Type3EmulationError, Type3Event, Type3NdefChange,
+        Type3NdefMemory, Type3NdefMemoryError, Type3Target, Type4EmulationError, Type4Event,
+        Type4NdefChange, Type4NdefFile, Type4Target,
     },
     port100::reader::{BitRate, Error, PollingResponder, Reader, TargetWait},
     type2::{Type2EmulationError, Type2Event, Type2Target},
 };
 use reader_script::port100::{Script, Step, command, initialization, initialization_with};
-use std::{error::Error as StdError, time::Duration};
+use std::{error::Error as StdError, num::NonZeroU16, time::Duration};
 
 const MESSAGE: [u8; 3] = [0xd0, 0, 0];
 const IDENTITY: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -135,6 +136,12 @@ fn serves_type3_attribute_and_message_blocks_across_field_cycles() -> Result<(),
             &[0x0c, 0, 0, 0, 0, 0, 0],
         ),
         exchange(&parameters, 0, &[], &incoming(0, &[0, 2, 0])),
+        exchange(
+            &parameters,
+            0,
+            &status_reply(7, 1, 0xa8),
+            &[0x0c, 0, 0, 0, 0, 0, 0],
+        ),
         exchange(&parameters, 0, &[], &[0x0c, 0, 0, 0, 4, 0, 0]),
         exchange(&parameters, 1, &[], &incoming(3, &[0, 1, 0])),
         exchange(&parameters, 0, &outgoing(body), &[0x0c, 0, 0, 0, 0, 0, 0]),
@@ -155,12 +162,26 @@ fn serves_type3_attribute_and_message_blocks_across_field_cycles() -> Result<(),
         Ok(Type3Event::Silence)
     ));
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
-    assert_eq!(target.serve_next(wait()?)?, Type3Event::Ignored);
+    assert_eq!(
+        target.serve_next(wait()?)?,
+        Type3Event::Rejected {
+            flag1: 1,
+            flag2: 0xa8
+        }
+    );
     assert_eq!(target.serve_next(wait()?)?, Type3Event::FieldOff);
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
+}
+
+/// A FeliCa status response with `code` and both status flags.
+fn status_reply(code: u8, flag1: u8, flag2: u8) -> Vec<u8> {
+    let mut packet = vec![12, code];
+    packet.extend(IDENTITY);
+    packet.extend([flag1, flag2]);
+    packet
 }
 
 fn felica_parameters() -> [u8; 24] {
@@ -409,6 +430,299 @@ fn type3_validates_ndef_before_configuring_the_reader() {
         Err(Type3EmulationError::Message(_))
     ));
     assert!(journal.borrow().commands.is_empty());
+}
+
+// A 20-byte short record of TNF Unknown that spans two data blocks.
+const UPDATE: [u8; 20] = *b"\xd5\x00\x11written by the PC";
+
+/// Attribute block of a writable mapping, checksum included.
+fn writable_attribute(flag: u8, length: u8, blocks: u8) -> [u8; 16] {
+    let mut block = [
+        0x10, 12, 12, 0, blocks, 0, 0, 0, 0, flag, 1, 0, 0, length, 0, 0,
+    ];
+    let sum: u16 = block[..14].iter().map(|&byte| u16::from(byte)).sum();
+    block[14..].copy_from_slice(&sum.to_be_bytes());
+    block
+}
+
+/// A Read (`06`) or Write (`08`) Without Encryption packet for one service.
+fn block_request(code: u8, service: u16, count: u8, elements: &[u8], data: &[[u8; 16]]) -> Vec<u8> {
+    let mut packet = vec![0, code];
+    packet.extend(IDENTITY);
+    packet.push(1);
+    packet.extend(service.to_le_bytes());
+    packet.push(count);
+    packet.extend_from_slice(elements);
+    packet.extend(data.iter().flatten());
+    packet[0] = packet.len() as u8;
+    packet
+}
+
+fn read_reply(blocks: &[[u8; 16]]) -> Vec<u8> {
+    let mut packet = vec![13 + 16 * blocks.len() as u8, 7];
+    packet.extend(IDENTITY);
+    packet.extend([0, 0, blocks.len() as u8]);
+    packet.extend(blocks.iter().flatten());
+    packet
+}
+
+fn split_update() -> [[u8; 16]; 2] {
+    let mut blocks = [[0; 16]; 2];
+    blocks[0].copy_from_slice(&UPDATE[..16]);
+    blocks[1][..4].copy_from_slice(&UPDATE[16..]);
+    blocks
+}
+
+/// Reception of `packet`. Activation bits 3 mark the first packet after the
+/// reader answered Polling.
+fn received(activation: u8, packet: &[u8]) -> Step {
+    exchange(
+        &felica_parameters(),
+        activation >> 1,
+        &[],
+        &felica_frame(0x0c, activation, packet),
+    )
+}
+
+fn sent(packet: &[u8]) -> Step {
+    exchange(&felica_parameters(), 0, packet, &[0x0c, 0, 0, 0, 0, 0, 0])
+}
+
+fn two_blocks() -> Result<NonZeroU16, Box<dyn StdError>> {
+    NonZeroU16::new(2).ok_or_else(|| "two blocks".into())
+}
+
+#[test]
+fn a_writable_type3_target_stages_an_update_and_publishes_it() -> Result<(), Box<dyn StdError>> {
+    let [first, second] = split_update();
+    let mut steps = initialization();
+    steps.extend(configure(0x0c));
+    steps.extend([
+        received(
+            3,
+            &block_request(8, 9, 1, &[0x80, 0], &[writable_attribute(0x0f, 3, 2)]),
+        ),
+        sent(&status_reply(9, 0, 0)),
+        received(
+            0,
+            &block_request(8, 9, 2, &[0x80, 1, 0x80, 2], &[first, second]),
+        ),
+        sent(&status_reply(9, 0, 0)),
+        received(0, &block_request(6, 9, 1, &[0x80, 0], &[])),
+        sent(&read_reply(&[writable_attribute(0x0f, 3, 2)])),
+        received(
+            0,
+            &block_request(8, 9, 1, &[0x80, 0], &[writable_attribute(0, 20, 2)]),
+        ),
+        sent(&status_reply(9, 0, 0)),
+        received(0, &block_request(6, 0x0b, 2, &[0x80, 1, 0, 2, 0], &[])),
+        sent(&read_reply(&[first, second])),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut memory = Type3NdefMemory::new(two_blocks()?, &MESSAGE)?;
+    let mut target = Type3Target::listen_writable(
+        &mut reader,
+        PollingResponder::Reader(BitRate::Kbps212),
+        Idm::new(IDENTITY),
+        PMM,
+        &mut memory,
+    )?;
+    assert_eq!(
+        target.serve_next(wait()?)?,
+        Type3Event::NdefChanged(Type3NdefChange::UpdateStarted)
+    );
+    assert_eq!(target.message(), None);
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Written);
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    assert_eq!(
+        target.serve_next(wait()?)?,
+        Type3Event::NdefChanged(Type3NdefChange::Published { length: 20 })
+    );
+    assert_eq!(target.message(), Some(&UPDATE[..]));
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    target.finish()?;
+    assert_eq!(memory.message(), Some(&UPDATE[..]));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_writable_type3_target_refuses_writes_that_would_break_the_mapping()
+-> Result<(), Box<dyn StdError>> {
+    let rejected = |position: u8, code: u8| Type3Event::Rejected {
+        flag1: position,
+        flag2: code,
+    };
+    let mut original = [0; 16];
+    original[..3].copy_from_slice(&MESSAGE);
+    let mut other_idm = block_request(8, 9, 1, &[0x80, 1], &[[0; 16]]);
+    other_idm[9] ^= 1;
+    let mut steps = initialization();
+    steps.extend(configure(0x0c));
+    steps.extend([
+        // A data block outside an update.
+        received(3, &block_request(8, 9, 1, &[0x80, 1], &[[0; 16]])),
+        sent(&status_reply(9, 1, 0xa5)),
+        // An attribute that changes the advertised block count.
+        received(
+            0,
+            &block_request(8, 9, 1, &[0x80, 0], &[writable_attribute(0, 3, 3)]),
+        ),
+        sent(&status_reply(9, 1, 0xa5)),
+        // Publishing bytes that are not an NDEF message undoes the command.
+        received(
+            0,
+            &block_request(
+                8,
+                9,
+                3,
+                &[0x80, 0, 0x80, 1, 0x80, 0],
+                &[
+                    writable_attribute(0x0f, 3, 2),
+                    [0xff; 16],
+                    writable_attribute(0, 16, 2),
+                ],
+            ),
+        ),
+        sent(&status_reply(9, 3, 0xa5)),
+        received(0, &block_request(6, 0x0b, 2, &[0x80, 0, 0x80, 1], &[])),
+        sent(&read_reply(&[writable_attribute(0, 3, 2), original])),
+        // The read-only service, the block count and the block number.
+        received(0, &block_request(8, 0x0b, 1, &[0x80, 1], &[[0; 16]])),
+        sent(&status_reply(9, 1, 0xa6)),
+        received(0, &block_request(8, 9, 13, &[], &[])),
+        sent(&status_reply(9, 0xff, 0xa2)),
+        received(0, &block_request(8, 9, 1, &[0x80, 3], &[[0; 16]])),
+        sent(&status_reply(9, 1, 0xa8)),
+        received(0, &other_idm),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut memory = Type3NdefMemory::new(two_blocks()?, &MESSAGE)?;
+    let mut target = Type3Target::listen_writable(
+        &mut reader,
+        PollingResponder::Reader(BitRate::Kbps212),
+        Idm::new(IDENTITY),
+        PMM,
+        &mut memory,
+    )?;
+    assert_eq!(target.serve_next(wait()?)?, rejected(1, 0xa5));
+    assert_eq!(target.serve_next(wait()?)?, rejected(1, 0xa5));
+    assert_eq!(target.serve_next(wait()?)?, rejected(3, 0xa5));
+    assert_eq!(target.message(), Some(&MESSAGE[..]));
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    assert_eq!(target.serve_next(wait()?)?, rejected(1, 0xa6));
+    assert_eq!(target.serve_next(wait()?)?, rejected(0xff, 0xa2));
+    assert_eq!(target.serve_next(wait()?)?, rejected(1, 0xa8));
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Ignored);
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_read_only_type3_target_has_no_writable_service() -> Result<(), Box<dyn StdError>> {
+    let mut steps = initialization();
+    steps.extend(configure(0x0c));
+    steps.extend([
+        received(3, &block_request(8, 9, 1, &[0x80, 1], &[[0; 16]])),
+        sent(&status_reply(9, 1, 0xa6)),
+        received(0, &block_request(6, 9, 1, &[0x80, 1], &[])),
+        sent(&status_reply(7, 1, 0xa6)),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut target = Type3Target::listen(
+        &mut reader,
+        PollingResponder::Reader(BitRate::Kbps212),
+        Idm::new(IDENTITY),
+        PMM,
+        &MESSAGE,
+    )?;
+    let rejected = Type3Event::Rejected {
+        flag1: 1,
+        flag2: 0xa6,
+    };
+    assert_eq!(target.serve_next(wait()?)?, rejected);
+    assert_eq!(target.serve_next(wait()?)?, rejected);
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_failed_type3_response_reports_the_published_change() -> Result<(), Box<dyn StdError>> {
+    let mut steps = initialization();
+    steps.extend(configure(0x0c));
+    steps.extend([
+        received(
+            3,
+            &block_request(8, 9, 1, &[0x80, 0], &[writable_attribute(0x0f, 3, 2)]),
+        ),
+        sent(&status_reply(9, 0, 0)),
+        received(
+            0,
+            &block_request(8, 9, 1, &[0x80, 0], &[writable_attribute(0, 3, 2)]),
+        ),
+        exchange(
+            &felica_parameters(),
+            0,
+            &status_reply(9, 0, 0),
+            &[0x0c, 0, 0, 1, 0, 0, 0],
+        ),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut memory = Type3NdefMemory::new(two_blocks()?, &MESSAGE)?;
+    let mut target = Type3Target::listen_writable(
+        &mut reader,
+        PollingResponder::Reader(BitRate::Kbps212),
+        Idm::new(IDENTITY),
+        PMM,
+        &mut memory,
+    )?;
+    assert_eq!(
+        target.serve_next(wait()?)?,
+        Type3Event::NdefChanged(Type3NdefChange::UpdateStarted)
+    );
+    assert!(matches!(
+        target.serve_next(wait()?),
+        Err(Type3EmulationError::NdefResponse {
+            change: Type3NdefChange::Published { length: 3 },
+            cause: Error::RfStatus(1),
+        })
+    ));
+    assert_eq!(target.message(), Some(&MESSAGE[..]));
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_type3_memory_validates_its_initial_message() -> Result<(), Box<dyn StdError>> {
+    let one = NonZeroU16::new(1).ok_or("one block")?;
+    assert!(matches!(
+        Type3NdefMemory::new(one, &[0xd0]),
+        Err(Type3NdefMemoryError::Message(_))
+    ));
+    assert!(matches!(
+        Type3NdefMemory::new(one, &UPDATE),
+        Err(Type3NdefMemoryError::MessageLength {
+            length: 20,
+            capacity: 16
+        })
+    ));
+    assert_eq!(Type3NdefMemory::new(one, &[])?.message(), Some(&[][..]));
+    Ok(())
 }
 
 fn type4_exchange(mdaa: u8, send: &[u8], receive_ms: u16, status: u32, frame: &[u8]) -> Step {

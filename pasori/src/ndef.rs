@@ -11,8 +11,8 @@ mod type4;
 pub use message::{Message, MessageError, MessageErrorKind, Record, RecordType};
 pub use type1::{Type1Error, Type1WriteError};
 pub use type3::{
-    MAX_TYPE3_EMULATED_NDEF_BYTES, TYPE3_POLLING, Type3EmulationError, Type3Event, Type3Tag,
-    Type3Target,
+    MAX_TYPE3_EMULATED_NDEF_BYTES, TYPE3_POLLING, Type3EmulationError, Type3Event, Type3NdefChange,
+    Type3NdefMemory, Type3NdefMemoryError, Type3Tag, Type3Target,
 };
 pub use type4::{
     MAX_TYPE4_EMULATED_NDEF_BYTES, Type4EmulationError, Type4Event, Type4NdefChange, Type4NdefFile,
