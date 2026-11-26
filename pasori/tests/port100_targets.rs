@@ -30,11 +30,21 @@ fn configure(rate: u8) -> [Step; 2] {
 
 fn exchange(parameters: &[u8; 24], mdaa: u8, transmit: &[u8], reply: &[u8]) -> Step {
     // Send-only and receive-only forms from the split Type 3 capture.
+    let receive = if transmit.is_empty() { WAIT_MS } else { 0 };
+    exchange_receiving(parameters, mdaa, receive, transmit, reply)
+}
+
+fn exchange_receiving(
+    parameters: &[u8; 24],
+    mdaa: u8,
+    receive_ms: u16,
+    transmit: &[u8],
+    reply: &[u8],
+) -> Step {
     let mut args = vec![0, 0, 0xff, 0xff, mdaa];
     args.extend_from_slice(parameters);
-    let receive = if transmit.is_empty() { WAIT_MS } else { 0 };
     args.extend([0, 0]);
-    args.extend(receive.to_le_bytes());
+    args.extend(receive_ms.to_le_bytes());
     args.extend_from_slice(transmit);
     command(0x48, &args, reply)
 }
@@ -212,6 +222,55 @@ fn a_type3_target_configured_for_424_serves_an_initiator_at_212() -> Result<(), 
         &MESSAGE,
     )?;
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_felica_target_keeps_a_frame_received_at_the_initiators_rate_with_its_response()
+-> Result<(), Box<dyn StdError>> {
+    let parameters = felica_parameters();
+    let mut steps = initialization();
+    steps.extend(configure(0x0d));
+    steps.extend([
+        exchange(
+            &parameters,
+            1,
+            &[],
+            &felica_frame(0x0c, 3, &attribute_read()),
+        ),
+        // The response arms reception, which captures the next 212 kbps packet.
+        exchange_receiving(
+            &parameters,
+            0,
+            WAIT_MS,
+            &attribute_reply(),
+            &felica_frame(0x0c, 0, &attribute_read()),
+        ),
+        exchange(
+            &parameters,
+            0,
+            &attribute_reply(),
+            &[0x0c, 0, 0, 0, 0, 0, 0],
+        ),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut target = reader.listen_felica(
+        PollingResponder::Reader(BitRate::Kbps424),
+        Idm::new(IDENTITY),
+        PMM,
+        0x12fc,
+    )?;
+    let command = target.receive(wait()?)?;
+    assert_eq!(command.data(), attribute_read());
+    command.respond_and_wait(&attribute_reply(), wait()?)?;
+    let command = target.receive(wait()?)?;
+    assert_eq!(command.data(), attribute_read());
+    command.respond(&attribute_reply())?;
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())

@@ -531,7 +531,7 @@ impl<T: Transport> TargetLink<'_, T> {
         let reply = self.exchange(false, wait.map_or(0, |wait| wait.0), response)?;
         let pending = match (wait, reply.status) {
             (None, 0) | (Some(_), RECEIVE_TIMEOUT) if reply.data.is_empty() => None,
-            (Some(_), 0) if reply.rate == self.radio.code() && !reply.data.is_empty() => {
+            (Some(_), 0) if self.radio.admits(reply.rate) && !reply.data.is_empty() => {
                 self.validate_data(&reply.data)?;
                 Some(reply.data)
             }
