@@ -6,7 +6,7 @@ use pasori::{
         MAX_TYPE4_EMULATED_NDEF_BYTES, Type3EmulationError, Type3Event, Type3Target,
         Type4EmulationError, Type4Event, Type4NdefChange, Type4NdefFile, Type4Target,
     },
-    port100::reader::{BitRate, Error, Reader, TargetWait},
+    port100::reader::{BitRate, Error, PollingResponder, Reader, TargetWait},
     type2::{Type2EmulationError, Type2Event, Type2Target},
 };
 use reader_script::port100::{Script, Step, command, initialization, initialization_with};
@@ -130,7 +130,7 @@ fn serves_type3_attribute_and_message_blocks_across_field_cycles() -> Result<(),
     reader.initialize()?;
     let mut target = Type3Target::listen(
         &mut reader,
-        BitRate::Kbps212,
+        PollingResponder::Reader(BitRate::Kbps212),
         Idm::new(IDENTITY),
         PMM,
         &MESSAGE,
@@ -146,6 +146,157 @@ fn serves_type3_attribute_and_message_blocks_across_field_cycles() -> Result<(),
         Err(Type3EmulationError::Reader(Error::TargetFieldOff))
     ));
     assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+fn felica_parameters() -> [u8; 24] {
+    let mut parameters = [0; 24];
+    parameters[6..14].copy_from_slice(&IDENTITY);
+    parameters[14..22].copy_from_slice(&PMM);
+    parameters[22..].copy_from_slice(&[0x12, 0xfc]);
+    parameters
+}
+
+/// TgCommRF reply carrying `packet` in receive `mode`, with activation bits.
+fn felica_frame(mode: u8, activation: u8, packet: &[u8]) -> Vec<u8> {
+    let mut reply = vec![mode, 0, activation, 0, 0, 0, 0];
+    reply.extend_from_slice(packet);
+    reply
+}
+
+fn attribute_read() -> Vec<u8> {
+    let mut packet = vec![16, 6];
+    packet.extend(IDENTITY);
+    packet.extend([1, 0x0b, 0, 1, 0x80, 0]);
+    packet
+}
+
+fn attribute_reply() -> Vec<u8> {
+    let mut packet = vec![29, 7];
+    packet.extend(IDENTITY);
+    packet.extend([0, 0, 1]);
+    packet.extend([0x10, 12, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0x20]);
+    packet
+}
+
+#[test]
+fn a_type3_target_configured_for_424_serves_an_initiator_at_212() -> Result<(), Box<dyn StdError>> {
+    let parameters = felica_parameters();
+    let mut steps = initialization();
+    steps.extend(configure(0x0d));
+    steps.extend([
+        exchange(
+            &parameters,
+            1,
+            &[],
+            &felica_frame(0x0c, 3, &attribute_read()),
+        ),
+        exchange(
+            &parameters,
+            0,
+            &attribute_reply(),
+            &[0x0c, 0, 0, 0, 0, 0, 0],
+        ),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut target = Type3Target::listen(
+        &mut reader,
+        PollingResponder::Reader(BitRate::Kbps424),
+        Idm::new(IDENTITY),
+        PMM,
+        &MESSAGE,
+    )?;
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn a_host_activated_type3_target_advertises_424_and_follows_the_initiator()
+-> Result<(), Box<dyn StdError>> {
+    let parameters = felica_parameters();
+    let polling_reply = |data: &[u8]| {
+        let mut packet = vec![if data.is_empty() { 18 } else { 20 }, 1];
+        packet.extend(IDENTITY);
+        packet.extend(PMM);
+        packet.extend_from_slice(data);
+        packet
+    };
+    let sent = |mode: u8| [mode, 0, 0, 0, 0, 0, 0];
+    let mut steps = initialization();
+    steps.extend(configure(0x0c));
+    steps.extend([
+        // Another system's Polling stays unanswered; FF matches any byte.
+        exchange(
+            &parameters,
+            0,
+            &[],
+            &felica_frame(0x0c, 0, &[6, 0, 0x88, 0xb4, 0, 0]),
+        ),
+        exchange(
+            &parameters,
+            0,
+            &[],
+            &felica_frame(0x0c, 0, &[6, 0, 0x12, 0xff, 1, 0]),
+        ),
+        exchange(&parameters, 0, &polling_reply(&[0x12, 0xfc]), &sent(0x0c)),
+        exchange(
+            &parameters,
+            0,
+            &[],
+            &felica_frame(0x0c, 0, &[6, 0, 0xff, 0xff, 2, 0]),
+        ),
+        exchange(&parameters, 0, &polling_reply(&[0, 0x83]), &sent(0x0c)),
+    ]);
+    steps.extend(configure(0x0d));
+    steps.extend([
+        exchange(
+            &parameters,
+            0,
+            &[],
+            &felica_frame(0x0d, 0, &attribute_read()),
+        ),
+        exchange(&parameters, 0, &attribute_reply(), &sent(0x0d)),
+        exchange(&parameters, 0, &[], &[0x0d, 0, 0, 0, 4, 0, 0]),
+    ]);
+    // After the field loss the target receives at 212 kbps again.
+    steps.extend(configure(0x0c));
+    steps.extend([
+        exchange(
+            &parameters,
+            0,
+            &[],
+            &felica_frame(0x0c, 0, &[6, 0, 0x12, 0xfc, 0, 0]),
+        ),
+        exchange(&parameters, 0, &polling_reply(&[]), &sent(0x0c)),
+        exchange(&parameters, 0, &[], &[0x0c, 0, 0, 0x80, 0, 0, 0]),
+    ]);
+    steps.extend(initialization());
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut target = Type3Target::listen(
+        &mut reader,
+        PollingResponder::Host,
+        Idm::new(IDENTITY),
+        PMM,
+        &MESSAGE,
+    )?;
+    assert_eq!(target.serve_next(wait()?)?, Type3Event::Read);
+    assert!(matches!(
+        target.serve_next(wait()?),
+        Err(Type3EmulationError::Reader(Error::TargetFieldOff))
+    ));
+    assert!(matches!(
+        target.serve_next(wait()?),
+        Err(Type3EmulationError::Reader(Error::TargetTimeout))
+    ));
     target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -189,7 +340,7 @@ fn type3_validates_ndef_before_configuring_the_reader() {
     assert!(matches!(
         Type3Target::listen(
             &mut reader,
-            BitRate::Kbps212,
+            PollingResponder::Reader(BitRate::Kbps212),
             Idm::new(IDENTITY),
             PMM,
             &[0xd0]

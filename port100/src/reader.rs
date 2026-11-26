@@ -12,7 +12,9 @@ mod type_a;
 mod type_b;
 
 pub use iso_dep::{Activation, IsoDepBlocks, IsoDepCard, MAX_BLOCK_BYTES};
-pub use target::{FelicaTarget, IsoDepATarget, TargetCommand, TargetWait, TypeATarget};
+pub use target::{
+    FelicaTarget, IsoDepATarget, PollingResponder, TargetCommand, TargetWait, TypeATarget,
+};
 pub use type_a::{TypeACard, TypeASelection};
 
 use crate::transport::{Failure, Link, Progress, TransactionError, Transport};

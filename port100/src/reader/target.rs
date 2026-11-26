@@ -2,7 +2,7 @@ use super::{BitRate, Error, Field, RF_MARGIN, Reader, State};
 use crate::{transport::Transport, wire};
 use alloc::vec::Vec;
 use core::{mem, time::Duration};
-use felica_packet::{Idm, validate_length};
+use felica_packet::{Idm, PollRequest, PollResponse, validate_length};
 use iso14443::nfca::{self, PassiveTarget, PassiveTargetReader};
 
 const EXCHANGE: u8 = 0x48;
@@ -10,6 +10,12 @@ const RECEIVE_TIMEOUT: u32 = 0x80;
 const FIELD_OFF: u32 = 0x400;
 const HEADER_BYTES: usize = 33;
 const MAX_RESPONSE_BYTES: usize = wire::MAX_LENGTH - HEADER_BYTES - 2;
+/// TgSetProtocol pairs of every passive target configuration.
+const TARGET_PROTOCOL: [u8; 6] = [0, 1, 1, 1, 2, 7];
+/// Request data that a [`PollingResponder::Host`] target returns for request
+/// code `02`: 212 kbps (bit 0), 424 kbps (bit 1) and automatic rate
+/// switching (bit 7).
+const DUAL_RATE: [u8; 2] = [0x00, 0x83];
 
 /// Finite wait for a passive target to receive an initiator command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,8 +53,29 @@ pub struct IsoDepATarget<'r, T: Transport> {
     uid: [u8; 4],
 }
 
-/// Passive FeliCa target. The reader answers the activation Polling with
-/// the configured identity and hands later packets to the host.
+/// Who answers the Polling that activates a passive FeliCa target.
+///
+/// After activation, packets arrive at the rate the initiator uses, 212 or
+/// 424 kbps, and replies go out at the rate of the packet they answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PollingResponder {
+    /// The reader answers the first Polling after the field comes on, with
+    /// no request data for request code `02`, so initiators that switch on
+    /// that data stay at 212 kbps. Configured for 424 kbps, it also answers a
+    /// Polling sent at 212 kbps; configured for 212 kbps, it does not answer
+    /// one sent at 424 kbps. Later Polling commands reach the host.
+    Reader(BitRate),
+    /// The host answers every Polling that selects the target's system,
+    /// without waiting for a time slot, and receives at 212 kbps. Request
+    /// code `01` returns the system code. Request code `02` advertises
+    /// 212 kbps, 424 kbps and automatic switching; the target then receives
+    /// at 424 kbps until the field goes off. The answer leaves later than
+    /// the reader's, which an initiator with a short Polling wait may miss.
+    Host,
+}
+
+/// Passive FeliCa target. Polling is answered as its [`PollingResponder`]
+/// selects; the host receives the other packets.
 #[derive(Debug)]
 pub struct FelicaTarget<'r, T: Transport>(TargetLink<'r, T>);
 
@@ -69,16 +96,54 @@ enum TargetState {
 #[derive(Clone, Copy, Debug)]
 enum Radio {
     TypeA,
-    Felica(BitRate),
+    /// The reader answers the activation Polling.
+    FelicaReader(BitRate),
+    /// The host answers Polling for `system`; the reader receives at
+    /// `listening`.
+    FelicaHost {
+        system: u16,
+        idm: Idm,
+        pmm: [u8; 8],
+        listening: BitRate,
+    },
 }
 
 impl Radio {
+    /// TgSetRF code of the current configuration.
     const fn code(self) -> u8 {
         match self {
             Self::TypeA => 0x0b,
-            Self::Felica(BitRate::Kbps212) => 0x0c,
-            Self::Felica(BitRate::Kbps424) => 0x0d,
+            Self::FelicaReader(rate)
+            | Self::FelicaHost {
+                listening: rate, ..
+            } => felica_code(rate),
         }
+    }
+
+    const fn is_felica(self) -> bool {
+        !matches!(self, Self::TypeA)
+    }
+
+    /// Whether a frame reported with this TgCommRF mode belongs to the radio.
+    const fn admits(self, mode: u8) -> bool {
+        match self {
+            Self::TypeA => mode == 0x0b,
+            Self::FelicaReader(_) | Self::FelicaHost { .. } => {
+                mode == felica_code(BitRate::Kbps212) || mode == felica_code(BitRate::Kbps424)
+            }
+        }
+    }
+
+    /// Whether the reader answers activation itself (MDAA).
+    const fn reader_activates(self) -> bool {
+        !matches!(self, Self::FelicaHost { .. })
+    }
+}
+
+const fn felica_code(rate: BitRate) -> u8 {
+    match rate {
+        BitRate::Kbps212 => 0x0c,
+        BitRate::Kbps424 => 0x0d,
     }
 }
 
@@ -135,17 +200,25 @@ impl<T: Transport> Reader<T> {
     /// begin listening. The caller supplies the advertised identity.
     pub fn listen_felica(
         &mut self,
-        rate: BitRate,
+        activation: PollingResponder,
         idm: Idm,
         pmm: [u8; 8],
         system: u16,
     ) -> Result<FelicaTarget<'_, T>, Error<T::Error>> {
-        let mut activation = [0; 24];
-        activation[6..14].copy_from_slice(idm.as_bytes());
-        activation[14..22].copy_from_slice(&pmm);
-        activation[22..].copy_from_slice(&system.to_be_bytes());
-        self.prepare_target(Radio::Felica(rate), activation)
-            .map(FelicaTarget)
+        let mut parameters = [0; 24];
+        parameters[6..14].copy_from_slice(idm.as_bytes());
+        parameters[14..22].copy_from_slice(&pmm);
+        parameters[22..].copy_from_slice(&system.to_be_bytes());
+        let radio = match activation {
+            PollingResponder::Reader(rate) => Radio::FelicaReader(rate),
+            PollingResponder::Host => Radio::FelicaHost {
+                system,
+                idm,
+                pmm,
+                listening: BitRate::Kbps212,
+            },
+        };
+        self.prepare_target(radio, parameters).map(FelicaTarget)
     }
 
     fn prepare_type_a(
@@ -168,8 +241,7 @@ impl<T: Transport> Reader<T> {
             self.rf_off()?;
         }
         self.state = State::NeedsInitialization;
-        self.status_command(0x40, &[8, radio.code()])?;
-        self.status_command(0x42, &[0, 1, 1, 1, 2, 7])?;
+        self.configure_target(radio.code())?;
         Ok(TargetLink {
             reader: self,
             radio,
@@ -177,6 +249,14 @@ impl<T: Transport> Reader<T> {
             has_activation_status: !firmware.at_most(0x619),
             state: TargetState::WaitingForActivation,
         })
+    }
+}
+
+impl<T: Transport> Reader<T> {
+    /// TgSetRF with `code` and the target protocol settings.
+    fn configure_target(&mut self, code: u8) -> Result<(), Error<T::Error>> {
+        self.status_command(0x40, &[8, code])?;
+        self.status_command(0x42, &TARGET_PROTOCOL)
     }
 }
 
@@ -232,12 +312,14 @@ impl<'r, T: Transport> IsoDepATarget<'r, T> {
 
 impl<'r, T: Transport> FelicaTarget<'r, T> {
     /// Receive a FeliCa packet including its length byte and excluding CRC.
+    /// A [`PollingResponder::Host`] target answers the Polling commands that
+    /// arrive within `wait` itself and keeps listening until the wait ends.
     /// After a timeout or field loss, call again to continue listening.
     pub fn receive(
         &mut self,
         wait: TargetWait,
     ) -> Result<TargetCommand<'_, 'r, T>, Error<T::Error>> {
-        let data = self.0.receive(wait)?;
+        let data = self.0.receive_felica(wait)?;
         Ok(TargetCommand {
             link: &mut self.0,
             data,
@@ -283,7 +365,7 @@ impl<T: Transport> TargetCommand<'_, '_, T> {
                 actual: response.len(),
             });
         }
-        if matches!(self.link.radio, Radio::Felica(_)) {
+        if self.link.radio.is_felica() {
             validate_length(response, 2).map_err(Error::FelicaRequest)?;
         }
         self.link.respond(response, wait)
@@ -338,7 +420,7 @@ impl<T: Transport> TargetLink<'_, T> {
         }
         let prior = mem::replace(&mut self.state, TargetState::Revoked);
         let activate = match prior {
-            TargetState::WaitingForActivation => true,
+            TargetState::WaitingForActivation => self.radio.reader_activates(),
             TargetState::Activated { .. } => false,
             TargetState::Revoked => return Err(Error::NotInitialized),
         };
@@ -357,7 +439,7 @@ impl<T: Transport> TargetLink<'_, T> {
                 self.state = TargetState::WaitingForActivation;
                 Err(Error::TargetFieldOff)
             }
-            0 if rate == self.radio.code()
+            0 if self.radio.admits(rate)
                 && (!activate || activated != Some(false))
                 && !data.is_empty() =>
             {
@@ -370,8 +452,71 @@ impl<T: Transport> TargetLink<'_, T> {
         }
     }
 
+    /// Receive the next packet for the host. A host-activated target first
+    /// returns to 212 kbps after a field loss, and answers Polling commands
+    /// for its system until another packet arrives or `wait` ends.
+    fn receive_felica(&mut self, wait: TargetWait) -> Result<Vec<u8>, Error<T::Error>> {
+        let Radio::FelicaHost {
+            system,
+            idm,
+            pmm,
+            listening,
+        } = self.radio
+        else {
+            return self.receive(wait);
+        };
+        if matches!(self.state, TargetState::WaitingForActivation) && listening != BitRate::Kbps212
+        {
+            self.listen_at(BitRate::Kbps212)?;
+        }
+        let deadline = self
+            .reader
+            .link
+            .monotonic_time()
+            .saturating_add(wait.duration());
+        loop {
+            let remaining = deadline
+                .checked_sub(self.reader.link.monotonic_time())
+                .and_then(TargetWait::new)
+                .ok_or(Error::TargetTimeout)?;
+            let data = self.receive(remaining)?;
+            let Some(request) = PollRequest::parse(&data) else {
+                return Ok(data);
+            };
+            if !request.selects(system) {
+                continue;
+            }
+            let request_data = match request.request_code() {
+                1 => Some(system.to_be_bytes()),
+                2 => Some(DUAL_RATE),
+                _ => None,
+            };
+            let response = PollResponse {
+                idm,
+                pmm,
+                request_data,
+            };
+            self.respond(&response.encode(), None)?;
+            if request.request_code() == 2 {
+                self.listen_at(BitRate::Kbps424)?;
+            }
+        }
+    }
+
+    /// Reconfigure a host-activated target to receive at `rate`. Failure
+    /// revokes the target.
+    fn listen_at(&mut self, rate: BitRate) -> Result<(), Error<T::Error>> {
+        let prior = mem::replace(&mut self.state, TargetState::Revoked);
+        self.reader.configure_target(felica_code(rate))?;
+        if let Radio::FelicaHost { listening, .. } = &mut self.radio {
+            *listening = rate;
+        }
+        self.state = prior;
+        Ok(())
+    }
+
     fn validate_data(&self, data: &[u8]) -> Result<(), Error<T::Error>> {
-        if matches!(self.radio, Radio::Felica(_)) {
+        if self.radio.is_felica() {
             validate_length(data, 2).map_err(Error::FelicaResponse)?;
         }
         Ok(())

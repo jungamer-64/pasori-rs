@@ -356,6 +356,10 @@ impl<T: Transport> Link<T> {
     pub(crate) fn wait(&mut self, duration: Duration) {
         self.transport.wait(duration);
     }
+
+    pub(crate) fn monotonic_time(&self) -> Duration {
+        self.transport.monotonic_time()
+    }
 }
 
 fn not_sent<E>(failure: Failure<E>) -> TransactionError<E> {

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use felica_packet::{Idm, PollRequest, Selection};
 use port100::{
-    reader::{self, BitRate, FelicaTarget, TargetWait},
+    reader::{self, FelicaTarget, PollingResponder, TargetWait},
     transport::Transport,
 };
 
@@ -80,12 +80,12 @@ pub struct Type3Target<'r, 'm, T: Transport> {
 }
 
 impl<'r, 'm, T: Transport> Type3Target<'r, 'm, T> {
-    /// Configure a read-only Type 3 target with the supplied identity and PMm.
-    /// The message is validated before configuring the reader. An empty
-    /// message exposes an empty mapping.
+    /// Configure a read-only Type 3 target with the supplied identity and PMm,
+    /// activated as `activation` selects. The message is validated before
+    /// configuring the reader. An empty message exposes an empty mapping.
     pub fn listen(
         reader: &'r mut reader::Reader<T>,
-        rate: BitRate,
+        activation: PollingResponder,
         idm: Idm,
         pmm: [u8; 8],
         message: &'m [u8],
@@ -102,7 +102,7 @@ impl<'r, 'm, T: Transport> Type3Target<'r, 'm, T> {
         attribute[1] = READ_LIMIT;
         attribute[3..5].copy_from_slice(&blocks.to_be_bytes());
         let target = reader
-            .listen_felica(rate, idm, pmm, SYSTEM)
+            .listen_felica(activation, idm, pmm, SYSTEM)
             .map_err(Type3EmulationError::Reader)?;
         Ok(Self {
             target,

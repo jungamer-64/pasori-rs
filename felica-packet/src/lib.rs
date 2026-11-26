@@ -121,9 +121,31 @@ impl PollRequest {
         })
     }
 
+    /// Decode a Polling command received from an initiator: six bytes,
+    /// including the length byte, with command code `00`. Returns `None` for
+    /// any other packet, including a Polling command whose request code or
+    /// slot selector [`Self::new`] rejects.
+    pub fn parse(input: &[u8]) -> Option<Self> {
+        match *input {
+            [6, 0, high, low, request, slots] => {
+                Self::new(u16::from_be_bytes([high, low]), request, slots).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// The requested system code, possibly holding `FF` wildcard bytes.
     pub const fn system(self) -> u16 {
         self.system
+    }
+
+    /// Whether this request addresses `system`, with `FF` in either byte of
+    /// the requested system code matching any value of that byte.
+    pub const fn selects(self, system: u16) -> bool {
+        let [requested_high, requested_low] = self.system.to_be_bytes();
+        let [high, low] = system.to_be_bytes();
+        (requested_high == 0xff || requested_high == high)
+            && (requested_low == 0xff || requested_low == low)
     }
 
     /// The request code that determines the meaning of optional response data.
@@ -180,6 +202,20 @@ impl PollResponse {
             pmm,
             request_data,
         })
+    }
+
+    /// Encode the 18-byte response, or the 20-byte response with request
+    /// data, including the length byte.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(20);
+        packet.extend([0, 0x01]);
+        packet.extend_from_slice(self.idm.as_bytes());
+        packet.extend_from_slice(&self.pmm);
+        if let Some(data) = self.request_data {
+            packet.extend(data);
+        }
+        packet[0] = if self.request_data.is_some() { 20 } else { 18 };
+        packet
     }
 }
 
@@ -269,5 +305,50 @@ mod tests {
             Err(PollRequestError::TimeSlots(2))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn received_polling_commands_decode_and_match_wildcards()
+    -> Result<(), alloc::boxed::Box<dyn core::error::Error>> {
+        let request = PollRequest::parse(&[6, 0, 0x12, 0xfc, 2, 3]).ok_or("polling")?;
+        assert_eq!(request, PollRequest::new(0x12fc, 2, 3)?);
+        assert!(request.selects(0x12fc));
+        assert!(!request.selects(0x12fd));
+        assert!(PollRequest::new(0xffff, 0, 0)?.selects(0x0003));
+        assert!(PollRequest::new(0x12ff, 0, 0)?.selects(0x12fc));
+        assert!(!PollRequest::new(0x12ff, 0, 0)?.selects(0x88b4));
+        assert!(PollRequest::new(0xfffc, 0, 0)?.selects(0x12fc));
+        // Undefined parameters, a wrong length and other commands are not Polling.
+        assert_eq!(PollRequest::parse(&[6, 0, 0x12, 0xfc, 3, 0]), None);
+        assert_eq!(PollRequest::parse(&[6, 0, 0x12, 0xfc, 0, 2]), None);
+        assert_eq!(PollRequest::parse(&[7, 0, 0x12, 0xfc, 0, 0, 0]), None);
+        assert_eq!(PollRequest::parse(&[6, 4, 1, 2, 3, 4]), None);
+        Ok(())
+    }
+
+    #[test]
+    fn polling_responses_encode_with_and_without_request_data() {
+        let idm = Idm::new([1, 2, 3, 4, 5, 6, 7, 8]);
+        let pmm = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let response = PollResponse {
+            idm,
+            pmm,
+            request_data: None,
+        };
+        assert_eq!(
+            response.encode(),
+            [
+                18, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88
+            ]
+        );
+        let response = PollResponse {
+            request_data: Some([0, 0x83]),
+            ..response
+        };
+        let encoded = response.encode();
+        assert_eq!(encoded.len(), 20);
+        assert_eq!(encoded[0], 20);
+        assert_eq!(encoded[18..], [0, 0x83]);
+        assert_eq!(PollResponse::parse(&encoded), Ok(response));
     }
 }
