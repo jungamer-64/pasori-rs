@@ -22,18 +22,11 @@
 
 `reader-script` は各 crate の wire-level test が共有する RC-S956、RC-S310、Port-100、Port-110、Port-400 の scripted transport で、公開しない dev dependency である。
 
+`xtask` は workspace の検証の段を実行する開発用の binary で、公開しない。ライブラリではないため `no_std` の対象外で、`std` でプロセスを起動する。
+
 ## ビルドと検証
 
-リポジトリのルートで実行する。`no_std` 検証にはベアメタル向け Rust target が必要。
-
-```powershell
-cargo build --workspace
-cargo fmt --all --check
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --workspace --no-deps --all-features --config "build.rustdocflags=['-Dwarnings']"
-cargo check -p felica-packet -p iso14443 -p rcs956 -p rcs310 -p port100 -p port110 -p port400 -p pasori --lib --all-features --target x86_64-unknown-none
-```
+リポジトリのルートで`cargo verify`を実行する。検証の正本は[`xtask`](xtask)で、整形、ビルド、テスト、Clippy、rustdoc と、`no_std`のベアメタル向け Rust target（`x86_64-unknown-none`）での検査を順に行い、各段の結果を最後に表示する。`cargo verify test clippy`のように段の名前を渡すと、その段だけを行う。`no_std`の検査は、manifest に`[package.metadata.verify]`の`no-std = true`を宣言した crate を対象に、feature なしと全 feature の両方で行う。新しい`no_std`の crate はこの宣言で検査対象になる。この target の標準ライブラリがない環境では、その段を実行できなかった理由を示して検証を失敗にする。ライブラリのworkspaceなので`Cargo.lock`は管理せず、各段は互換範囲で最新の依存を解決する。GitHub Actions も同じ`cargo verify`を実行する。
 
 ## 状態と失敗の契約
 

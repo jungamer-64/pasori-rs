@@ -13,5 +13,8 @@ iso14443 = { path = "../iso14443", version = "0.1" }
 reader-script = { path = "../script" }
 serde_json = "1"
 
+[package.metadata.verify]
+no-std = true
+
 [lints]
 workspace = true

@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "NFC-A and NFC-B activation data and the selected-card exchanges shared by PaSoRi reader layers"
 
+[package.metadata.verify]
+no-std = true
+
 [lints]
 workspace = true

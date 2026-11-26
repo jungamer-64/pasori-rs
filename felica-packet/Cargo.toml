@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "FeliCa card packets and the selected-card packet exchange shared by PaSoRi reader layers"
 
+[package.metadata.verify]
+no-std = true
+
 [lints]
 workspace = true

@@ -11,5 +11,8 @@ felica-packet = { path = "../felica-packet", version = "0.1" }
 [dev-dependencies]
 reader-script = { path = "../script" }
 
+[package.metadata.verify]
+no-std = true
+
 [lints]
 workspace = true
