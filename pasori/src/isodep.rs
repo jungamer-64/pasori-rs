@@ -11,7 +11,7 @@ pub(crate) mod target;
 
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
-use iso14443::iso_dep;
+use iso14443::{WaitIndex, iso_dep};
 use rcs956::{
     reader::{self, TypeACard},
     transport::Transport,
@@ -23,12 +23,10 @@ const MAX_RESPONSE: usize = 65_536;
 const MAX_FRAMES: usize = 2048;
 const MAX_WTX: usize = 32;
 const MAX_RETRANSMISSIONS: usize = 2;
-const MAX_BLOCK_WAIT: Duration = block_frame_wait(14);
-/// Block wait for frame waiting index `index`: 330 µs per FWI step, which
-/// covers the ISO-DEP FWT of 302 µs per step with margin.
-pub(crate) const fn block_frame_wait(index: u8) -> Duration {
-    Duration::from_micros(330 * (1u64 << index))
-}
+/// Block wait per FWI step: 330 µs covers the ISO-DEP FWT of 302 µs per
+/// step with margin.
+const BLOCK_WAIT_UNIT: Duration = Duration::from_micros(330);
+const MAX_BLOCK_WAIT: Duration = WaitIndex::MAX.scaled(BLOCK_WAIT_UNIT);
 
 /// Activation parameters cannot establish the supported block profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,8 +37,6 @@ pub enum ParameterError {
     Nad(u8),
     /// The selected card did not advertise NAD support.
     NadUnsupported,
-    /// Base wait must be positive and at most the FWI14 reader wait.
-    Wait,
 }
 impl fmt::Display for ParameterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -48,7 +44,6 @@ impl fmt::Display for ParameterError {
             Self::Cid(cid) => write!(f, "CID {cid} is outside 1..=14"),
             Self::Nad(nad) => write!(f, "reserved node address {nad:02X}"),
             Self::NadUnsupported => f.write_str("card does not support node addressing"),
-            Self::Wait => f.write_str("block wait is zero or exceeds the FWI 14 wait"),
         }
     }
 }
@@ -254,11 +249,12 @@ impl Session {
     /// `card_frame_bytes` is the card's FSC. Received blocks are bounded by
     /// the transfer channel's block buffer `channel_frame_bytes`, which also
     /// bounds every transmitted frame. Both sizes include the two CRC bytes.
+    /// Every block waits as `fwi` grants until WTX extends one.
     pub(crate) fn new(
         card_frame_bytes: u16,
         channel_frame_bytes: usize,
         cid: Option<u8>,
-        wait: Duration,
+        fwi: WaitIndex,
         card_buffer: Option<usize>,
         nad: Option<NodeAddress>,
     ) -> Result<Self, ParameterError> {
@@ -267,9 +263,6 @@ impl Session {
         {
             return Err(ParameterError::Cid(cid));
         }
-        if wait.is_zero() || wait > MAX_BLOCK_WAIT {
-            return Err(ParameterError::Wait);
-        }
         Ok(Self {
             state: State::Active(0),
             maximum_frame_bytes: usize::from(card_frame_bytes).min(channel_frame_bytes) - 2,
@@ -277,7 +270,7 @@ impl Session {
             maximum_application_bytes: card_buffer.unwrap_or(MAX_APDU_BYTES).min(MAX_APDU_BYTES),
             cid,
             nad,
-            wait,
+            wait: fwi.scaled(BLOCK_WAIT_UNIT),
         })
     }
 
@@ -698,8 +691,8 @@ impl<S: iso_dep::Selection> IsoDepCard<S> {
     ///
     /// # Errors
     ///
-    /// Rejects a node address the card does not advertise, a CID outside
-    /// 1..=14, and a frame waiting time beyond FWI 14.
+    /// Rejects a node address the card does not advertise and a CID outside
+    /// 1..=14.
     pub fn new(mut card: S, node_address: Option<NodeAddress>) -> Result<Self, ParameterError> {
         match session(&card, node_address) {
             Ok(session) => Ok(Self { card, session }),
@@ -773,7 +766,7 @@ fn session<S: iso_dep::Selection>(
         parameters.frame_size(),
         card.maximum_block_bytes(),
         parameters.cid(),
-        block_frame_wait(parameters.fwi()),
+        parameters.fwi(),
         parameters.maximum_command_bytes(),
         node_address,
     )
@@ -793,8 +786,15 @@ mod tests {
     use alloc::{boxed::Box, collections::VecDeque, vec};
     use std::io;
 
+    const FWI4: WaitIndex = match WaitIndex::new(4) {
+        Some(index) => index,
+        None => panic!("FWI 4 is defined"),
+    };
+    /// 330 µs times 2^4.
+    const FWI4_WAIT: Duration = Duration::from_micros(5280);
+
     fn session(fsc: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
-        Session::new(fsc, 64, cid, block_frame_wait(4), None, None)
+        Session::new(fsc, 64, cid, FWI4, None, None)
     }
 
     #[test]
@@ -838,7 +838,7 @@ mod tests {
                     .pop_front()
                     .ok_or_else(|| io::Error::other("extra transfer"))?;
                 assert_eq!(frame, expected);
-                assert_eq!(wait, block_frame_wait(4));
+                assert_eq!(wait, FWI4_WAIT);
                 Ok::<_, io::Error>(reply)
             },
         )?;
@@ -870,12 +870,12 @@ mod tests {
                 match calls {
                     1 => {
                         assert_eq!(frame, [0x0a, 3, 0xa4]);
-                        assert_eq!(wait, block_frame_wait(4));
+                        assert_eq!(wait, FWI4_WAIT);
                         Ok::<_, io::Error>(vec![0xfa, 3, 3])
                     }
                     _ => {
                         assert_eq!(frame, [0xfa, 3, 3]);
-                        assert_eq!(wait, block_frame_wait(4) * 3);
+                        assert_eq!(wait, FWI4_WAIT * 3);
                         Ok(vec![0x0a, 3, 0x90, 0])
                     }
                 }
@@ -1121,7 +1121,7 @@ mod tests {
     #[test]
     fn reader_receive_and_card_buffer_limits_are_distinct() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut link = Session::new(16, 64, None, block_frame_wait(4), Some(128), None)?;
+        let mut link = Session::new(16, 64, None, FWI4, Some(128), None)?;
         let error = link
             .prepare::<io::Error>(&[0; 129])
             .err()
@@ -1154,7 +1154,7 @@ mod tests {
             |_, frame, wait| {
                 probes += 1;
                 assert_eq!(frame, [0xba, 3]);
-                assert_eq!(wait, block_frame_wait(4));
+                assert_eq!(wait, FWI4_WAIT);
                 if probes == 1 {
                     Err(io::ErrorKind::TimedOut.into())
                 } else {

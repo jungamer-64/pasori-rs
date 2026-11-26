@@ -1092,7 +1092,10 @@ fn type_a_apdu_host_wait_covers_the_reader_iso_dep_bound() -> Result<(), Box<dyn
         let mut card = reader
             .poll_type_a(timeout()?)?
             .ok_or("expected NFC-A card")?;
-        assert_eq!(card.observation().ats().map(|ats| ats.fwi()), Some(12));
+        assert_eq!(
+            card.observation().ats().map(|ats| ats.fwi().get()),
+            Some(12)
+        );
         let result = card.exchange_apdu(&[0, 0xa4, 4, 0]);
         if completes {
             assert_eq!(result?, [0x90, 0]);

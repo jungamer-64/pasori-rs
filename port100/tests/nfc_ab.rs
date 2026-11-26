@@ -114,7 +114,7 @@ fn an_iso_dep_card_is_activated_with_rats_and_carries_blocks() -> TestResult {
         assert_eq!(observation.ats().map(nfca::Ats::bytes), Some(&ATS[..]));
         let parameters = card.parameters();
         assert_eq!(parameters.frame_size(), 256);
-        assert_eq!(parameters.fwi(), 7);
+        assert_eq!(parameters.fwi().get(), 7);
         assert_eq!(parameters.cid(), None);
         assert_eq!(card.maximum_block_bytes(), MAX_BLOCK_BYTES);
         let mut blocks = card.blocks()?;

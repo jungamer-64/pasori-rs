@@ -375,7 +375,7 @@ impl TargetWait {
     /// about 4.4 FWT, so four FWT cover retransmission and two maximal FWT
     /// (FWI 14) leave room for WTX.
     fn iso_dep(fwt: Duration) -> Self {
-        Self::IsoDep(fwt * 4 + iso14443::frame_wait(14) * 2)
+        Self::IsoDep(fwt * 4 + iso14443::WaitIndex::MAX.duration() * 2)
     }
 
     /// Host deadline: the card bound plus the margin of every reader command.
@@ -1217,7 +1217,7 @@ impl<'a, T: Transport> TypeACard<'a, T> {
                     maximum: MAX_TYPE_A_COMMAND_BYTES,
                 });
             }
-            let wait = TargetWait::iso_dep(ats.frame_wait());
+            let wait = TargetWait::iso_dep(ats.fwi().duration());
             match self.reader.prepare_target_exchange(RfProtocol::TypeA, wait) {
                 Ok(()) => {}
                 Err(TargetExchangeError::Preparation(error)) => {
@@ -1771,7 +1771,7 @@ mod tests {
         ])?;
         assert_eq!(observation.sens_res(), [4, 7]);
         assert_eq!(observation.uid(), [0, 0xd4, 0x1e, 0x92]);
-        assert_eq!(observation.ats().map(nfca::Ats::fwi), Some(6));
+        assert_eq!(observation.ats().map(|ats| ats.fwi().get()), Some(6));
         assert!(
             type_a_record(&[0, 0x44, 0, 7, 1, 2, 3, 4, 5, 6, 7])?
                 .ats()
